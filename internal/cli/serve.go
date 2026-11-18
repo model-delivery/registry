@@ -37,32 +37,18 @@ func cmdServe(e *env, args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(e.stderr, nil))
 
-	var store blob.Store // nil keeps files in the data directory
-	redirect := false
-	switch *storage {
-	case "filesystem":
-	case "s3":
-		cfg := blob.S3Config{
-			Endpoint:     e.getenv("REGISTRY_S3_ENDPOINT"),
-			Region:       e.envOr("REGISTRY_S3_REGION", e.getenv("AWS_REGION")),
-			Bucket:       e.getenv("REGISTRY_S3_BUCKET"),
-			Prefix:       e.getenv("REGISTRY_S3_PREFIX"),
-			AccessKey:    e.envOr("REGISTRY_S3_ACCESS_KEY", e.getenv("AWS_ACCESS_KEY_ID")),
-			SecretKey:    e.envOr("REGISTRY_S3_SECRET_KEY", e.getenv("AWS_SECRET_ACCESS_KEY")),
-			SessionToken: e.getenv("AWS_SESSION_TOKEN"),
-			StagingDir:   filepath.Join(*data, "tmp"),
-		}
-		if cfg.Bucket == "" {
-			return usagef("--storage s3 needs a bucket: set REGISTRY_S3_BUCKET")
-		}
-		s3, err := blob.NewS3(e.ctx, cfg)
-		if err != nil {
+	backupEvery, backupKeep, err := backupSettings(e)
+	if err != nil {
+		return err
+	}
+	store, redirect, err := openStore(e, *data, *storage, log)
+	if err != nil {
+		return err
+	}
+	if envBool(e, "REGISTRY_RESTORE_IF_EMPTY") {
+		if err := restoreIfEmpty(e, *data, store, log); err != nil {
 			return err
 		}
-		store, redirect = s3, envBool(e, "REGISTRY_S3_REDIRECT")
-		log.Info("storing model files in S3", "bucket", cfg.Bucket, "endpoint", cfg.Endpoint, "prefix", cfg.Prefix, "redirect_downloads", redirect)
-	default:
-		return usagef("unknown --storage %q: use filesystem or s3", *storage)
 	}
 
 	reg, err := registry.Open(*data, store)
@@ -97,6 +83,7 @@ func cmdServe(e *env, args []string) error {
 		RedirectDownloads: redirect,
 		PullThrough:       *pullThrough,
 		PullThroughAllow:  allow,
+		BackupKeep:        backupKeep,
 		Version:           Version,
 		Logger:            log,
 	})
@@ -109,6 +96,11 @@ func cmdServe(e *env, args []string) error {
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
 		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)
+
+	if backupEvery > 0 {
+		log.Info("scheduled metadata backups are on", "every", backupEvery.String(), "keep", backupKeep)
+		go runBackups(e.ctx, reg, backupEvery, backupKeep, log)
+	}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -123,6 +115,106 @@ func cmdServe(e *env, args []string) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	return nil
+}
+
+// openStore builds the storage backend the configuration names.
+func openStore(e *env, data, storage string, log *slog.Logger) (store blob.Store, redirect bool, err error) {
+	switch storage {
+	case "filesystem":
+		fs, err := blob.NewFS(data)
+		return fs, false, err
+	case "s3":
+		cfg := blob.S3Config{
+			Endpoint:     e.getenv("REGISTRY_S3_ENDPOINT"),
+			Region:       e.envOr("REGISTRY_S3_REGION", e.getenv("AWS_REGION")),
+			Bucket:       e.getenv("REGISTRY_S3_BUCKET"),
+			Prefix:       e.getenv("REGISTRY_S3_PREFIX"),
+			AccessKey:    e.envOr("REGISTRY_S3_ACCESS_KEY", e.getenv("AWS_ACCESS_KEY_ID")),
+			SecretKey:    e.envOr("REGISTRY_S3_SECRET_KEY", e.getenv("AWS_SECRET_ACCESS_KEY")),
+			SessionToken: e.getenv("AWS_SESSION_TOKEN"),
+			StagingDir:   filepath.Join(data, "tmp"),
+		}
+		if cfg.Bucket == "" {
+			return nil, false, usagef("--storage s3 needs a bucket: set REGISTRY_S3_BUCKET")
+		}
+		s3, err := blob.NewS3(e.ctx, cfg)
+		if err != nil {
+			return nil, false, err
+		}
+		redirect = envBool(e, "REGISTRY_S3_REDIRECT")
+		log.Info("storing model files in S3", "bucket", cfg.Bucket, "endpoint", cfg.Endpoint, "prefix", cfg.Prefix, "redirect_downloads", redirect)
+		return s3, redirect, nil
+	}
+	return nil, false, usagef("unknown --storage %q: use filesystem or s3", storage)
+}
+
+// backupSettings reads the schedule for metadata backups: how often, and
+// how many to keep.
+func backupSettings(e *env) (every time.Duration, keep int, err error) {
+	keep = 48
+	if v := e.getenv("REGISTRY_BACKUP_KEEP"); v != "" {
+		keep, err = strconv.Atoi(v)
+		if err != nil || keep < 0 {
+			return 0, 0, usagef("REGISTRY_BACKUP_KEEP must be a number, 0 to keep every backup; got %q", v)
+		}
+	}
+	if v := e.getenv("REGISTRY_BACKUP_INTERVAL"); v != "" {
+		every, err = time.ParseDuration(v)
+		if err != nil || every < time.Minute {
+			return 0, 0, usagef("REGISTRY_BACKUP_INTERVAL must be a duration of at least a minute, such as 1h or 30m; got %q", v)
+		}
+	}
+	return every, keep, nil
+}
+
+// runBackups takes a metadata backup every interval until ctx ends. A
+// failed backup is logged and the schedule carries on.
+func runBackups(ctx context.Context, reg *registry.Registry, every time.Duration, keep int, log *slog.Logger) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b, info, err := reg.Backup(ctx, keep)
+			if err != nil {
+				log.Error("scheduled metadata backup failed", "error", err)
+				continue
+			}
+			log.Info("metadata backup stored", "name", b.Name, "bytes", b.Size, "repos", info.Repos, "revisions", info.Revisions)
+		}
+	}
+}
+
+// restoreIfEmpty installs the newest stored backup when the data directory
+// has no database. It is for a registry whose disk does not outlive it: a
+// replacement starts from the last backup instead of from nothing. A data
+// directory that already has a database is never touched.
+func restoreIfEmpty(e *env, data string, store blob.Store, log *slog.Logger) error {
+	if _, err := os.Stat(filepath.Join(data, "registry.db")); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(data, "tmp"), 0o750); err != nil {
+		return err
+	}
+	snapshot := filepath.Join(data, "tmp", "restore-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".db")
+	defer func() { _ = os.Remove(snapshot) }()
+	name, err := registry.FetchBackup(e.ctx, store, "", snapshot)
+	switch {
+	case errors.Is(err, blob.ErrArchiveNotFound):
+		log.Info("no database and no stored backup: starting as a new registry")
+		return nil
+	case err != nil:
+		return fmt.Errorf("REGISTRY_RESTORE_IF_EMPTY: fetch the newest backup: %w", err)
+	}
+	info, _, err := registry.Restore(e.ctx, data, snapshot, false)
+	if err != nil {
+		return fmt.Errorf("REGISTRY_RESTORE_IF_EMPTY: %w", err)
+	}
+	log.Info("restored the metadata database from the newest stored backup", "backup", name,
+		"repos", info.Repos, "revisions", info.Revisions)
 	return nil
 }
 

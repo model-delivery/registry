@@ -36,6 +36,9 @@ var (
 	ErrTokenNotFound    = errors.New("token not found")
 )
 
+// schemaVersion is the database layout this version reads and writes.
+const schemaVersion = 2
+
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
 const schema = `
@@ -101,6 +104,8 @@ type Registry struct {
 	// recorded. Work on different digests never waits on each other.
 	locks keyLock
 	now   func() time.Time
+	// dataDir holds the database and scratch space.
+	dataDir string
 }
 
 // keyLock is a mutex per key.
@@ -159,7 +164,7 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Registry{db: db, blobs: store, now: time.Now}
+	r := &Registry{db: db, blobs: store, now: time.Now, dataDir: dataDir}
 	if err := r.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err

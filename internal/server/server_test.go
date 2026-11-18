@@ -338,6 +338,18 @@ func TestAccessControl(t *testing.T) {
 		{"private: read token downloads", private, http.MethodGet, "/acme/tiny/resolve/main/config.json", read, "", 200},
 		{"private: read token lists", private, http.MethodGet, "/api/v1/repos", read, "", 200},
 
+		// Backups contain every token hash: admins only, open registry or not.
+		{"open: anonymous backup list", open, http.MethodGet, "/api/v1/backups", none, "", 401},
+		{"open: write token backup list", open, http.MethodGet, "/api/v1/backups", write, "", 403},
+		{"open: admin backup list", open, http.MethodGet, "/api/v1/backups", admin, "", 200},
+		{"open: anonymous backup", open, http.MethodPost, "/api/v1/backups", none, "", 401},
+		{"open: write token backup", open, http.MethodPost, "/api/v1/backups", write, "", 403},
+		{"open: admin backup", open, http.MethodPost, "/api/v1/backups", admin, "", 201},
+		{"open: anonymous snapshot", open, http.MethodGet, "/api/v1/backup/snapshot", none, "", 401},
+		{"open: read token snapshot", open, http.MethodGet, "/api/v1/backup/snapshot", read, "", 403},
+		{"open: write token snapshot", open, http.MethodGet, "/api/v1/backup/snapshot", write, "", 403},
+		{"open: admin snapshot", open, http.MethodGet, "/api/v1/backup/snapshot", admin, "", 200},
+
 		// Writing always needs a write token, open registry or not.
 		{"open: anonymous upload", open, http.MethodPut, blobURL, none, "new", 401},
 		{"open: read token upload", open, http.MethodPut, blobURL, read, "new", 403},

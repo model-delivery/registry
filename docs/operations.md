@@ -280,31 +280,113 @@ Model Delivery registry, which is how you copy models between registries.
 
 ## Backup and restore
 
-Everything is in the data directory: `registry.db` (plus `registry.db-wal`
-and `registry.db-shm` while running) and `blobs/`.
+There are two things to protect:
 
-**Simplest:** stop the server, copy the directory, start the server.
+- **Model files** (`blobs/`, or the bucket). They are named by their
+  SHA-256 and never change once written.
+- **The metadata database** (`registry.db`). It is small, and it is the
+  only record of which files make up which revision, plus the tokens.
+  Without it the files are a pile of digests.
 
-**Without stopping:** files under `blobs/` never change once written, so
-they can be copied at any time. Copy `blobs/` first and the database
-second, so that every file the database mentions is in the copy. Take the
-database copy with SQLite's online backup rather than a plain file copy:
+The registry backs up the database itself. It does not copy model files.
+
+### Scheduled backups
 
 ```bash
-rsync -a data/blobs/ backup/blobs/
-sqlite3 data/registry.db ".backup 'backup/registry.db'"
+REGISTRY_BACKUP_INTERVAL=1h   # off unless set; at least 1m
+REGISTRY_BACKUP_KEEP=48       # how many to keep (default 48; 0 keeps all)
 ```
 
-To restore, put the directory back and start the server. Do not run
-`modelctl gc` or delete repositories while a backup is being taken.
+Every interval the server takes a consistent snapshot while it keeps
+serving, runs SQLite's integrity check on it, and stores it next to the
+model files:
 
-**With S3 storage,** the bucket holds the files and your provider's
-durability covers them; what you back up is `registry.db`, with the same
-`sqlite3 ... ".backup"` command, on a schedule. Keep the backups somewhere
-other than the server. If you restore an older database, revisions
-recorded after that backup are gone from the registry even though their
-objects are still in the bucket; `modelctl gc` cannot see those objects,
-because it only knows about files the database lists.
+- with S3 storage, in the same bucket under `backups/` (inside
+  `REGISTRY_S3_PREFIX` if one is set), which puts it off the server;
+- with filesystem storage, in `backups/` in the data directory. That
+  protects against a damaged database, not a lost disk: copy the directory
+  elsewhere, or use `modelctl backup download` from another machine.
+
+Backups are named by time, `registry-20261118T140000Z.db`, and the oldest
+beyond the keep count are removed. A failed backup is logged as an error
+and the schedule carries on; alert on `scheduled metadata backup failed`.
+
+A stored backup contains token hashes (not the tokens) and the full
+catalogue. Anyone who can read the bucket can read it.
+
+### On demand
+
+```bash
+modelctl backup now                 # take one and store it, as above
+modelctl backup list
+modelctl backup download snap.db    # a fresh snapshot to a local file, verified on arrival
+```
+
+These need an admin token. `download` is the way to keep copies somewhere
+of your own choosing, for example from a scheduled job.
+
+### Restore
+
+Stop the registry, then:
+
+```bash
+modelctl restore --latest               # newest stored backup
+modelctl restore --name registry-20261118T140000Z.db
+modelctl restore snap.db                # a downloaded snapshot
+```
+
+`restore` takes `--data` and the same `REGISTRY_STORAGE` and
+`REGISTRY_S3_*` settings as `serve`, so it finds the stored backups. It
+verifies the snapshot first, and refuses a file that is damaged, is not a
+registry database, or was written by a newer version. It will not
+overwrite an existing database unless you pass `--replace`, and then the
+old one is kept beside it as `registry.db.before-restore-<time>`.
+
+### A server whose disk does not outlive it
+
+With S3 storage the server's disk holds only the database. Set
+
+```bash
+REGISTRY_RESTORE_IF_EMPTY=true
+```
+
+and a server that starts with no database restores the newest stored
+backup before serving; with no backup either, it starts as a new registry.
+A data directory that already has a database is never touched. In
+Kubernetes this means a replaced volume recovers by itself:
+
+```yaml
+env:
+  - name: REGISTRY_STORAGE
+    value: s3
+  - name: REGISTRY_BACKUP_INTERVAL
+    value: 1h
+  - name: REGISTRY_RESTORE_IF_EMPTY
+    value: "true"
+```
+
+Run one replica. Two servers restoring the same backup would each record
+revisions the other cannot see.
+
+### What a restore loses
+
+A backup is a point in time. Revisions, tokens and deletions recorded
+after it are not in it: at most one interval of changes with scheduled
+backups. The files of lost revisions are still stored, but the registry no
+longer knows them; push or mirror those revisions again. With pull-through
+caching, lost entries are fetched again on the next request.
+
+If you ran `modelctl gc` or `modelctl delete` after the backup you are
+restoring, some restored revisions may list files that were removed.
+Downloads of those files fail until the revision is pushed or mirrored
+again.
+
+### Copying everything by hand
+
+Stop the server, copy the data directory, start the server. Without
+stopping, copy `blobs/` first and take the database second with
+`modelctl backup download`, so every file the database mentions is in the
+copy.
 
 ## Freeing space
 

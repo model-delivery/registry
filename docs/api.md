@@ -160,6 +160,16 @@ All `admin`.
 | `POST /api/v1/tokens` | Body `{"name": "ci", "role": "write"}`. Returns the token secret, once. |
 | `DELETE /api/v1/tokens/{name}` | Revoke. |
 
+## Backups
+
+All `admin`. See [operations.md](operations.md#backup-and-restore).
+
+| | |
+|---|---|
+| `GET /api/v1/backups` | List stored backups, oldest first: `name`, `size`, `created_at`. |
+| `POST /api/v1/backups` | Take a backup and store it next to the model files. Returns `backup` and `contents` (`schema_version`, `repos`, `revisions`, `size`). |
+| `GET /api/v1/backup/snapshot` | Download a fresh, verified snapshot of the metadata database (`application/vnd.sqlite3`). |
+
 ## Maintenance
 
 | | |

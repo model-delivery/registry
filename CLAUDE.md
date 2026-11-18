@@ -18,7 +18,8 @@ Read `docs/architecture.md` before changing anything structural, and
   Two backends, `FS` and `S3`, behind one interface. `store_test.go` runs
   the same contract against both; a new backend joins that list.
   `blobtest` is an in-memory S3 for tests.
-- `internal/registry` — repositories, immutable revisions, refs, tokens.
+- `internal/registry` — repositories, immutable revisions, refs, tokens,
+  and metadata backup and restore (`backup.go`).
 - `internal/mirror` — imports a revision from an upstream hub.
 - `internal/server` — HTTP: `hf.go` (Hugging Face routes), `api.go`
   (`/api/v1`), `ui.go` plus `templates/` and `static/` (web UI).
@@ -44,7 +45,9 @@ Docker; the only place multipart uploads are exercised), `task build`,
 - **Nothing is stored or served unverified.** Every write goes through
   `blob.Store.Stage`, which hashes while streaming and rejects mismatches.
   Do not add a path that writes under `blobs/` or to the bucket any other
-  way; the S3 backend stages locally for exactly this reason.
+  way; the S3 backend stages locally for exactly this reason. The one
+  other thing stored beside blobs is metadata backups (`blob.Archive`,
+  under `backups/`), which are never served as model content.
 - **Publishing and removing a blob hold that digest's lock**
   (`Registry.locks`). Removal re-checks "unreferenced" in the same
   statement that deletes the record. Do not split that check from the

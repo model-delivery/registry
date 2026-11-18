@@ -121,6 +121,27 @@ func (c *Client) Raw(ctx context.Context, method, path string, in any) (json.Raw
 	return out, nil
 }
 
+// Download saves the response body of a GET to dst, which must not exist,
+// and returns how many bytes were written.
+func (c *Client) Download(ctx context.Context, path, dst string) (int64, error) {
+	resp, err := c.do(ctx, http.MethodGet, path, nil, -1, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // a path the user named.
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(out, resp.Body)
+	if err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return 0, err
+	}
+	return n, out.Close()
+}
+
 // File is one file of a revision as the registry reports it.
 type File struct {
 	Path   string `json:"path"`

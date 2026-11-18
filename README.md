@@ -114,6 +114,8 @@ modelctl inspect <repo>             show revisions, refs and files
 modelctl delete <repo> --yes        delete a repository and free its storage
 modelctl token create|list|revoke   manage access tokens
 modelctl gc                         remove stored files nothing references
+modelctl backup now|list|download   back up the registry's metadata
+modelctl restore <file>|--latest    put a backup back (registry stopped)
 ```
 
 Client commands read `MODELCTL_ENDPOINT` (default `http://localhost:8080`)
@@ -147,6 +149,9 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | | `REGISTRY_ADMIN_TOKEN_FILE` | | Read the admin token from this file (a mounted secret) |
 | `--require-admin-token` | `REGISTRY_REQUIRE_ADMIN_TOKEN` | `false` | Refuse to start without a supplied admin token instead of generating one and printing it. Use on Kubernetes and anywhere logs are collected |
 | | `REGISTRY_UPSTREAM_TOKEN` | | Default token for the upstream hub |
+| | `REGISTRY_BACKUP_INTERVAL` | off | Store a metadata backup this often, for example `1h` |
+| | `REGISTRY_BACKUP_KEEP` | `48` | How many stored backups to keep; `0` keeps all |
+| | `REGISTRY_RESTORE_IF_EMPTY` | `false` | At start, if there is no database, restore the newest stored backup |
 
 **S3 storage.** Set `REGISTRY_STORAGE=s3` and:
 
@@ -190,8 +195,10 @@ export HF_TOKEN=md_...
 (Caddy, nginx, Traefik) for HTTPS, and do that before exposing it beyond a
 network you trust. See [docs/operations.md](docs/operations.md).
 
-**Backups.** Everything is in the data directory. See
-[docs/operations.md](docs/operations.md) for how to copy it safely.
+**Backups.** Set `REGISTRY_BACKUP_INTERVAL=1h` and the registry stores a
+verified snapshot of its metadata next to the model files on that
+schedule; `modelctl backup` takes one on demand and `modelctl restore`
+puts one back. See [docs/operations.md](docs/operations.md#backup-and-restore).
 
 ## Hugging Face compatibility
 

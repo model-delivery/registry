@@ -41,6 +41,9 @@ type Config struct {
 	// PullThroughAllow limits pull-through to repositories matching one of
 	// these globs over the whole id ("meta-llama/*"). Empty allows all.
 	PullThroughAllow []string
+	// BackupKeep is how many stored metadata backups to keep when one is
+	// taken through the API; 0 keeps them all.
+	BackupKeep int
 	// UpstreamClient overrides the HTTP client used to reach the upstream.
 	UpstreamClient *http.Client
 	Version        string
@@ -88,6 +91,9 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 	mux.Handle("POST /api/v1/mirror", s.need(roleWrite, s.apiMirror))
 	mux.Handle("GET /api/v1/stats", s.need(roleRead, s.apiStats))
 	mux.Handle("POST /api/v1/gc", s.need(roleAdmin, s.apiGC))
+	mux.Handle("GET /api/v1/backups", s.need(roleAdmin, s.apiListBackups))
+	mux.Handle("POST /api/v1/backups", s.need(roleAdmin, s.apiBackupNow))
+	mux.Handle("GET /api/v1/backup/snapshot", s.need(roleAdmin, s.apiSnapshot))
 	mux.Handle("GET /api/v1/tokens", s.need(roleAdmin, s.apiListTokens))
 	mux.Handle("POST /api/v1/tokens", s.need(roleAdmin, s.apiCreateToken))
 	mux.Handle("DELETE /api/v1/tokens/{name}", s.need(roleAdmin, s.apiRevokeToken))

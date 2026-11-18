@@ -60,8 +60,9 @@ Docker; the only place multipart uploads are exercised), `task build`,
   is one transaction. A mirror records nothing unless every file verified.
 - **`files` rows always point at stored, verified content.** A file that
   pull-through has listed but not fetched is a row in `pending_files`, and
-  moves to `files` only in `Registry.Fulfil`, after its content matched its
-  digest. Never insert into `files` for content that is not stored, and
+  moves to `files` only through `fulfil` (`pending.go`; `Registry.Fulfil`
+  for one file, `Registry.CompleteRevision` for the rest of a revision in
+  one transaction), after its content matched its digest. Never insert into `files` for content that is not stored, and
   never serve a pending file's content.
 - **Stream, never buffer.** Model files are many gigabytes. No
   `io.ReadAll` on file content, in the server or the client.

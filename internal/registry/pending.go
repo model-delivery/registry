@@ -60,12 +60,10 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		return Commit{}, err
 	}
 	if !IsSHA(in.SHA) {
-		return Commit{}, fmt.Errorf("%w: revision id must be 40 hex characters", ErrInvalid)
+		return Commit{}, errRevisionID()
 	}
-	if in.Branch != "" {
-		if err := ValidateRefName(in.Branch); err != nil {
-			return Commit{}, err
-		}
+	if err := validateTarget(in.Branch, nil); err != nil {
+		return Commit{}, err
 	}
 	if len(in.Files) == 0 {
 		return Commit{}, fmt.Errorf("%w: a revision needs at least one file", ErrInvalid)
@@ -83,68 +81,38 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 	defer func() { _ = tx.Rollback() }()
 	at, now := r.clock()
 
-	var repoID int64
-	var heldUpstream string
-	err = tx.QueryRowContext(ctx, "SELECT id, upstream FROM repos WHERE name = ?", in.Repo).Scan(&repoID, &heldUpstream)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		res, insErr := tx.ExecContext(ctx, "INSERT INTO repos (name, upstream, created_at) VALUES (?, ?, ?)", in.Repo, in.Upstream, now)
-		if insErr != nil {
-			return Commit{}, insErr
-		}
-		repoID, _ = res.LastInsertId()
-	case err != nil:
+	repoID, err := upsertRepo(ctx, tx, repoUpsert{name: in.Repo, upstream: in.Upstream, onlyFromUpstream: in.OnlyFromUpstream, now: now})
+	if err != nil {
 		return Commit{}, err
-	case in.OnlyFromUpstream && heldUpstream == "":
-		// Checked inside the transaction, so a repository created by a push
-		// between the caller's lookup and this one is still left alone.
-		return Commit{}, fmt.Errorf("%w: %s", ErrLocalRepo, in.Repo)
-	case in.Upstream != "":
-		if _, err := tx.ExecContext(ctx, "UPDATE repos SET upstream = ? WHERE id = ?", in.Upstream, repoID); err != nil {
-			return Commit{}, err
-		}
 	}
-
 	var c Commit
 	found, err := scanCommit(tx.QueryRowContext(ctx, commitCols+" WHERE c.repo_id = ? AND c.sha = ?", repoID, in.SHA), &c)
 	if err != nil {
 		return Commit{}, err
 	}
 	if !found {
+		c = Commit{RepoID: repoID, Repo: in.Repo, SHA: in.SHA, Message: in.Message, Source: SourceMirror,
+			UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
 		// tree stays empty until the last pending file arrives: it is the
 		// digest of the complete file list, which is not known before then.
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO commits (repo_id, sha, parent, tree, message, source, upstream_info, created_at)
-			 VALUES (?, ?, '', '', ?, ?, ?, ?)`,
-			repoID, in.SHA, in.Message, SourceMirror, in.UpstreamInfo, now)
-		if err != nil {
+		if c.ID, err = insertCommit(ctx, tx, c, "", now); err != nil {
 			return Commit{}, err
 		}
-		id, _ := res.LastInsertId()
-		c = Commit{ID: id, RepoID: repoID, Repo: in.Repo, SHA: in.SHA, Message: in.Message, Source: SourceMirror,
-			UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
 		for _, f := range in.Files {
 			if _, err := tx.ExecContext(ctx,
 				"INSERT INTO pending_files (commit_id, path, size, sha256, git_oid, lfs) VALUES (?, ?, ?, ?, ?, ?)",
-				id, f.Path, f.Size, f.SHA256, f.GitOID, f.LFS); err != nil {
+				c.ID, f.Path, f.Size, f.SHA256, f.GitOID, f.LFS); err != nil {
 				return Commit{}, err
 			}
 		}
 	}
-	if in.Branch != "" {
-		var kind RefKind
-		err := tx.QueryRowContext(ctx, "SELECT kind FROM refs WHERE repo_id = ? AND name = ?", repoID, in.Branch).Scan(&kind)
-		if err == nil && kind == KindTag {
-			return Commit{}, fmt.Errorf("%w: %q is a tag and cannot be moved", ErrConflict, in.Branch)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO refs (repo_id, name, kind, sha, updated_at) VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT (repo_id, name) DO UPDATE SET sha = excluded.sha, updated_at = excluded.updated_at`,
-			repoID, in.Branch, KindBranch, in.SHA, now); err != nil {
-			return Commit{}, err
-		}
+	if err := moveBranch(ctx, tx, repoID, in.Branch, in.SHA, now); err != nil {
+		return Commit{}, err
 	}
-	return c, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return Commit{}, err
+	}
+	return c, nil
 }
 
 // Fulfil turns a pending file into a stored one. The content must already
@@ -158,61 +126,170 @@ func (r *Registry) Fulfil(ctx context.Context, c Commit, path, sha256 string) er
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-
-	var want File
-	err = tx.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM pending_files WHERE commit_id = ? AND path = ?", c.ID, path).
-		Scan(&want.Size, &want.SHA256, &want.GitOID, &want.LFS)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+	fulfilled, err := fulfil(ctx, tx, c.ID, path, sha256)
 	if err != nil {
 		return err
 	}
-	var size int64
-	err = tx.QueryRowContext(ctx, "SELECT size FROM blobs WHERE sha256 = ?", sha256).Scan(&size)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %s (sha256 %s)", ErrBlobMissing, path, sha256)
-	}
-	if err != nil {
-		return err
-	}
-	// The digests were checked when the content was stored. These two are
-	// what can still be compared here, and a mismatch means a caller bug.
-	if size != want.Size || (want.SHA256 != "" && want.SHA256 != sha256) {
-		return fmt.Errorf("%w: stored content for %s does not match the revision's listing", ErrConflict, path)
-	}
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO files (commit_id, path, size, sha256, git_oid, lfs) VALUES (?, ?, ?, ?, ?, ?)",
-		c.ID, path, size, sha256, want.GitOID, want.LFS); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM pending_files WHERE commit_id = ? AND path = ?", c.ID, path); err != nil {
-		return err
-	}
-	var left int
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pending_files WHERE commit_id = ?", c.ID).Scan(&left); err != nil {
-		return err
-	}
-	if left == 0 {
-		files, err := queryFiles(ctx, tx, c.ID)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, "UPDATE commits SET tree = ? WHERE id = ?", treeDigest(files), c.ID); err != nil {
+	if fulfilled {
+		if _, err := sealIfComplete(ctx, tx, c.ID); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// PendingCount is how many of a revision's files have not been fetched.
-func (r *Registry) PendingCount(ctx context.Context, c Commit) (int, error) {
+// fulfil moves one pending file of a revision to its stored files, and
+// reports whether it did: a file that is not pending is left alone. This is
+// the only place a files row is written for a revision that already exists,
+// and it writes one only for content the blobs table says is stored.
+func fulfil(ctx context.Context, tx dbtx, commitID int64, path, sha256 string) (bool, error) {
+	var want File
+	err := tx.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM pending_files WHERE commit_id = ? AND path = ?", commitID, path).
+		Scan(&want.Size, &want.SHA256, &want.GitOID, &want.LFS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var size int64
+	err = tx.QueryRowContext(ctx, "SELECT size FROM blobs WHERE sha256 = ?", sha256).Scan(&size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: %s (sha256 %s)", ErrBlobMissing, path, sha256)
+	}
+	if err != nil {
+		return false, err
+	}
+	// The digests were checked when the content was stored. These two are
+	// what can still be compared here, and a mismatch means a caller bug.
+	if size != want.Size || (want.SHA256 != "" && want.SHA256 != sha256) {
+		return false, fmt.Errorf("%w: stored content for %s does not match the revision's listing", ErrConflict, path)
+	}
+	if err := insertFile(ctx, tx, commitID, File{Path: path, Size: size, SHA256: sha256, GitOID: want.GitOID, LFS: want.LFS}); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM pending_files WHERE commit_id = ? AND path = ?", commitID, path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// sealIfComplete gives a revision its tree digest once none of its files
+// is pending, which is what makes it indistinguishable from a mirrored
+// one. It returns how many files are still pending.
+func sealIfComplete(ctx context.Context, tx dbtx, commitID int64) (int, error) {
+	left, err := countPending(ctx, tx, commitID)
+	if err != nil || left > 0 {
+		return left, err
+	}
+	files, err := queryFiles(ctx, tx, commitID)
+	if err != nil {
+		return 0, err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE commits SET tree = ? WHERE id = ?", treeDigest(files), commitID)
+	return 0, err
+}
+
+// CompleteInput names a recorded revision and the stored content of its
+// files.
+type CompleteInput struct {
+	Repo string
+	SHA  string
+	// Branch to move to the revision. Empty moves none.
+	Branch string
+	// Upstream, when set, is recorded as where the repository comes from.
+	Upstream string
+	// Files of the revision whose content is now stored: Path, and the
+	// SHA256 it is stored under. Files that are not pending are ignored.
+	Files []File
+}
+
+// CompleteRevision finishes a revision that is already recorded, perhaps
+// with files still pending: it marks each given file stored and moves the
+// branch, in one transaction. Either the revision is complete and the
+// branch points at it afterwards, or nothing has changed.
+//
+// It fails with ErrRevisionNotFound when the repository or the revision is
+// not recorded, which is the caller's cue to record it whole with Commit,
+// and with ErrConflict when the files given leave some of the revision's
+// files pending.
+func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Commit, error) {
+	if err := ValidateRepoName(in.Repo); err != nil {
+		return Commit{}, err
+	}
+	if !IsSHA(in.SHA) {
+		return Commit{}, errRevisionID()
+	}
+	if err := validateTarget(in.Branch, nil); err != nil {
+		return Commit{}, err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Commit{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var c Commit
+	found, err := scanCommit(tx.QueryRowContext(ctx, commitCols+" WHERE r.name = ? AND c.sha = ?", in.Repo, in.SHA), &c)
+	if err != nil {
+		return Commit{}, err
+	}
+	if !found {
+		return Commit{}, fmt.Errorf("%w: %s@%s", ErrRevisionNotFound, in.Repo, in.SHA)
+	}
+	fulfilled := 0
+	for _, f := range in.Files {
+		done, err := fulfil(ctx, tx, c.ID, f.Path, f.SHA256)
+		if err != nil {
+			return Commit{}, fmt.Errorf("%s: %w", f.Path, err)
+		}
+		if done {
+			fulfilled++
+		}
+	}
+	// A revision with nothing pending was sealed when it was recorded or
+	// when its last file arrived; only one this call completed needs it.
+	left, err := countPending(ctx, tx, c.ID)
+	if err != nil {
+		return Commit{}, err
+	}
+	if left > 0 {
+		return Commit{}, fmt.Errorf("%w: revision %s lists %d files that were not among those fetched, so it cannot be completed", ErrConflict, in.SHA, left)
+	}
+	if fulfilled > 0 {
+		if _, err := sealIfComplete(ctx, tx, c.ID); err != nil {
+			return Commit{}, err
+		}
+	}
+	_, now := r.clock()
+	if in.Upstream != "" {
+		if _, err := tx.ExecContext(ctx, "UPDATE repos SET upstream = ? WHERE id = ?", in.Upstream, c.RepoID); err != nil {
+			return Commit{}, err
+		}
+	}
+	if err := moveBranch(ctx, tx, c.RepoID, in.Branch, c.SHA, now); err != nil {
+		return Commit{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Commit{}, err
+	}
+	return c, nil
+}
+
+// countPending is how many files of a revision have not been fetched.
+func countPending(ctx context.Context, q dbtx, commitID int64) (int, error) {
 	var n int
-	err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pending_files WHERE commit_id = ?", c.ID).Scan(&n)
+	err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM pending_files WHERE commit_id = ?", commitID).Scan(&n)
 	return n, err
 }
 
-func queryPending(ctx context.Context, q querier, commitID int64) ([]File, error) {
+// PendingCount is how many of a revision's files have not been fetched.
+func (r *Registry) PendingCount(ctx context.Context, c Commit) (int, error) {
+	return countPending(ctx, r.db, c.ID)
+}
+
+func queryPending(ctx context.Context, q dbtx, commitID int64) ([]File, error) {
 	rows, err := q.QueryContext(ctx, "SELECT path, size, sha256, git_oid, lfs FROM pending_files WHERE commit_id = ? ORDER BY path", commitID)
 	if err != nil {
 		return nil, err
@@ -231,7 +308,7 @@ func queryPending(ctx context.Context, q querier, commitID int64) ([]File, error
 
 // allFiles is a revision's complete file list: stored files and pending
 // ones together, in path order.
-func allFiles(ctx context.Context, q querier, commitID int64) ([]File, error) {
+func allFiles(ctx context.Context, q dbtx, commitID int64) ([]File, error) {
 	stored, err := queryFiles(ctx, q, commitID)
 	if err != nil {
 		return nil, err

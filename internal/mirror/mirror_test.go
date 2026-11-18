@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -156,4 +157,90 @@ func TestOversizedModelInfoIsNotStored(t *testing.T) {
 			check("pull-through", pulled)
 		})
 	}
+}
+
+// A mirror of a revision the registry already holds, recorded by
+// pull-through with its files still to fetch, completes that revision. If
+// it cannot be completed the mirror fails with the reason; it does not go
+// on to record the revision afresh, which is only for one the registry
+// does not hold.
+func TestMirrorCompletesARecordedRevisionOrFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("completes it and moves the branch", func(t *testing.T) {
+		t.Parallel()
+		h := newHub(t, map[string]string{"config.json": "{}", "weights.bin": "weights"})
+		h.lfs = map[string]bool{"weights.bin": true}
+		reg := openRegistry(t)
+		plan, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", hubSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded, err := plan.RecordLazy(ctx, reg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := reg.PendingCount(ctx, recorded); n != 2 {
+			t.Fatalf("%d files pending before the mirror, want 2", n)
+		}
+		named, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := named.Execute(ctx, reg, 2, nil); err != nil {
+			t.Fatal(err)
+		}
+		head, err := reg.Resolve(ctx, "acme/tiny", "main")
+		if err != nil || head.ID != recorded.ID {
+			t.Fatalf("main = %+v, %v; want the revision that was already recorded", head, err)
+		}
+		if n, _ := reg.PendingCount(ctx, head); n != 0 {
+			t.Fatalf("%d files still pending after the mirror", n)
+		}
+	})
+
+	t.Run("a new repository is recorded whole", func(t *testing.T) {
+		t.Parallel()
+		h := newHub(t, map[string]string{"config.json": "{}"})
+		reg := openRegistry(t)
+		plan, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := plan.Execute(ctx, reg, 1, nil); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := reg.Resolve(ctx, "acme/tiny", "main"); err != nil || c.SHA != hubSHA || c.Source != registry.SourceMirror {
+			t.Fatalf("main = %+v, %v", c, err)
+		}
+	})
+
+	t.Run("fails when the recorded revision cannot be completed", func(t *testing.T) {
+		t.Parallel()
+		h := newHub(t, map[string]string{"config.json": "{}", "weights.bin": "weights"})
+		reg := openRegistry(t)
+		plan, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded, err := plan.RecordLazy(ctx, reg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The upstream now lists fewer files under the same revision id, so
+		// what the mirror fetches cannot account for the whole revision.
+		delete(h.files, "weights.bin")
+		shorter, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = shorter.Execute(ctx, reg, 1, nil)
+		if !errors.Is(err, registry.ErrConflict) || !strings.Contains(err.Error(), "cannot be completed") {
+			t.Fatalf("mirror = %v, want the registry's reason for not completing the revision", err)
+		}
+		if n, _ := reg.PendingCount(ctx, recorded); n != 2 {
+			t.Fatalf("%d files pending after the failed mirror, want both: part of it was kept", n)
+		}
+	})
 }

@@ -5,6 +5,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -183,19 +184,18 @@ feed:
 	if !registry.IsSHA(p.revision) {
 		in.Branch = p.revision
 	}
-	if existing, err := reg.Resolve(ctx, repo, sha); err == nil {
-		// The revision is already recorded, perhaps by pull-through with
-		// some files still to fetch. Every file is stored now, so complete
-		// it, and move the branch.
-		for _, f := range files {
-			if err := reg.Fulfil(ctx, existing, f.Path, f.SHA256); err != nil {
-				return Event{}, fmt.Errorf("%s: %w", f.Path, err)
-			}
-		}
-		if _, err := reg.CommitLazy(ctx, p.lazyInput(in.Branch)); err != nil {
-			return Event{}, err
-		}
-	} else if _, err := reg.Commit(ctx, in); err != nil {
+	// The revision may already be recorded, perhaps by pull-through with
+	// some files still to fetch. Every file is stored now, so the registry
+	// completes it and moves the branch, in one transaction. Only when it
+	// holds no such revision is this a new one to record whole; any other
+	// failure is the mirror's failure.
+	_, err := reg.CompleteRevision(ctx, registry.CompleteInput{
+		Repo: repo, SHA: sha, Branch: in.Branch, Upstream: in.Upstream, Files: files,
+	})
+	if errors.Is(err, registry.ErrRevisionNotFound) {
+		_, err = reg.Commit(ctx, in)
+	}
+	if err != nil {
 		return Event{}, err
 	}
 	return Event{Event: "done", Repo: repo, SHA: sha, Ref: in.Branch, Files: len(files),

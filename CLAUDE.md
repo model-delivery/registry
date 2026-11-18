@@ -18,6 +18,9 @@ Read `docs/architecture.md` before changing anything structural, and
   Two backends, `FS` and `S3`, behind one interface. `store_test.go` runs
   the same contract against both; a new backend joins that list.
   `blobtest` is an in-memory S3 for tests.
+- `internal/datadir` — the names of the files and directories in the data
+  directory, and clearing `tmp/` at server start. Nothing else joins those
+  names itself.
 - `internal/registry` — repositories, immutable revisions, refs, tokens,
   and metadata backup and restore (`backup.go`).
 - `internal/mirror` — imports a revision from an upstream hub.

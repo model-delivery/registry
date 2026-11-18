@@ -1,6 +1,6 @@
 module github.com/model-delivery/registry
 
-go 1.26.5
+go 1.26.11
 
 require (
 	github.com/johannesboyne/gofakes3 v1.2.0

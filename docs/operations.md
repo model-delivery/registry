@@ -160,6 +160,57 @@ for every mirror.
 Once mirrored, the model is governed by your registry's access settings.
 Honour the model's licence and access terms.
 
+## Pull-through caching
+
+With `--pull-through` (or `REGISTRY_PULL_THROUGH=true`) the registry fills
+itself. A client asks for a model; if the registry does not hold that
+revision, it fetches it from the upstream hub, verifies every file, stores
+it, and answers. Later requests are served from the registry and never
+reach the upstream.
+
+```bash
+REGISTRY_PULL_THROUGH=true modelctl serve
+export HF_ENDPOINT=http://localhost:8080
+hf download hf-internal-testing/tiny-random-bert    # fetched on demand, then served
+```
+
+What to expect:
+
+- **The first request waits for the whole revision.** The registry only
+  makes a revision visible once every file is stored and verified, so the
+  first request for a 20 GB model takes as long as downloading 20 GB.
+  Clients with short timeouts (the Hugging Face libraries allow about ten
+  seconds for metadata) give up and report an error. The fetch carries on
+  regardless, and a retry once it finishes is served at once. For large
+  models, warm the registry first with `modelctl mirror`, or have the
+  client retry.
+- **Requests for the same revision share one fetch.** Twenty workers
+  starting at once cause one download from upstream, not twenty.
+- **It fills gaps; it does not refresh.** A branch the registry already
+  holds is served as stored, even if it has moved upstream. Clients that
+  pin a revision id always get exactly that revision. To pick up a newer
+  `main`, run `modelctl mirror`.
+- **Private and gated models** use the server's `REGISTRY_UPSTREAM_TOKEN`.
+  Without one, such a request fails with an error saying so.
+- **A model the upstream does not have** is an ordinary "not found". That
+  answer is remembered for a minute, so a client retrying a wrong name does
+  not become a stream of upstream requests.
+
+**Who can trigger a fetch.** Anyone who is allowed to download. On a
+private network that is what you want. Anywhere else, an open registry
+with pull-through lets any visitor make it download and store any public
+model, which fills your disk and uses your bandwidth. Close that with
+either or both of:
+
+- `--require-auth`, so only token holders can read, and therefore fetch;
+- `REGISTRY_PULL_THROUGH_ALLOW`, a comma-separated list of patterns over
+  the repository id, such as `meta-llama/*,google/*,*/*-GGUF`. Repositories
+  that match nothing are served only if already stored.
+
+The server logs a warning at start if pull-through is on with neither.
+
+At most two revisions are fetched at a time; further requests queue.
+
 ## Mirroring from somewhere other than Hugging Face
 
 `--upstream` (or `REGISTRY_UPSTREAM`) sets the hub to mirror from. Any

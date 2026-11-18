@@ -131,6 +131,24 @@ The upstream address is set by the operator when the server starts. It is
 never taken from a request, so an API caller cannot make the server fetch
 from an arbitrary host.
 
+## Pull-through caching
+
+Pull-through is the mirror above, started by a read instead of a command.
+The three Hugging Face routes and the registry's own revision lookup all
+resolve a revision through one function. When that lookup misses, and
+pull-through is on and the repository is allowed, it asks a small
+coordinator to make the revision available and then looks again.
+
+The coordinator keeps one job per `repository@revision`. A request for a
+revision that is already being fetched waits on the existing job. The job
+runs on the server's own context, not the request's, so a client that
+disconnects does not stop it. Because it is the same mirror, the same
+guarantees hold: every file verified, nothing visible until all of it is
+stored.
+
+A lookup that hits is never sent upstream, so pull-through cannot change
+what a stored branch points at.
+
 ## Serving downloads
 
 `GET /{repo}/resolve/{revision}/{path}` resolves the revision, looks up the

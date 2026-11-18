@@ -290,6 +290,7 @@ func TestServeStorageConfigurationErrors(t *testing.T) {
 	}{
 		{"s3 without a bucket", map[string]string{"REGISTRY_STORAGE": "s3"}, "REGISTRY_S3_BUCKET"},
 		{"unknown storage", map[string]string{"REGISTRY_STORAGE": "tape"}, "use filesystem or s3"},
+		{"malformed pull-through pattern", map[string]string{"REGISTRY_PULL_THROUGH": "true", "REGISTRY_PULL_THROUGH_ALLOW": "meta-llama/*, [bad"}, "is not a valid pattern"},
 		{"s3 bucket that does not exist", map[string]string{"REGISTRY_STORAGE": "s3", "REGISTRY_S3_BUCKET": "absent",
 			"REGISTRY_S3_ENDPOINT": "FAKE", "REGISTRY_S3_ACCESS_KEY": "k", "REGISTRY_S3_SECRET_KEY": "s"}, `bucket "absent" does not exist`},
 	}

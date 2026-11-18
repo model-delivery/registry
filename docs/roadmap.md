@@ -17,8 +17,9 @@ of dates. Issues and pull requests that move an item forward are welcome.
 ## After that
 
 - **Scheduled sync.** Keep chosen mirrors up to date with upstream.
-- **Pull-through cache.** Fetch from upstream on first request, serve from
-  the registry afterwards.
+- **Serve while fetching.** Today the first pull-through request for a
+  model waits until the whole revision is stored. Stream files to that
+  first client as they arrive.
 - **Mirror every branch and tag** of a repository in one command.
 - **Resumable uploads** for `modelctl push`.
 - **A migration command** to move stored files between local disk and S3.

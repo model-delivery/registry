@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
@@ -25,6 +27,7 @@ func cmdServe(e *env, args []string) error {
 	data := c.String("data", e.envOr("REGISTRY_DATA", "./data"), "directory for the database and stored files (env REGISTRY_DATA)")
 	upstream := c.String("upstream", e.envOr("REGISTRY_UPSTREAM", mirror.DefaultEndpoint), "hub to mirror from (env REGISTRY_UPSTREAM)")
 	requireAuth := c.Bool("require-auth", envBool(e, "REGISTRY_REQUIRE_AUTH"), "require a token for downloads and browsing too (env REGISTRY_REQUIRE_AUTH)")
+	pullThrough := c.Bool("pull-through", envBool(e, "REGISTRY_PULL_THROUGH"), "fetch a model from the upstream hub the first time a client asks for one the registry does not hold (env REGISTRY_PULL_THROUGH); limit which with REGISTRY_PULL_THROUGH_ALLOW")
 	storage := c.String("storage", e.envOr("REGISTRY_STORAGE", "filesystem"), "where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with REGISTRY_S3_* variables")
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
@@ -69,11 +72,28 @@ func cmdServe(e *env, args []string) error {
 		return err
 	}
 
+	var allow []string
+	for _, pattern := range strings.Split(e.getenv("REGISTRY_PULL_THROUGH_ALLOW"), ",") {
+		if pattern = strings.TrimSpace(pattern); pattern != "" {
+			if _, err := path.Match(pattern, "a/b"); err != nil {
+				return usagef("REGISTRY_PULL_THROUGH_ALLOW: %q is not a valid pattern", pattern)
+			}
+			allow = append(allow, pattern)
+		}
+	}
+	if *pullThrough && !*requireAuth && len(allow) == 0 {
+		// Anyone who can reach the registry can then make it download any
+		// public model, which is fine on a private network and not on a public one.
+		log.Warn("pull-through is on with open downloads and no allow list: anyone who can reach this registry can make it fetch and store any upstream model; set REGISTRY_REQUIRE_AUTH or REGISTRY_PULL_THROUGH_ALLOW unless the network is private")
+	}
+
 	handler := server.New(reg, server.Config{
 		AnonymousRead:     !*requireAuth,
 		Upstream:          *upstream,
 		UpstreamToken:     e.getenv("REGISTRY_UPSTREAM_TOKEN"),
 		RedirectDownloads: redirect,
+		PullThrough:       *pullThrough,
+		PullThroughAllow:  allow,
 		Version:           Version,
 		Logger:            log,
 	})
@@ -85,7 +105,7 @@ func cmdServe(e *env, args []string) error {
 	// long. Slow-header attacks are still bounded.
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
-		"anonymous_read", !*requireAuth, "version", Version)
+		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()

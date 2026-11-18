@@ -93,6 +93,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | | |
 |---|---|
 | **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id. Private and gated repositories work with your Hugging Face token. |
+| **Cache on demand** | Optionally, fetch a model from Hugging Face the first time a client asks for it, then serve it from the registry from then on. Point your tools at the registry and it fills itself. |
 | **Serve** | Existing clients download through the Hugging Face compatible API, including resumable range requests. |
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
 | **Version** | Every revision is immutable and addressed by id. Branches move, tags never do. |
@@ -139,6 +140,8 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | `--data` | `REGISTRY_DATA` | `./data` | Database and stored files |
 | `--upstream` | `REGISTRY_UPSTREAM` | `https://huggingface.co` | Hub to mirror from |
 | `--require-auth` | `REGISTRY_REQUIRE_AUTH` | `false` | Require a token for downloads and browsing too |
+| `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
+| | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
 | | `REGISTRY_UPSTREAM_TOKEN` | | Default token for the upstream hub |
@@ -156,6 +159,15 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 
 Metadata stays in SQLite in the data directory, so keep that directory on a
 persistent disk and back it up. See [docs/operations.md](docs/operations.md#s3-storage).
+
+**Pull-through caching.** With `--pull-through`, a request for a model the
+registry does not have makes it fetch that revision from the upstream hub,
+verify and store it, and then answer. The first request for a large model
+waits for the whole download; if the client gives up, the fetch carries on
+and the next request is served from the registry. Anyone allowed to
+download can trigger a fetch, so on a registry others can reach, combine it
+with `--require-auth` or an allow list. See
+[docs/operations.md](docs/operations.md#pull-through-caching).
 
 **Access.** Writing (push, mirror) always needs a token with the `write`
 role; deleting and managing tokens needs `admin`. By default anyone who can
@@ -203,8 +215,9 @@ Details, including the exact routes, are in
   on the server's disk, so you run a single instance. No replication or
   high availability yet.
 - **A mirror is a point-in-time copy.** Run `modelctl mirror` again to pick
-  up a newer upstream revision. There is no automatic sync and no
-  pull-through caching.
+  up a newer upstream revision. There is no automatic sync. Pull-through
+  caching fetches what the registry lacks, but it never refreshes a branch
+  it already holds.
 - **A mirror copies whole revisions.** You cannot yet mirror only some
   files of a repository.
 - **Repository ids are `namespace/name`**, and are case-sensitive.

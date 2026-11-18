@@ -34,6 +34,12 @@ type Config struct {
 	// registry. It only has an effect when the storage backend can sign
 	// URLs, and clients must be able to reach the object store directly.
 	RedirectDownloads bool
+	// PullThrough fetches a revision from the upstream the first time a
+	// client asks for one the registry does not hold, then serves it.
+	PullThrough bool
+	// PullThroughAllow limits pull-through to repositories matching one of
+	// these globs over the whole id ("meta-llama/*"). Empty allows all.
+	PullThroughAllow []string
 	// UpstreamClient overrides the HTTP client used to reach the upstream.
 	UpstreamClient *http.Client
 	Version        string
@@ -42,9 +48,10 @@ type Config struct {
 
 // Server holds the handler's dependencies.
 type Server struct {
-	reg *registry.Registry
-	cfg Config
-	log *slog.Logger
+	reg    *registry.Registry
+	cfg    Config
+	log    *slog.Logger
+	puller *puller // nil unless pull-through caching is on
 }
 
 // New builds the HTTP handler.
@@ -56,6 +63,9 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 		cfg.Upstream = mirror.DefaultEndpoint
 	}
 	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger}
+	if cfg.PullThrough {
+		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.Logger)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -135,6 +145,11 @@ func splitPath(escaped string) ([]string, bool) {
 		parts[i] = dec
 	}
 	return parts, true
+}
+
+// upstream is the hub this registry mirrors from, with the operator's token.
+func (s *Server) upstream() *mirror.Upstream {
+	return &mirror.Upstream{Endpoint: s.cfg.Upstream, Token: s.cfg.UpstreamToken, Client: s.cfg.UpstreamClient}
 }
 
 // ---- authentication ----
@@ -223,6 +238,9 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // statusFor maps registry errors to HTTP statuses and the error codes
 // Hugging Face clients look for in X-Error-Code.
 func statusFor(err error) (int, string) {
+	if errors.As(err, new(errUpstream)) {
+		return http.StatusBadGateway, ""
+	}
 	switch {
 	case errors.Is(err, registry.ErrRepoNotFound):
 		return http.StatusNotFound, "RepoNotFound"

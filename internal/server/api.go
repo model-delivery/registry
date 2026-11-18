@@ -76,7 +76,7 @@ type RevisionDetail struct {
 }
 
 func (s *Server) apiGetRevision(w http.ResponseWriter, r *http.Request) {
-	c, err := s.reg.Resolve(r.Context(), repoParam(r), r.PathValue("rev"))
+	c, err := s.resolve(r.Context(), repoParam(r), r.PathValue("rev"))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -183,7 +183,7 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	up := &mirror.Upstream{Endpoint: s.cfg.Upstream, Token: s.cfg.UpstreamToken, Client: s.cfg.UpstreamClient}
+	up := s.upstream()
 	if req.UpstreamToken != "" {
 		up.Token = req.UpstreamToken
 	}

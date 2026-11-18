@@ -62,7 +62,7 @@ func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) hfModelInfo(w http.ResponseWriter, r *http.Request, repo, rev string) {
-	c, err := s.reg.Resolve(r.Context(), repo, rev)
+	c, err := s.resolve(r.Context(), repo, rev)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -114,7 +114,7 @@ type hfTreeEntry struct {
 }
 
 func (s *Server) hfTree(w http.ResponseWriter, r *http.Request, repo, rev, dir string) {
-	c, err := s.reg.Resolve(r.Context(), repo, rev)
+	c, err := s.resolve(r.Context(), repo, rev)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -209,7 +209,7 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	repo, rev, filePath := segs[0]+"/"+segs[1], segs[3], strings.Join(segs[4:], "/")
-	c, err := s.reg.Resolve(r.Context(), repo, rev)
+	c, err := s.resolve(r.Context(), repo, rev)
 	if err != nil {
 		s.fail(w, r, err)
 		return

@@ -287,6 +287,45 @@ func TestHubClientAgainstPush(t *testing.T) {
 	}
 }
 
+// TestHubClientPullThrough points huggingface_hub at an empty registry with
+// pull-through on. The client asks for a model the registry has never seen,
+// and gets it: the registry fetches it from its upstream, verifies it,
+// stores it, and answers.
+func TestHubClientPullThrough(t *testing.T) {
+	python(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for p, content := range map[string]string{
+		"config.json":       `{"model_type":"tiny"}`,
+		"model.safetensors": strings.Repeat("\x00weights\xff", 100_000),
+		"sub/vocab.txt":     "a\nb\n",
+	} {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hub := start(t, server.Config{AnonymousRead: true})
+	pushed, err := client.New(hub.srv.URL, hub.write).Push(ctx, dir, "acme/on-demand", client.PushOptions{Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.srv.URL, PullThrough: true})
+	if _, err := local.reg.GetRepo(ctx, "acme/on-demand"); err == nil {
+		t.Fatal("the registry already has the repository before anyone asked")
+	}
+	res := hfDownload(t, local.srv.URL, "acme/on-demand", "main", "sub/vocab.txt")
+	checkSnapshot(t, local, "acme/on-demand", pushed.SHA, res)
+
+	// With the upstream gone, a second client still downloads everything.
+	hub.srv.Close()
+	checkSnapshot(t, local, "acme/on-demand", pushed.SHA, hfDownload(t, local.srv.URL, "acme/on-demand", pushed.SHA, "config.json"))
+}
+
 // s3Stores returns the S3 backends to test against: always the in-memory
 // fake, plus a real S3-compatible service when REGISTRY_TEST_S3_ENDPOINT
 // (and _BUCKET, _ACCESS_KEY, _SECRET_KEY) point at one.

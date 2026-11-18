@@ -18,7 +18,7 @@ Do not report security problems in public issues. See
 
 ## Development setup
 
-You need Go 1.26 or newer. [Task](https://taskfile.dev) is optional but
+You need Go 1.27 or newer. [Task](https://taskfile.dev) is optional but
 runs the common commands. `task check` also needs
 [golangci-lint](https://golangci-lint.run) v2.14.0, the version the checks
 pin. The compatibility tests also need Python with `huggingface_hub`

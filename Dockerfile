@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # The build stage runs on the builder's own platform and cross-compiles, so
 # multi-arch images build at native speed. The binary has no C dependencies.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download

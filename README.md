@@ -238,7 +238,7 @@ is stored once per unique SHA-256, on disk or in a bucket. A revision is a list 
 
 ## Building from source
 
-Needs Go 1.26 or newer. [Task](https://taskfile.dev) runs the common
+Needs Go 1.27 or newer. [Task](https://taskfile.dev) runs the common
 commands:
 
 ```bash

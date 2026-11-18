@@ -75,23 +75,54 @@ func guardHop(ctx context.Context, target *url.URL) (context.Context, error) {
 	return context.WithValue(ctx, guardKey{}, dialAddr(target)), nil
 }
 
-// guardedClient is the HTTP client used unless Upstream.Client overrides it.
-var guardedClient = &http.Client{Transport: guardedTransport()}
+// timeouts bounds how long the registry waits on an upstream host before
+// any content flows.
+type timeouts struct {
+	// dial is the limit on opening a connection.
+	dial time.Duration
+	// tlsHandshake is the limit on the TLS handshake that follows.
+	tlsHandshake time.Duration
+	// responseHeader is how long a host may take to start answering once the
+	// request has been sent.
+	responseHeader time.Duration
+}
 
-// guardedTransport is the default transport with one change: a connection
-// made for a guarded hop is refused if it is to a local address.
+// upstreamTimeouts is what the default client waits. There is deliberately
+// no limit on a whole request: a model file takes as long as it takes, and a
+// transfer that is moving is never cut. What is bounded is a host that
+// accepts a connection and then says nothing, which would otherwise hold a
+// pull-through job until the job's own timeout, hours later.
+var upstreamTimeouts = timeouts{
+	dial:           30 * time.Second,
+	tlsHandshake:   15 * time.Second,
+	responseHeader: time.Minute,
+}
+
+// keepAlive is how often an idle upstream connection is probed.
+const keepAlive = 30 * time.Second
+
+// guardedClient is the HTTP client used unless Upstream.Client overrides it.
+// It has no Timeout of its own, for the reason given at upstreamTimeouts.
+var guardedClient = &http.Client{Transport: guardedTransport(upstreamTimeouts)}
+
+// guardedTransport is the default transport with two changes: a connection
+// made for a guarded hop is refused if it is to a local address, and
+// connecting, the TLS handshake and the wait for an answer to begin are
+// each limited by limits.
 //
 // Only the connection to the hop's own host is checked. When a proxy is
 // configured the connection is to the proxy, which is the operator's own
 // and resolves the name itself; what it may reach is its policy.
-func guardedTransport() http.RoundTripper {
+func guardedTransport(limits timeouts) *http.Transport {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
 	}
 	t := base.Clone()
-	open := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	guarded := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: refuseLocal}
+	t.TLSHandshakeTimeout = limits.tlsHandshake
+	t.ResponseHeaderTimeout = limits.responseHeader
+	open := &net.Dialer{Timeout: limits.dial, KeepAlive: keepAlive}
+	guarded := &net.Dialer{Timeout: limits.dial, KeepAlive: keepAlive, Control: refuseLocal}
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if hop, _ := ctx.Value(guardKey{}).(string); hop != "" && strings.EqualFold(hop, addr) {
 			return guarded.DialContext(ctx, network, addr)

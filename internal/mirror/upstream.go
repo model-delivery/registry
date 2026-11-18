@@ -32,6 +32,46 @@ var (
 	ErrUnsafeUpstream = errors.New("the upstream pointed at an address the registry does not follow")
 )
 
+// upstreamError marks a failure as the upstream's or the network's doing:
+// it could not be reached, answered with an error, sent something that is
+// not what it listed. It adds nothing to the message.
+type upstreamError struct{ err error }
+
+func (e upstreamError) Error() string { return e.err.Error() }
+func (e upstreamError) Unwrap() error { return e.err }
+
+// blame marks err as caused by the upstream. A request this side gave up
+// on (a cancelled context) is nobody's failure and is left unmarked.
+func blame(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || FromUpstream(err) {
+		return err
+	}
+	return upstreamError{err}
+}
+
+// FromUpstream reports whether err was caused by the upstream or the
+// network between: not found, access denied, an address the registry does
+// not follow, a transport failure, a malformed answer, or content that did
+// not match its digest. Everything else that can go wrong in a mirror is
+// this registry's own failure (its disk, its database), and a caller that
+// answers a client should not describe that as the upstream's.
+func FromUpstream(err error) bool {
+	return errors.As(err, new(upstreamError)) || errors.Is(err, ErrUpstreamNotFound) ||
+		errors.Is(err, ErrUpstreamAuth) || errors.Is(err, ErrUnsafeUpstream)
+}
+
+// blamedBody is an upstream response body whose read errors are marked as
+// the upstream's, so they can be told from a failure to store what was read.
+type blamedBody struct{ io.ReadCloser }
+
+func (b blamedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = blame(err)
+	}
+	return n, err
+}
+
 // Upstream talks to a hub's public HTTP API.
 //
 // The operator configures one address, Endpoint, and trusts it. Everything

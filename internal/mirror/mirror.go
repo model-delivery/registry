@@ -105,28 +105,30 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 	if revision == "" {
 		revision = defaultRevision
 	}
+	// Everything that can fail from here on is the upstream's doing: it
+	// could not be reached, or what it answered cannot be mirrored.
 	info, err := up.info(ctx, repo, revision)
 	if err != nil {
-		return nil, err
+		return nil, blame(err)
 	}
 	// The hub answers with the canonical id, which can differ from what was
 	// asked for after a rename. Store under the canonical one.
 	if err := registry.ValidateRepoName(info.ID); err != nil {
-		return nil, fmt.Errorf("upstream repository id %q is not supported: %w", info.ID, err)
+		return nil, blame(fmt.Errorf("upstream repository id %q is not supported: %w", info.ID, err))
 	}
 	if !registry.IsSHA(info.SHA) {
-		return nil, fmt.Errorf("upstream revision id %q is not a 40-character hash", info.SHA)
+		return nil, blame(fmt.Errorf("upstream revision id %q is not a 40-character hash", info.SHA))
 	}
 	entries, err := up.tree(ctx, info.ID, info.SHA)
 	if err != nil {
-		return nil, err
+		return nil, blame(err)
 	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("upstream revision %s has no files", info.SHA)
+		return nil, blame(fmt.Errorf("upstream revision %s has no files", info.SHA))
 	}
 	for _, e := range entries {
 		if err := registry.ValidatePath(e.Path); err != nil {
-			return nil, err
+			return nil, blame(err)
 		}
 	}
 	return &Plan{up: up, revision: revision, Info: info, Entries: entries}, nil
@@ -310,7 +312,7 @@ func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo,
 	want := blob.Expect{Size: e.Size}
 	if f.LFS {
 		if !blob.ValidDigest(e.LFSSHA256) {
-			return f, false, fmt.Errorf("upstream lists a malformed sha256 %q", e.LFSSHA256)
+			return f, false, blame(fmt.Errorf("upstream lists a malformed sha256 %q", e.LFSSHA256))
 		}
 		// For LFS files the hub publishes the SHA-256 of the content.
 		want.SHA256 = e.LFSSHA256
@@ -342,9 +344,15 @@ func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo,
 			return f, false, nil
 		}
 	}
-	body := up.open(ctx, repo, sha, e.Path)
+	// Two things can fail below, and they are told apart: reading from the
+	// upstream (marked by blamedBody) or content that is not what it listed
+	// is the upstream's failure; staging and recording the bytes is ours.
+	body := blamedBody{up.open(ctx, repo, sha, e.Path)}
 	defer func() { _ = body.Close() }()
 	info, err := reg.PutBlob(ctx, body, want)
+	if errors.Is(err, blob.ErrMismatch) {
+		err = blame(err)
+	}
 	if err != nil {
 		return f, false, err
 	}

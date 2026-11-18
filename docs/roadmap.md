@@ -8,8 +8,9 @@ of dates. Issues and pull requests that move an item forward are welcome.
 
 - **Partial mirrors.** `modelctl mirror --include "*.gguf"` to copy only
   some files of a large repository, recorded honestly as a subset.
-- **Uploads from Hugging Face clients.** `upload_file`, `upload_folder` and
-  `hf upload` against the registry, so pushing needs no extra tool.
+- **Xet uploads.** Uploads from Hugging Face clients work today, but a
+  stock client needs `HF_HUB_DISABLE_XET=1` for large files. Speaking the
+  Xet protocol would remove that step.
 - **Integrity check.** `modelctl verify` to re-hash stored files against
   their names and report any damage.
 - **Datasets.** The same registry for dataset repositories.

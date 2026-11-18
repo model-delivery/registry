@@ -36,10 +36,6 @@ const hfTime = "2006-01-02T15:04:05.000Z"
 const presignTTL = time.Hour
 
 func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeError(w, http.StatusMethodNotAllowed, "the Hugging Face compatible API is read-only; see docs/compatibility.md")
-		return
-	}
 	segs, ok := splitPath(strings.TrimPrefix(r.URL.EscapedPath(), "/api/models"))
 	if !ok || len(segs) < 2 {
 		// Listing/search (GET /api/models) and single-segment legacy ids.
@@ -48,7 +44,33 @@ func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := segs[0] + "/" + segs[1]
 	rest := segs[2:]
+	if r.Method == http.MethodPost {
+		// The upload steps (hfupload.go). All of them write.
+		if !s.requireRole(w, r, roleWrite) {
+			return
+		}
+		switch {
+		case len(rest) == 2 && rest[0] == "preupload":
+			s.hfPreupload(w, r, repo, rest[1])
+		case len(rest) == 2 && rest[0] == "commit":
+			s.hfCommit(w, r, repo, rest[1])
+		case len(rest) == 2 && rest[0] == "branch":
+			s.hfCreateBranch(w, r, repo, rest[1])
+		default:
+			hfError(w, http.StatusNotFound, "this Hugging Face endpoint is not implemented by the registry; see docs/compatibility.md")
+		}
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed; see docs/compatibility.md for what the registry implements")
+		return
+	}
 	switch {
+	case len(rest) == 2 && (rest[0] == "xet-write-token" || rest[0] == "xet-read-token"):
+		// A client with hf_xet installed asks for this before uploading. Its
+		// error shows only the address that failed, never the response body,
+		// so the explanation is put in the address it is redirected to.
+		http.Redirect(w, r, "/api/xet-is-not-supported/set-HF_HUB_DISABLE_XET=1-and-upload-again", http.StatusTemporaryRedirect)
 	case len(rest) == 0:
 		s.hfModelInfo(w, r, repo, "main")
 	case len(rest) == 2 && rest[0] == "revision":

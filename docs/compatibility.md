@@ -44,11 +44,58 @@ registry you run.
 | `HfApi.list_repo_files`, `list_repo_tree` | |
 | `HfApi.list_repo_refs` | |
 | Reading with `HF_TOKEN` from a registry that requires a token | And being refused without one |
+| `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Adding, replacing and deleting files. **Large files need `HF_HUB_DISABLE_XET=1`**; see [Uploading](#uploading) |
 
 Libraries that fetch files through `huggingface_hub` (`transformers`,
 `diffusers`, `sentence-transformers` and others) use the calls above, so
 they are expected to work. They are not tested individually yet. If one
 does not work, please open an issue naming the library and the call.
+
+## Uploading
+
+`hf upload`, `upload_file`, `upload_folder` and `create_commit` work
+against the registry (each is run against it in `test/e2e`), so a training script that pushes to the Hub can push
+to your registry instead. The token needs the `write` role.
+
+```bash
+export HF_ENDPOINT=http://localhost:8080
+export HF_TOKEN=md_...              # a registry token with the write role
+export HF_HUB_DISABLE_XET=1         # required for files over 10 MiB, see below
+hf upload my-team/my-model ./my-model
+```
+
+**Files over 10 MiB need `HF_HUB_DISABLE_XET=1`.** `huggingface_hub`
+installs the `hf_xet` package by default, and with it present the client
+sends large files through Hugging Face's Xet storage protocol without
+asking the server whether it supports that. The registry does not speak
+Xet. With the variable set, the client uses its older large-file protocol,
+which the registry implements. Without it:
+
+- files up to 10 MiB upload normally, because they travel inside the
+  commit request and never touch Xet;
+- a larger file fails, and the error names the address
+  `/api/xet-is-not-supported/set-HF_HUB_DISABLE_XET=1-and-upload-again`,
+  which is the registry telling you what to do in the only place that
+  client will print.
+
+A client without `hf_xet` installed needs no setting.
+
+What an upload does and does not do:
+
+- **Each upload is a new revision** on the branch (default `main`); earlier
+  revisions are unchanged. Uploading content identical to the branch's
+  current revision makes no new revision.
+- **Every file is verified.** A large file is uploaded under its SHA-256
+  and rejected unless the bytes match.
+- **A file already stored is not sent again**, whichever repository or
+  revision it came from.
+- **The repository is created on first use.** A repository id without a
+  namespace is put under the name of the token that created it.
+- **Not supported:** pull requests (`create_pr`), uploading to a revision
+  id, datasets and Spaces, and `git push`.
+- **Not tested:** `upload_large_folder`, and `push_to_hub` in libraries
+  such as `transformers`. They are built on the calls above, so they are
+  expected to work with the same setting.
 
 ## Routes
 
@@ -60,6 +107,13 @@ does not work, please open an issue naming the library and the call.
 | `GET /api/models/{repo}/refs` | |
 | `HEAD`, `GET /{repo}/resolve/{revision}/{path}` | Sends `ETag`, `X-Repo-Commit`, `Content-Length`, `Accept-Ranges`; honours `Range` and `If-None-Match` |
 | `GET /api/whoami-v2` | Reports the registry token's name |
+| `POST /api/repos/create` | Models only. `409` if the repository exists, which `exist_ok` clients accept |
+| `POST /api/models/{repo}/preupload/{branch}` | Files up to 10 MiB are sent inline, larger ones through the large-file protocol |
+| `POST /{repo}.git/info/lfs/objects/batch` | git-lfs batch API, `upload` operation, `basic` transfer. Returns a signed, expiring URL per object, or nothing for an object already stored |
+| `PUT /api/lfs/upload/{sha256}` | The signed URL. Accepts only the bytes it was issued for |
+| `POST /api/models/{repo}/commit/{branch}` | Line-delimited commit: `file`, `lfsFile`, `deletedFile`, `deletedFolder`. `412` if `parentCommit` is no longer the branch's revision |
+| `POST /api/models/{repo}/branch/{branch}` | |
+| `POST /api/validate-yaml` | Always accepts; the registry stores `README.md` as a file |
 
 When the registry is configured to redirect downloads to S3, `resolve`
 answers `302` with `Location` (a signed bucket URL), `X-Linked-Etag`,
@@ -82,7 +136,8 @@ Hub reports LFS files, with its SHA-256 as the `ETag`.
 
 | | |
 |---|---|
-| **Uploads from Hugging Face clients** (`upload_file`, `upload_folder`, `create_repo`, `hf upload`, `push_to_hub`) | Use `modelctl push` or the [REST API](api.md). Planned. |
+| **Xet uploads** | Large files from a client with `hf_xet` installed need `HF_HUB_DISABLE_XET=1`. See [Uploading](#uploading). |
+| **Pull requests, uploading to a revision id** | Upload to a branch, or use `modelctl push`. |
 | **Datasets and Spaces** | Only model repositories. `repo_type="dataset"` returns 404. |
 | **Search and listing** (`list_models`, `GET /api/models`) | Use `modelctl list` or the web UI. |
 | **Repository ids without a namespace** (`gpt2`) | Use the full id (`openai-community/gpt2`). When mirroring, the registry stores the repository under the canonical id the upstream reports. |

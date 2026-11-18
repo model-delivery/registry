@@ -155,6 +155,12 @@ func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
 		s.uiError(w, r, err)
 		return
 	}
+	if len(detail.Revisions) == 0 {
+		s.render(w, r, http.StatusOK, "error.html", name, map[string]any{
+			"Error": "This repository has no revisions yet. Upload to it with `hf upload` or `modelctl push`.",
+		})
+		return
+	}
 	// Show the requested revision, else main, else the newest one.
 	rev := r.URL.Query().Get("rev")
 	if rev == "" && len(detail.Revisions) > 0 {

@@ -53,6 +53,10 @@ type Server struct {
 	cfg    Config
 	log    *slog.Logger
 	puller *puller // nil unless pull-through caching is on
+	// uploadKey signs the URLs large files are uploaded to. It is made at
+	// start and never stored, so a restart invalidates URLs in flight; the
+	// client then asks for new ones.
+	uploadKey []byte
 }
 
 // New builds the HTTP handler.
@@ -63,7 +67,7 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 	if cfg.Upstream == "" {
 		cfg.Upstream = mirror.DefaultEndpoint
 	}
-	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger}
+	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, uploadKey: newUploadKey()}
 	if cfg.PullThrough {
 		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.Logger)
 	}
@@ -93,6 +97,13 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 	// hand instead of by mux patterns.
 	mux.Handle("/api/models/", s.need(roleRead, s.hfModels))
 	mux.HandleFunc("GET /api/whoami-v2", s.hfWhoami)
+	// Uploads from Hugging Face clients (hfupload.go).
+	mux.Handle("POST /api/repos/create", s.need(roleWrite, s.hfCreateRepo))
+	mux.Handle("POST /api/validate-yaml", s.need(roleRead, s.hfValidateYAML))
+	mux.HandleFunc("PUT /api/lfs/upload/{sha256}", s.hfLFSUpload) // authorised by its signed URL
+	mux.HandleFunc("/api/xet-is-not-supported/", func(w http.ResponseWriter, _ *http.Request) {
+		hfError(w, http.StatusBadRequest, xetHint)
+	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "this endpoint is not implemented by the registry")
 	})
@@ -121,6 +132,8 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "malformed path")
 	case len(segs) == 0:
 		s.uiIndex(w, r)
+	case len(segs) == 6 && strings.HasSuffix(segs[1], ".git") && strings.Join(segs[2:], "/") == "info/lfs/objects/batch":
+		s.hfLFSBatch(w, r, segs[0]+"/"+strings.TrimSuffix(segs[1], ".git"))
 	case len(segs) >= 5 && segs[2] == "resolve":
 		s.need(roleRead, func(w http.ResponseWriter, r *http.Request) { s.hfResolve(w, r, segs) }).ServeHTTP(w, r)
 	case len(segs) == 2 && r.Method == http.MethodGet:

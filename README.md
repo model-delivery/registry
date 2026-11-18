@@ -201,7 +201,7 @@ Tested against the real `huggingface_hub` Python library in CI.
 | Resuming interrupted downloads | Supported |
 | Private access with `HF_TOKEN` | Supported |
 | Libraries that download through `huggingface_hub` (`transformers`, `diffusers`, ...) | Expected to work; not individually tested yet |
-| Uploading with Hugging Face clients (`upload_file`, `hf upload`, `push_to_hub`) | Not supported; use `modelctl push` |
+| Uploading with `hf upload`, `upload_file`, `upload_folder`, `create_commit` | Supported. Files over 10 MiB need `HF_HUB_DISABLE_XET=1` on the client, because the registry does not speak Xet |
 | Datasets and Spaces | Not supported |
 | Model search and listing (`list_models`) | Not supported |
 | `git clone` / git-lfs access | Not supported |

@@ -80,6 +80,10 @@ func cmdServe(e *env, args []string) error {
 	if err != nil {
 		return err
 	}
+	maxBlob, err := envBytes(e, "REGISTRY_MAX_BLOB_BYTES")
+	if err != nil {
+		return err
+	}
 
 	handler := server.New(reg, server.Config{
 		AnonymousRead:     !*requireAuth,
@@ -93,13 +97,15 @@ func cmdServe(e *env, args []string) error {
 		Logger:            log,
 
 		PullThroughMaxFileBytes: pullMaxFile,
+		MaxBlobBytes:            maxBlob,
 	})
 	ln, err := (&net.ListenConfig{}).Listen(e.ctx, "tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}
 	// No read or write timeout: model files are large and transfers are
-	// long. Slow-header attacks are still bounded.
+	// long. Slow-header attacks are still bounded, and the handlers of the
+	// small JSON and form routes set a deadline for their own bodies.
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
 		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)

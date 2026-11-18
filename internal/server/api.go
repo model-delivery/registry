@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -19,10 +20,8 @@ import (
 
 func repoParam(r *http.Request) string { return r.PathValue("ns") + "/" + r.PathValue("name") }
 
-func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := s.readJSON(w, r, 64<<20, v, true); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return false
 	}
@@ -106,7 +105,7 @@ type CommitRequest struct {
 
 func (s *Server) apiCommit(w http.ResponseWriter, r *http.Request) {
 	var req CommitRequest
-	if !decodeBody(w, r, &req) {
+	if !s.decodeBody(w, r, &req) {
 		return
 	}
 	if req.Branch == "" {
@@ -160,10 +159,22 @@ func (s *Server) apiPutBlob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "blob name must be a lowercase hex SHA-256")
 		return
 	}
+	body := io.Reader(r.Body)
+	if s.cfg.MaxBlobBytes > 0 {
+		if over, err := s.blobTooLarge(r.ContentLength); over {
+			s.fail(w, r, err)
+			return
+		}
+		// A body sent without a declared length is cut off at the limit.
+		body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBlobBytes)
+	}
 	// The body is streamed to disk and hashed as it arrives; the upload is
 	// rejected unless it hashes to the digest in the URL.
-	info, err := s.reg.PutBlob(r.Context(), r.Body, blob.Expect{SHA256: digest, Size: r.ContentLength})
+	info, err := s.reg.PutBlob(r.Context(), body, blob.Expect{SHA256: digest, Size: r.ContentLength})
 	if err != nil {
+		if errors.As(err, new(*http.MaxBytesError)) {
+			err = s.blobLimitError()
+		}
 		s.fail(w, r, err)
 		return
 	}
@@ -181,7 +192,7 @@ type MirrorRequest struct {
 
 func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	var req MirrorRequest
-	if !decodeBody(w, r, &req) {
+	if !s.decodeBody(w, r, &req) {
 		return
 	}
 	up := s.upstream()
@@ -268,7 +279,7 @@ func (s *Server) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 		Role string `json:"role"`
 	}
-	if !decodeBody(w, r, &req) {
+	if !s.decodeBody(w, r, &req) {
 		return
 	}
 	secret, err := s.reg.CreateToken(r.Context(), req.Name, req.Role)

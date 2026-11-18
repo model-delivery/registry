@@ -12,6 +12,10 @@ for administration. The Hugging Face compatible routes are described in
 - **Errors**: a non-2xx status with `{"error": "what went wrong"}`.
   `401` means no valid token was sent; `403` means the token's role is too
   low.
+- **Request bodies**: a JSON body may be at most 64 MiB and must arrive
+  within 30 seconds, or the request is refused with `400`. File uploads
+  have no time limit. If the operator has set `REGISTRY_MAX_BLOB_BYTES`, a
+  larger file is refused with `413`.
 - **Repository ids** are `namespace/name` and appear in paths as two
   segments.
 - **Revision** means a branch name, a tag name, or a 40-character revision

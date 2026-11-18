@@ -555,13 +555,21 @@ type RepoSummary struct {
 }
 
 // ListRepos returns every repository by name.
+//
+// The totals are computed for all repositories in one pass over the
+// revisions and one over the files, not once per repository: this listing
+// is what the home page and an anonymous API call run.
 func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT r.id, r.name, r.upstream, r.created_at,
-		(SELECT COUNT(*) FROM commits c WHERE c.repo_id = r.id),
-		(SELECT COALESCE(SUM(b.size), 0) FROM blobs b WHERE b.sha256 IN
-			(SELECT f.sha256 FROM files f JOIN commits c ON c.id = f.commit_id WHERE c.repo_id = r.id)),
-		COALESCE((SELECT MAX(c.created_at) FROM commits c WHERE c.repo_id = r.id), r.created_at)
-		FROM repos r ORDER BY r.name`)
+		COALESCE(rev.n, 0), COALESCE(held.bytes, 0), COALESCE(rev.latest, r.created_at)
+		FROM repos r
+		LEFT JOIN (SELECT repo_id, COUNT(*) AS n, MAX(created_at) AS latest FROM commits GROUP BY repo_id) rev
+			ON rev.repo_id = r.id
+		LEFT JOIN (SELECT d.repo_id, SUM(b.size) AS bytes
+			FROM (SELECT DISTINCT c.repo_id, f.sha256 FROM files f JOIN commits c ON c.id = f.commit_id) d
+			JOIN blobs b ON b.sha256 = d.sha256 GROUP BY d.repo_id) held
+			ON held.repo_id = r.id
+		ORDER BY r.name`)
 	if err != nil {
 		return nil, err
 	}

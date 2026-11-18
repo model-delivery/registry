@@ -216,7 +216,7 @@ func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	name := repoParam(r)
 	// Typing the name guards against deleting the wrong repository.
-	if r.FormValue("confirm") != name {
+	if s.formValue(w, r, "confirm") != name {
 		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice="+url.QueryEscape("Nothing deleted: the name you typed did not match."), http.StatusSeeOther)
 		return
 	}
@@ -234,7 +234,8 @@ func (s *Server) uiLoginForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uiLogin(w http.ResponseWriter, r *http.Request) {
-	secret := strings.TrimSpace(r.FormValue("token"))
+	// Anyone can post here, so the body is bounded before it is parsed.
+	secret := strings.TrimSpace(s.formValue(w, r, "token"))
 	if _, ok := s.reg.Authenticate(r.Context(), secret); !ok {
 		s.render(w, r, http.StatusUnauthorized, "login.html", "Sign in", map[string]any{
 			"Error": "That token is not valid for this registry.",

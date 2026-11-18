@@ -146,6 +146,7 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
 | | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
+| | `REGISTRY_MAX_BLOB_BYTES` | `0` (no limit) | Largest single file, in bytes, that an upload may store. Larger uploads are refused with `413` |
 | | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
 | | `REGISTRY_ADMIN_TOKEN_FILE` | | Read the admin token from this file (a mounted secret) |
 | `--require-admin-token` | `REGISTRY_REQUIRE_ADMIN_TOKEN` | `false` | Refuse to start without a supplied admin token instead of generating one and printing it. Use on Kubernetes and anywhere logs are collected |

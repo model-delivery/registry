@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/mirror"
@@ -45,6 +46,18 @@ type Config struct {
 	// demand. A larger one is refused with an error naming `modelctl
 	// mirror`. 0 means no limit.
 	PullThroughMaxFileBytes int64
+	// MaxBlobBytes is the largest single file an upload may store, through
+	// the registry API or the Hugging Face upload routes. 0 means no limit.
+	// It does not apply to files mirrored or pulled through from upstream.
+	MaxBlobBytes int64
+	// MaxCommitBytes bounds the whole body of a Hugging Face commit request,
+	// which carries the small files of an upload. 0 means the default (see
+	// limits.go).
+	MaxCommitBytes int64
+	// BodyTimeout is how long a client may take to send the body of a small
+	// JSON or form request. 0 means the default. File transfers have no
+	// time limit.
+	BodyTimeout time.Duration
 	// BackupKeep is how many stored metadata backups to keep when one is
 	// taken through the API; 0 keeps them all.
 	BackupKeep int
@@ -264,6 +277,9 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func statusFor(err error) (int, string) {
 	if errors.As(err, new(errUpstream)) {
 		return http.StatusBadGateway, ""
+	}
+	if errors.As(err, new(errTooLarge)) {
+		return http.StatusRequestEntityTooLarge, ""
 	}
 	switch {
 	case errors.Is(err, errPullBusy):

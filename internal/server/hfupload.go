@@ -104,7 +104,7 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 		Organization string `json:"organization"`
 		Type         string `json:"type"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := s.readJSON(w, r, 1<<20, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -153,7 +153,7 @@ func (s *Server) hfPreupload(w http.ResponseWriter, r *http.Request, repo, rev s
 			Size int64  `json:"size"`
 		} `json:"files"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
+	if err := s.readJSON(w, r, 64<<20, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -209,7 +209,7 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 			Size int64  `json:"size"`
 		} `json:"objects"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
+	if err := s.readJSON(w, r, 64<<20, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -233,6 +233,10 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 		out[i] = object{OID: o.OID, Size: o.Size}
 		if !blob.ValidDigest(o.OID) || o.Size < 0 {
 			out[i].Error = &map[string]any{"code": 422, "message": "the object id must be a lowercase hex SHA-256 and the size must not be negative"}
+			continue
+		}
+		if over, err := s.blobTooLarge(o.Size); over {
+			out[i].Error = &map[string]any{"code": http.StatusRequestEntityTooLarge, "message": err.Error()}
 			continue
 		}
 		// Asking about a blob marks it in use, so garbage collection leaves
@@ -281,6 +285,10 @@ func (s *Server) hfLFSUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "this upload URL has expired: start the upload again")
 		return
 	}
+	if over, err := s.blobTooLarge(size); over {
+		s.fail(w, r, err)
+		return
+	}
 	// Streamed to storage and hashed on the way; rejected unless it is
 	// exactly the bytes the URL was issued for.
 	if _, err := s.reg.PutBlob(r.Context(), r.Body, blob.Expect{SHA256: oid, Size: size}); err != nil {
@@ -301,12 +309,20 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 		return
 	}
 	in := registry.CommitInput{Repo: repo, Branch: rev, Source: registry.SourcePush, Merge: true}
+	// Each line is bounded below; this bounds how many there can be.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxCommitBytes())
 	br := bufio.NewReaderSize(r.Body, 1<<20)
 	sawHeader := false
 	for {
 		line, err := readLine(br, maxCommitLine)
 		if errors.Is(err, io.EOF) {
 			break
+		}
+		if errors.As(err, new(*http.MaxBytesError)) {
+			hfError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"the commit is larger than %s in total: split the upload into several commits (upload_large_folder does), or send the larger files through the large-file upload, which this limit does not count",
+				humanBytes(s.maxCommitBytes())))
+			return
 		}
 		if errors.Is(err, errLineTooLong) {
 			hfError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
@@ -399,6 +415,9 @@ func (s *Server) applyCommitLine(r *http.Request, in *registry.CommitInput, entr
 		if err != nil {
 			return invalid("file %s is not valid base64", f.Path)
 		}
+		if over, err := s.blobTooLarge(int64(len(content))); over {
+			return err
+		}
 		info, err := s.reg.PutBlob(r.Context(), bytes.NewReader(content), blob.Expect{Size: int64(len(content))})
 		if err != nil {
 			return err
@@ -480,7 +499,7 @@ func (s *Server) hfCreateBranch(w http.ResponseWriter, r *http.Request, repoName
 	var req struct {
 		StartingPoint string `json:"startingPoint"`
 	}
-	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+	_ = s.readJSON(w, r, 1<<20, &req, false) // the body is optional
 	repo, err := s.reg.GetRepo(r.Context(), repoName)
 	if err != nil {
 		s.fail(w, r, err)

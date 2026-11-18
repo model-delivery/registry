@@ -451,5 +451,32 @@ before upgrading if you might need to go back.
 - Keep the data directory on a local filesystem. SQLite over a network
   filesystem (NFS, SMB) is unreliable. This applies with S3 storage too,
   since the database stays in the data directory.
-- There is no built-in rate limiting. Use the reverse proxy for that if the
-  registry is public.
+- There is no built-in rate limiting and no cap on connections. Use the
+  reverse proxy for both if the registry is public.
+- There is no storage quota. The settings under
+  [Limits on what a request may send](#limits-on-what-a-request-may-send)
+  bound single files and requests, not the total.
+
+## Limits on what a request may send
+
+File transfers have no time limit, because model files are large. By
+default they have no size limit either. Everything else a client sends is
+small, and is held to that:
+
+| What | Limit |
+|---|---|
+| One uploaded file | `REGISTRY_MAX_BLOB_BYTES`, in bytes. Unset or `0`: no limit. |
+| One file fetched by pull-through | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES`. Unset or `0`: no limit. See [pull-through caching](#pull-through-caching). |
+| A commit from a Hugging Face client (`hf upload`, `create_commit`) | 4 GiB for the whole request, which carries only the files of 10 MiB or less; larger files travel separately and are not counted. |
+| A JSON request to the API | 64 MiB, and the body must arrive within 30 seconds. |
+| A web UI form | 64 KiB, and the body must arrive within 30 seconds. |
+
+`REGISTRY_MAX_BLOB_BYTES` applies to every way of uploading: `modelctl
+push`, `PUT /api/v1/blobs`, and both the small-file and large-file paths of
+a Hugging Face client. An upload over it is refused with `413` and a
+message naming the setting, and nothing of it is kept. It does not apply
+to `modelctl mirror`, which stores what the upstream holds.
+
+A token with the write role can still fill the disk with many files under
+the limit. Give write tokens to people and jobs you would trust with the
+disk.

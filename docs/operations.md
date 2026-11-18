@@ -253,11 +253,33 @@ What to expect:
   the branch's current files, and the registry will not build a revision on
   content it has not verified. Run `modelctl mirror <repo>` first.
 
+**Your own repositories are never filled from upstream.** Pull-through
+looks upstream for two kinds of repository only: one the registry does not
+hold at all, and one that itself came from the upstream (by `modelctl
+mirror` or by pull-through). A repository created here, by `modelctl
+push`, `hf upload` or `create_repo`, is served as it is: a branch or
+revision id it does not have is "not found", whatever a repository of the
+same name on the hub contains, and the web UI keeps showing it as pushed
+here. To bring upstream revisions into such a repository on purpose, run
+`modelctl mirror`, which needs a token with the write role.
+
+That rule protects names the registry already holds. For a name it does
+not hold yet, **the allow list is the control**: without one, the first
+client to ask for `my-team/model` before you have pushed it gets whatever
+the hub has under that name, stored under your internal name. If you push
+your own models to a registry that also has pull-through on, set
+`REGISTRY_PULL_THROUGH_ALLOW` to the upstream namespaces you use and leave
+your own namespaces out of it. The list is checked against the name in the
+request and against the name the upstream reports after a rename.
+
 **Who can trigger a fetch.** Anyone who is allowed to download. On a
 private network that is what you want. Anywhere else, an open registry
 with pull-through lets any visitor make it download and store any public
-file, which fills your disk and uses your bandwidth. Close that with
-either or both of:
+file, which fills your disk and uses your bandwidth. Each revision id a
+visitor asks about is also recorded with its full file listing, so the
+metadata database grows with every upstream commit that is asked for,
+whether or not a file is ever downloaded. Close that with either or both
+of:
 
 - `--require-auth`, so only token holders can read, and therefore fetch;
 - `REGISTRY_PULL_THROUGH_ALLOW`, a comma-separated list of patterns over
@@ -266,7 +288,24 @@ either or both of:
 
 The server logs a warning at start if pull-through is on with neither.
 
-At most four fetches run at a time; further requests queue.
+An allow list limits which repositories can be fetched, not how much of
+them. Two further bounds:
+
+- `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` is the largest file fetched on
+  demand, in bytes; unset or `0` means no limit. A download of a larger
+  file is refused with an error that names this setting and the
+  `modelctl mirror` command that fetches the file deliberately. Listings
+  and file metadata for such a file still answer.
+- At most four fetches run at a time and at most 64 more wait their turn.
+  A fetch carries on after the client that started it has gone, so this
+  queue is what stops a client from stacking up fetches by asking and
+  hanging up. When it is full, a request that would start another fetch
+  is answered `503` with `Retry-After`, saying the registry is busy
+  fetching; requests for files already stored, or already being fetched,
+  are not affected.
+
+There is no total quota: watch free disk space, and see
+[Limits](#limits).
 
 If you turn pull-through off later, revisions it recorded stay listed.
 Their fetched files are served; a request for one that was never fetched

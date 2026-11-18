@@ -48,26 +48,55 @@ type errUpstream struct{ err error }
 func (e errUpstream) Error() string { return "could not fetch from upstream: " + e.err.Error() }
 func (e errUpstream) Unwrap() error { return e.err }
 
+// errPullBusy refuses a new fetch while too many are already waiting.
+var errPullBusy = errors.New("the registry is busy fetching other files from upstream; try again in a minute")
+
+// errNotFromUpstream refuses to fetch into a repository that was created in
+// this registry (by a push or an upload) and not from the upstream.
+var errNotFromUpstream = errors.New("this repository was not created from the upstream")
+
+// errFileTooLarge refuses a file over the operator's pull-through limit.
+type errFileTooLarge struct {
+	repo, path  string
+	size, limit int64
+}
+
+func (e errFileTooLarge) Error() string {
+	return fmt.Sprintf("%s is %s, more than this registry fetches on demand (REGISTRY_PULL_THROUGH_MAX_FILE_BYTES is %d): "+
+		"raise that setting, or fetch the file ahead of time with `modelctl mirror %s`", e.path, humanBytes(e.size), e.limit, e.repo)
+}
+
 const (
 	// How long an upstream "not found" is remembered, so a client retrying
 	// a wrong name does not turn into a stream of upstream requests.
 	missTTL = time.Minute
 	// How many fetches may run at once.
 	maxConcurrentPulls = 4
+	// How many more fetches may wait for one of those slots. A fetch outlives
+	// the request that started it, so without a bound a client could queue
+	// any number of them by asking and hanging up.
+	maxWaitingPulls = 64
 	// The most time one fetch may take before it is abandoned.
 	pullTimeout = 12 * time.Hour
+	// The longest "repository@revision" that is looked up or remembered as a
+	// miss. Valid names are shorter; this bounds what a request can make the
+	// registry keep.
+	maxPullKey = 512
 )
 
 type puller struct {
 	reg      *registry.Registry
 	upstream func() *mirror.Upstream
 	allow    []string
-	log      *slog.Logger
+	// maxFileBytes is the largest file fetched on demand; 0 means no limit.
+	maxFileBytes int64
+	log          *slog.Logger
 
-	mu     sync.Mutex
-	jobs   map[string]*pullJob
-	misses map[string]time.Time
-	slots  chan struct{}
+	mu      sync.Mutex
+	jobs    map[string]*pullJob
+	waiting int // jobs that do not hold a slot yet
+	misses  map[string]time.Time
+	slots   chan struct{}
 }
 
 type pullJob struct {
@@ -76,9 +105,9 @@ type pullJob struct {
 	err  error
 }
 
-func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow []string, log *slog.Logger) *puller {
+func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow []string, maxFileBytes int64, log *slog.Logger) *puller {
 	return &puller{
-		reg: reg, upstream: upstream, allow: allow, log: log,
+		reg: reg, upstream: upstream, allow: allow, maxFileBytes: maxFileBytes, log: log,
 		jobs: map[string]*pullJob{}, misses: map[string]time.Time{},
 		slots: make(chan struct{}, maxConcurrentPulls),
 	}
@@ -101,11 +130,18 @@ func (p *puller) allowed(repo string) bool {
 
 // share runs work once per key however many callers ask for it at the same
 // time, on the server's own context, and lets each caller wait only as
-// long as its own ctx lives.
+// long as its own ctx lives. A new job is refused with errPullBusy while
+// maxWaitingPulls others are waiting for a slot; joining a job that already
+// exists is never refused.
 func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
 	p.mu.Lock()
 	job := p.jobs[key]
 	if job == nil {
+		if p.waiting >= maxWaitingPulls {
+			p.mu.Unlock()
+			return nil, errPullBusy
+		}
+		p.waiting++
 		job = &pullJob{done: make(chan struct{})}
 		p.jobs[key] = job
 		// Deliberately not the request's context: the fetch must outlive the
@@ -120,6 +156,9 @@ func (p *puller) share(ctx context.Context, key string, work func(ctx context.Co
 				close(job.done)
 			}()
 			p.slots <- struct{}{}
+			p.mu.Lock()
+			p.waiting--
+			p.mu.Unlock()
 			defer func() { <-p.slots }()
 			work(bg, job)
 		}()
@@ -139,6 +178,9 @@ func (p *puller) share(ctx context.Context, key string, work func(ctx context.Co
 // the upstream's canonical id and can differ from repo after a rename.
 func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	key := repo + "@" + rev
+	if len(key) > maxPullKey {
+		return "", fmt.Errorf("%w: %s", mirror.ErrUpstreamNotFound, repo)
+	}
 	p.mu.Lock()
 	if until, missed := p.misses[key]; missed {
 		if time.Now().Before(until) {
@@ -165,6 +207,14 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 			p.log.Warn("pull-through could not resolve upstream", "repo", repo, "revision", rev, "error", err)
 			return
 		}
+		// The upstream answers with its canonical id, which differs from
+		// what was asked for after a rename. The allow list covers the name
+		// the revision is stored under, not only the one in the request.
+		if plan.Info.ID != repo && !p.allowed(plan.Info.ID) {
+			job.err = fmt.Errorf("%w: %s is named %s upstream, which pull-through is not allowed to fetch",
+				mirror.ErrUpstreamNotFound, repo, plan.Info.ID)
+			return
+		}
 		c, err := plan.RecordLazy(ctx, p.reg)
 		if err != nil {
 			job.err = err
@@ -183,7 +233,17 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 
 // ensureFile fetches the content of one pending file of revision c.
 func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.File) error {
-	_, err := p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context, job *pullJob) {
+	repo, err := p.reg.GetRepo(ctx, c.Repo)
+	if err != nil {
+		return err
+	}
+	if repo.Upstream == "" {
+		return errNotFromUpstream
+	}
+	if p.maxFileBytes > 0 && f.Size > p.maxFileBytes {
+		return errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
+	}
+	_, err = p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context, job *pullJob) {
 		started := time.Now()
 		if err := mirror.FetchFile(ctx, p.upstream(), p.reg, c, f); err != nil {
 			job.err = err
@@ -199,27 +259,52 @@ func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.F
 // resolve is Registry.Resolve with pull-through: a revision the registry
 // does not hold is recorded from upstream first, when that is enabled and
 // the repository is allowed.
+//
+// Only two kinds of repository are ever looked up upstream: one the
+// registry does not hold at all, and one that itself came from the upstream
+// (by mirroring or pull-through, so its upstream field is set). A
+// repository created here by a push or an upload is never added to from
+// upstream: whoever holds the same name on the hub must not be able to put
+// revisions into it.
 func (s *Server) resolve(ctx context.Context, repo, rev string) (registry.Commit, error) {
 	c, err := s.reg.Resolve(ctx, repo, rev)
 	if err == nil || s.puller == nil {
 		return c, err
 	}
-	if !errors.Is(err, registry.ErrRepoNotFound) && !errors.Is(err, registry.ErrRevisionNotFound) {
+	switch {
+	case errors.Is(err, registry.ErrRepoNotFound):
+		// Not held at all. The allow list decides, below.
+	case errors.Is(err, registry.ErrRevisionNotFound):
+		held, repoErr := s.reg.GetRepo(ctx, repo)
+		if repoErr != nil || held.Upstream == "" {
+			return c, err
+		}
+	default:
 		return c, err
 	}
-	if registry.ValidateRepoName(repo) != nil || !s.puller.allowed(repo) {
+	// Nothing is sent upstream that the registry itself would not accept
+	// as a name.
+	if registry.ValidateRepoName(repo) != nil || !validRevision(rev) || !s.puller.allowed(repo) {
 		return c, err
 	}
 	stored, pullErr := s.puller.ensure(ctx, repo, rev)
 	switch {
 	case pullErr == nil:
 		return s.reg.Resolve(ctx, stored, rev)
-	case errors.Is(pullErr, mirror.ErrUpstreamNotFound), errors.Is(pullErr, registry.ErrInvalid):
-		// Upstream does not have it either: the local "not found" stands.
+	case errors.Is(pullErr, mirror.ErrUpstreamNotFound), errors.Is(pullErr, registry.ErrInvalid),
+		errors.Is(pullErr, registry.ErrLocalRepo):
+		// Upstream does not have it either, or it belongs in a repository
+		// that was created here: the local "not found" stands.
 		return c, err
-	case errors.Is(pullErr, context.Canceled), errors.Is(pullErr, context.DeadlineExceeded):
+	case errors.Is(pullErr, context.Canceled), errors.Is(pullErr, context.DeadlineExceeded), errors.Is(pullErr, errPullBusy):
 		return c, pullErr
 	default:
 		return c, errUpstream{pullErr}
 	}
+}
+
+// validRevision reports whether rev could name a revision: a full revision
+// id, or a branch or tag name the registry would accept.
+func validRevision(rev string) bool {
+	return registry.IsSHA(rev) || registry.ValidateRefName(rev) == nil
 }

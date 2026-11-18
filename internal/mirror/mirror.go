@@ -29,6 +29,12 @@ type Event struct {
 	Error           string `json:"error,omitempty"`
 }
 
+// maxStoredInfo is the largest upstream model description kept with a
+// revision. It is provenance, shown back by the model info route; a larger
+// one is not stored at all, so a revision's metadata stays small whatever
+// the upstream sends.
+const maxStoredInfo = 1 << 20
+
 // Plan is a resolved upstream revision, ready to be copied.
 type Plan struct {
 	up       *Upstream
@@ -72,6 +78,15 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 		}
 	}
 	return &Plan{up: up, revision: revision, Info: info, Entries: entries}, nil
+}
+
+// storedInfo is the upstream's model description as it is kept with the
+// revision: all of it, or none when it is over maxStoredInfo.
+func (p *Plan) storedInfo() string {
+	if len(p.Info.Raw) > maxStoredInfo {
+		return ""
+	}
+	return string(p.Info.Raw)
 }
 
 // Bytes is the total size of the revision's files.
@@ -159,7 +174,7 @@ feed:
 		SHA:          sha,
 		Source:       registry.SourceMirror,
 		Upstream:     p.up.endpoint(),
-		UpstreamInfo: string(p.Info.Raw),
+		UpstreamInfo: p.storedInfo(),
 		Message:      "Mirrored from " + p.up.endpoint(),
 		Files:        files,
 	}
@@ -194,19 +209,25 @@ func (p *Plan) lazyInput(branch string) registry.LazyInput {
 	}
 	return registry.LazyInput{
 		Repo: p.Info.ID, Branch: branch, SHA: p.Info.SHA, Files: files,
-		Upstream: p.up.endpoint(), UpstreamInfo: string(p.Info.Raw), Message: "Mirrored from " + p.up.endpoint(),
+		Upstream: p.up.endpoint(), UpstreamInfo: p.storedInfo(), Message: "Mirrored from " + p.up.endpoint(),
 	}
 }
 
 // RecordLazy records the revision from its upstream file listing without
 // fetching any content. Every file is listed with its size and digest;
 // FetchFile brings in one file's bytes when it is first wanted.
+//
+// This is what pull-through calls, on a reader's request, so it only ever
+// records into a repository that is new or that came from an upstream; for
+// one created in this registry it fails with registry.ErrLocalRepo.
 func (p *Plan) RecordLazy(ctx context.Context, reg *registry.Registry) (registry.Commit, error) {
 	branch := ""
 	if !registry.IsSHA(p.revision) {
 		branch = p.revision
 	}
-	return reg.CommitLazy(ctx, p.lazyInput(branch))
+	in := p.lazyInput(branch)
+	in.OnlyFromUpstream = true
+	return reg.CommitLazy(ctx, in)
 }
 
 // FetchFile fetches the content of one pending file of revision c from up,

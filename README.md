@@ -144,6 +144,7 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | `--require-auth` | `REGISTRY_REQUIRE_AUTH` | `false` | Require a token for downloads and browsing too |
 | `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
 | | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
+| | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
 | | `REGISTRY_ADMIN_TOKEN_FILE` | | Read the admin token from this file (a mounted secret) |
@@ -176,7 +177,9 @@ fetches one file. The first download of a large file waits while the
 registry fetches it; if the client gives up, the fetch carries on and a
 retry is served from the registry. Anyone allowed to download can trigger a
 fetch, so on a registry others can reach, combine it with `--require-auth`
-or an allow list. To have a whole model available offline, run
+or an allow list. A repository you pushed is never added to from upstream;
+if you push your own models as well, use an allow list that leaves your
+own namespaces out. To have a whole model available offline, run
 `modelctl mirror`. See
 [docs/operations.md](docs/operations.md#pull-through-caching).
 

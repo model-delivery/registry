@@ -34,6 +34,9 @@ var (
 	ErrConflict         = errors.New("conflict")
 	ErrBlobMissing      = errors.New("blob has not been uploaded")
 	ErrTokenNotFound    = errors.New("token not found")
+	// ErrLocalRepo refuses to add an upstream revision, on a reader's
+	// request, to a repository that was created in this registry.
+	ErrLocalRepo = errors.New("repository was created in this registry, not from an upstream")
 )
 
 // schemaVersion is the database layout this version reads and writes.

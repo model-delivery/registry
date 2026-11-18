@@ -273,7 +273,17 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 			return
 		}
 		if err := s.puller.ensureFile(r.Context(), c, f); err != nil {
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			switch {
+			case errors.As(err, new(errFileTooLarge)):
+				hfError(w, http.StatusForbidden, err.Error())
+				return
+			case errors.Is(err, errNotFromUpstream):
+				w.Header().Set("X-Error-Code", "EntryNotFound")
+				hfError(w, http.StatusNotFound, fmt.Sprintf(
+					"%s is listed in this revision but was never fetched, and %s was created in this registry, so pull-through does not fetch into it: run `modelctl mirror %s`", filePath, repo, repo))
+				return
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, errPullBusy):
+			default:
 				err = errUpstream{err}
 			}
 			s.fail(w, r, err)

@@ -136,6 +136,55 @@ func TestCommitLazyRules(t *testing.T) {
 	}
 }
 
+// Pull-through records with OnlyFromUpstream. It may create a repository,
+// and add to one that came from an upstream, but never touch one that was
+// created here.
+func TestCommitLazyOnlyFromUpstream(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := open(t)
+	listing := []File{{Path: "a.bin", Size: 1, GitOID: strings.Repeat("a", 40)}}
+	other := strings.Repeat("b", 40)
+
+	// A repository that was pushed, and one that was only created.
+	if _, err := r.Commit(ctx, CommitInput{Repo: "acme/pushed", Branch: "main", Files: []File{file(t, r, "x", "x")}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CreateRepo(ctx, "acme/empty"); err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range []string{"acme/pushed", "acme/empty"} {
+		_, err := r.CommitLazy(ctx, LazyInput{Repo: repo, Branch: "dev", SHA: upstreamSHA, Files: listing,
+			Upstream: "https://hub.example", OnlyFromUpstream: true})
+		if !errors.Is(err, ErrLocalRepo) {
+			t.Fatalf("%s: got %v, want ErrLocalRepo", repo, err)
+		}
+		got, err := r.GetRepo(ctx, repo)
+		if err != nil || got.Upstream != "" {
+			t.Fatalf("%s: upstream = %q (%v), want it left empty", repo, got.Upstream, err)
+		}
+		if _, err := r.Resolve(ctx, repo, "dev"); !errors.Is(err, ErrRevisionNotFound) {
+			t.Fatalf("%s: a branch was created: %v", repo, err)
+		}
+		if _, err := r.Resolve(ctx, repo, upstreamSHA); !errors.Is(err, ErrRevisionNotFound) {
+			t.Fatalf("%s: the revision was recorded: %v", repo, err)
+		}
+	}
+
+	// A repository it creates, and then adds a second revision to.
+	for _, sha := range []string{upstreamSHA, other} {
+		if _, err := r.CommitLazy(ctx, LazyInput{Repo: "acme/fetched", SHA: sha, Files: listing,
+			Upstream: "https://hub.example", OnlyFromUpstream: true}); err != nil {
+			t.Fatalf("revision %s: %v", sha, err)
+		}
+	}
+	// An explicit mirror, by someone with the write role, may still record
+	// into a pushed repository.
+	if _, err := r.CommitLazy(ctx, LazyInput{Repo: "acme/pushed", SHA: upstreamSHA, Files: listing, Upstream: "https://hub.example"}); err != nil {
+		t.Fatalf("without OnlyFromUpstream: %v", err)
+	}
+}
+
 // A data directory written before pending files existed must open, keep
 // everything it had, and gain the new table.
 func TestUpgradeFromSchemaVersion1(t *testing.T) {

@@ -155,7 +155,19 @@ a mirrored one.
 A small coordinator keeps one job per thing being fetched, whether a
 revision's listing or one file. A request for something already being
 fetched waits on the existing job. Jobs run on the server's own context,
-not the request's, so a client that disconnects does not stop one.
+not the request's, so a client that disconnects does not stop one. Four
+run at a time and a bounded number wait; past that, a request that would
+start another is answered `503`.
+
+**Which repositories.** The lookup goes upstream only for a repository the
+registry does not hold, or one whose `upstream` field is set, meaning it
+was created by mirroring or pull-through. A repository created here by a
+push or an upload is never added to on a reader's request, and its
+`upstream` field is never set by pull-through. The same check is repeated
+inside the transaction that records the revision, against the canonical
+name the upstream answered with, so neither a rename upstream nor a push
+that lands in between gets around it. For names not held at all, the
+operator's allow list is the control.
 
 Two rules follow from "nothing unverified is served":
 

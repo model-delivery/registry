@@ -76,6 +76,11 @@ func cmdServe(e *env, args []string) error {
 		log.Warn("pull-through is on with open downloads and no allow list: anyone who can reach this registry can make it fetch and store any upstream model; set REGISTRY_REQUIRE_AUTH or REGISTRY_PULL_THROUGH_ALLOW unless the network is private")
 	}
 
+	pullMaxFile, err := envBytes(e, "REGISTRY_PULL_THROUGH_MAX_FILE_BYTES")
+	if err != nil {
+		return err
+	}
+
 	handler := server.New(reg, server.Config{
 		AnonymousRead:     !*requireAuth,
 		Upstream:          *upstream,
@@ -86,6 +91,8 @@ func cmdServe(e *env, args []string) error {
 		BackupKeep:        backupKeep,
 		Version:           Version,
 		Logger:            log,
+
+		PullThroughMaxFileBytes: pullMaxFile,
 	})
 	ln, err := (&net.ListenConfig{}).Listen(e.ctx, "tcp", *addr)
 	if err != nil {
@@ -216,6 +223,19 @@ func restoreIfEmpty(e *env, data string, store blob.Store, log *slog.Logger) err
 	log.Info("restored the metadata database from the newest stored backup", "backup", name,
 		"repos", info.Repos, "revisions", info.Revisions)
 	return nil
+}
+
+// envBytes reads an optional size limit in bytes; unset or 0 means none.
+func envBytes(e *env, key string) (int64, error) {
+	v := e.getenv(key)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, usagef("%s must be a whole number of bytes, 0 for no limit; got %q", key, v)
+	}
+	return n, nil
 }
 
 func envBool(e *env, key string) bool {

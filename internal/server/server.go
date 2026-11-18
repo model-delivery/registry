@@ -41,6 +41,10 @@ type Config struct {
 	// PullThroughAllow limits pull-through to repositories matching one of
 	// these globs over the whole id ("meta-llama/*"). Empty allows all.
 	PullThroughAllow []string
+	// PullThroughMaxFileBytes is the largest file pull-through fetches on
+	// demand. A larger one is refused with an error naming `modelctl
+	// mirror`. 0 means no limit.
+	PullThroughMaxFileBytes int64
 	// BackupKeep is how many stored metadata backups to keep when one is
 	// taken through the API; 0 keeps them all.
 	BackupKeep int
@@ -72,7 +76,7 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 	}
 	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, uploadKey: newUploadKey()}
 	if cfg.PullThrough {
-		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.Logger)
+		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.PullThroughMaxFileBytes, cfg.Logger)
 	}
 
 	mux := http.NewServeMux()
@@ -262,6 +266,8 @@ func statusFor(err error) (int, string) {
 		return http.StatusBadGateway, ""
 	}
 	switch {
+	case errors.Is(err, errPullBusy):
+		return http.StatusServiceUnavailable, ""
 	case errors.Is(err, registry.ErrRepoNotFound):
 		return http.StatusNotFound, "RepoNotFound"
 	case errors.Is(err, registry.ErrRevisionNotFound):
@@ -291,6 +297,9 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if status == http.StatusInternalServerError {
 		s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
 		msg = "internal error"
+	}
+	if errors.Is(err, errPullBusy) {
+		w.Header().Set("Retry-After", "60")
 	}
 	if code != "" {
 		w.Header().Set("X-Error-Code", code)

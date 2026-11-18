@@ -42,6 +42,11 @@ type LazyInput struct {
 	Message      string
 	Upstream     string
 	UpstreamInfo string
+	// OnlyFromUpstream refuses, with ErrLocalRepo, to record the revision in
+	// a repository that exists and did not itself come from an upstream.
+	// Pull-through sets it: a reader's request must never add upstream
+	// content to a repository that was pushed here.
+	OnlyFromUpstream bool
 	// Files as the upstream lists them. SHA256 is set for LFS files, whose
 	// content digest the upstream publishes, and empty for the rest, which
 	// are identified by GitOID until they are fetched.
@@ -79,7 +84,8 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 	now := r.stamp()
 
 	var repoID int64
-	err = tx.QueryRowContext(ctx, "SELECT id FROM repos WHERE name = ?", in.Repo).Scan(&repoID)
+	var heldUpstream string
+	err = tx.QueryRowContext(ctx, "SELECT id, upstream FROM repos WHERE name = ?", in.Repo).Scan(&repoID, &heldUpstream)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		res, insErr := tx.ExecContext(ctx, "INSERT INTO repos (name, upstream, created_at) VALUES (?, ?, ?)", in.Repo, in.Upstream, now)
@@ -89,6 +95,10 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		repoID, _ = res.LastInsertId()
 	case err != nil:
 		return Commit{}, err
+	case in.OnlyFromUpstream && heldUpstream == "":
+		// Checked inside the transaction, so a repository created by a push
+		// between the caller's lookup and this one is still left alone.
+		return Commit{}, fmt.Errorf("%w: %s", ErrLocalRepo, in.Repo)
 	case in.Upstream != "":
 		if _, err := tx.ExecContext(ctx, "UPDATE repos SET upstream = ? WHERE id = ?", in.Upstream, repoID); err != nil {
 			return Commit{}, err

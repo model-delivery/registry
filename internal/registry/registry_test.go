@@ -363,11 +363,11 @@ func TestTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tok, ok := r.Authenticate(ctx, secret); !ok || tok.Name != "ci" || tok.Role != RoleWrite {
+	if tok, ok, _ := r.Authenticate(ctx, secret); !ok || tok.Name != "ci" || tok.Role != RoleWrite {
 		t.Fatalf("authenticate = %+v, %v", tok, ok)
 	}
 	for _, bad := range []string{"", "md_wrong", secret + "x"} {
-		if _, ok := r.Authenticate(ctx, bad); ok {
+		if _, ok, _ := r.Authenticate(ctx, bad); ok {
 			t.Errorf("token %q was accepted", bad)
 		}
 	}
@@ -380,7 +380,7 @@ func TestTokens(t *testing.T) {
 	if err := r.RevokeToken(ctx, "ci"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.Authenticate(ctx, secret); ok {
+	if _, ok, _ := r.Authenticate(ctx, secret); ok {
 		t.Fatal("revoked token still works")
 	}
 	if err := r.RevokeToken(ctx, "ci"); !errors.Is(err, ErrTokenNotFound) {

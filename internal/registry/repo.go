@@ -419,10 +419,17 @@ func (r *Registry) CreateBranch(ctx context.Context, repoName, branch, from stri
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(ctx,
-		"INSERT INTO refs (repo_id, name, kind, sha, updated_at) VALUES (?, ?, ?, ?, ?)",
+	// A name that is taken, by a branch or a tag, inserts nothing. Any other
+	// failure is returned as it is.
+	res, err := r.db.ExecContext(ctx,
+		"INSERT INTO refs (repo_id, name, kind, sha, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (repo_id, name) DO NOTHING",
 		c.RepoID, branch, KindBranch, c.SHA, r.stamp())
 	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
 		return fmt.Errorf("%w: %q already exists in %s", ErrConflict, branch, repoName)
 	}
 	return nil

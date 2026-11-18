@@ -88,7 +88,7 @@ func TestBackupAndRestore(t *testing.T) {
 	if string(content) != "weights" {
 		t.Fatalf("content after restore = %q", content)
 	}
-	if tok, ok := restored.Authenticate(ctx, secret); !ok || tok.Role != RoleWrite {
+	if tok, ok, _ := restored.Authenticate(ctx, secret); !ok || tok.Role != RoleWrite {
 		t.Fatal("tokens did not survive the restore")
 	}
 	if _, err := restored.Resolve(ctx, "acme/later", "main"); !errors.Is(err, ErrRepoNotFound) {

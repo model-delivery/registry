@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -148,7 +149,7 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 
 	// Browsers may only make state-changing requests from our own pages.
 	// Non-browser clients (the CLI, Python libraries) are unaffected.
-	return s.guardBodies(http.NewCrossOriginProtection().Handler(mux))
+	return s.guardBodies(http.NewCrossOriginProtection().Handler(s.identify(mux)))
 }
 
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
@@ -228,13 +229,41 @@ func presentedToken(r *http.Request) string {
 	return ""
 }
 
+// identityKey is the request context key under which identify leaves the
+// token a request presented.
+type identityKey struct{}
+
+// identify looks up the token a request carries, once, before any handler
+// runs, and leaves the answer in the request's context for roleOf.
+//
+// "No such token" and "the database could not be asked" are different
+// answers. The first is an anonymous request. The second is the server's
+// failure: it is logged and answered 500, not passed off as a 401 that
+// tells every user their token is bad.
+func (s *Server) identify(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, _, err := s.reg.Authenticate(r.Context(), presentedToken(r))
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("look up the request's access token: %w", err))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, tok)))
+	})
+}
+
 // roleOf reports what the request's token allows. A token this registry
 // does not know grants nothing: people who switch HF_ENDPOINT often still
 // send their Hugging Face token, and that must not break anonymous reads.
 func (s *Server) roleOf(r *http.Request) (role, registry.Token) {
-	tok, ok := s.reg.Authenticate(r.Context(), presentedToken(r))
-	if !ok {
-		return roleNone, registry.Token{}
+	tok, identified := r.Context().Value(identityKey{}).(registry.Token)
+	if !identified {
+		// A handler reached without identify in front of it, which only a
+		// test does. A lookup that fails here grants nothing.
+		var err error
+		if tok, _, err = s.reg.Authenticate(r.Context(), presentedToken(r)); err != nil {
+			s.log.Error("look up the request's access token", "error", err)
+			return roleNone, registry.Token{}
+		}
 	}
 	return roleFromName(tok.Role), tok
 }

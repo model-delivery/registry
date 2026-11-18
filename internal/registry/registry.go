@@ -500,35 +500,57 @@ func (r *Registry) SetToken(ctx context.Context, name string, role Role, secret 
 	if len(secret) < minTokenSecret {
 		return fmt.Errorf("%w: token must be at least %d characters", ErrInvalid, minTokenSecret)
 	}
-	q := `INSERT INTO tokens (name, hash, role, created_at) VALUES (?, ?, ?, ?)`
+	hash := hashToken(secret)
 	if replace {
-		q += ` ON CONFLICT (name) DO UPDATE SET hash = excluded.hash, role = excluded.role`
-	}
-	if _, err := r.db.ExecContext(ctx, q, name, hashToken(secret), role, r.stamp()); err != nil {
-		if !replace {
-			return fmt.Errorf("%w: a token named %q already exists", ErrConflict, name)
-		}
+		_, err := r.db.ExecContext(ctx,
+			`INSERT INTO tokens (name, hash, role, created_at) VALUES (?, ?, ?, ?)
+			 ON CONFLICT (name) DO UPDATE SET hash = excluded.hash, role = excluded.role`,
+			name, hash, role, r.stamp())
 		return err
 	}
-	return nil
+	// A name or a secret that is already taken inserts nothing. Any other
+	// failure is the database's and is returned as it is: a busy or broken
+	// database is not "already exists".
+	res, err := r.db.ExecContext(ctx,
+		`INSERT INTO tokens (name, hash, role, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+		name, hash, role, r.stamp())
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 1 {
+		return err
+	}
+	var named bool
+	if err := r.db.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM tokens WHERE name = ?)", name).Scan(&named); err != nil {
+		return err
+	}
+	if named {
+		return fmt.Errorf("%w: a token named %q already exists", ErrConflict, name)
+	}
+	return fmt.Errorf("%w: that secret is already another token's; choose a different one for %q", ErrConflict, name)
 }
 
-// Authenticate returns the token record for a presented secret.
-func (r *Registry) Authenticate(ctx context.Context, secret string) (Token, bool) {
+// Authenticate returns the token record for a presented secret. ok is
+// false when no token has that secret, which is not an error; an error
+// means the database could not answer, and says nothing about the secret.
+func (r *Registry) Authenticate(ctx context.Context, secret string) (tok Token, ok bool, err error) {
 	if secret == "" {
-		return Token{}, false
+		return Token{}, false, nil
 	}
 	var t Token
 	var created string
-	err := r.db.QueryRowContext(ctx, "SELECT name, role, created_at FROM tokens WHERE hash = ?", hashToken(secret)).
+	err = r.db.QueryRowContext(ctx, "SELECT name, role, created_at FROM tokens WHERE hash = ?", hashToken(secret)).
 		Scan(&t.Name, &t.Role, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Token{}, false, nil
+	}
 	if err != nil {
-		return Token{}, false
+		return Token{}, false, err
 	}
 	if t.CreatedAt, err = parseTime(created); err != nil {
-		return Token{}, false
+		return Token{}, false, err
 	}
-	return t, true
+	return t, true, nil
 }
 
 // Token returns the record of the token called name, or ErrTokenNotFound.

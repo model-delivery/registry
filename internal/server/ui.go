@@ -245,7 +245,13 @@ func (s *Server) uiLoginForm(w http.ResponseWriter, r *http.Request) {
 func (s *Server) uiLogin(w http.ResponseWriter, r *http.Request) {
 	// Anyone can post here, so the body is bounded before it is parsed.
 	secret := strings.TrimSpace(s.formValue(w, r, "token"))
-	if _, ok := s.reg.Authenticate(r.Context(), secret); !ok {
+	_, ok, err := s.reg.Authenticate(r.Context(), secret)
+	if err != nil {
+		// The database could not be asked: that is not a wrong token.
+		s.uiError(w, r, fmt.Errorf("look up the access token: %w", err))
+		return
+	}
+	if !ok {
 		s.render(w, r, http.StatusUnauthorized, "login.html", "Sign in", map[string]any{
 			"Error": "That token is not valid for this registry.",
 		})

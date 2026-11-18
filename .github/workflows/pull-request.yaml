@@ -1,0 +1,26 @@
+# Runs on every pull request into main: the gate a change must pass before
+# it can merge. The checks themselves live in quality.yaml.
+#
+# Documentation-only pull requests run it too. Skipping them would leave a
+# required check that never reports, and the pull request could not merge.
+#
+# Secrets required: none. Pull requests from forks get a read-only token.
+
+name: Pull request
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same pull request replaces the run in progress.
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yaml

@@ -30,6 +30,14 @@ tasks:
     desc: Run go vet, including integration-tagged files
     cmd: go vet -tags=integration ./...
 
+  lint:
+    desc: Run golangci-lint (install v2.14.0, the version CI pins)
+    cmd: golangci-lint run ./...
+
+  vuln:
+    desc: Check dependencies for vulnerabilities reachable from this code
+    cmd: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
   test:
     desc: Run unit tests (no network, no Python, no Docker)
     cmd: go test ./...
@@ -64,12 +72,17 @@ tasks:
       - go test -tags=integration -count=1 -run TestHubClientAgainstS3 ./test/e2e/
 
   check:
-    desc: Everything CI checks that needs only Go
+    desc: Everything CI checks that needs only Go and golangci-lint
     cmds:
       - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - task: vet
+      - task: lint
       - task: test
       - go mod tidy -diff
+
+  release:
+    desc: "Cut a release from main, e.g. task release -- -f bump=minor (runs the Cut release workflow)"
+    cmd: gh workflow run release-cut.yaml {{.CLI_ARGS}}
 
   docker:
     desc: Build the container image for this machine

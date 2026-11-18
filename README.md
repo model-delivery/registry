@@ -230,7 +230,7 @@ commands:
 
 ```bash
 task build        # bin/modelctl
-task check        # format, vet, unit tests
+task check        # format, vet, lint, unit tests
 task test:e2e     # the huggingface_hub compatibility tests (needs Python)
 task test:s3      # storage and compatibility tests against a real S3 server (needs Docker)
 task docker       # container image

@@ -26,9 +26,15 @@ Read `docs/architecture.md` before changing anything structural, and
 - `test/e2e` — runs the real `huggingface_hub` Python library against the
   registry. Build tag `integration`.
 
+- `.github/workflows` — named for the event that starts them:
+  `pull-request.yaml`, `merge.yaml` (push to main), `release.yaml` (version
+  tag), `release-cut.yaml` (manual button). The checks live once, in
+  `quality.yaml`, which the others call. A new check goes in `quality.yaml`;
+  a new workflow is named for its trigger. Actions are pinned by commit SHA.
+
 ## Commands
 
-Use the Taskfile: `task check` (format, vet, unit tests), `task test:e2e`
+Use the Taskfile: `task check` (format, vet, lint, unit tests), `task test:e2e`
 (needs Python with `huggingface_hub`), `task test:s3` (real S3 server in
 Docker; the only place multipart uploads are exercised), `task build`,
 `task docker`.

@@ -1,0 +1,34 @@
+# Routine dependency updates: once a month, grouped so each kind is one
+# pull request to review rather than a dozen. Security problems do not wait
+# for this; govulncheck in quality.yaml fails the gate as soon as an
+# advisory is reachable from the code.
+version: 2
+
+updates:
+  # Go modules.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  # Workflows pin every action by commit SHA with a version comment. A pin
+  # stays frozen until something moves it; this is that something.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The Dockerfile's build and runtime base images.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      base-images:
+        patterns: ["*"]

@@ -1,0 +1,104 @@
+# The button that starts a release: Actions -> Cut release -> Run workflow,
+# or from a terminal:
+#
+#   gh workflow run release-cut.yaml -f bump=minor
+#
+# It works out the next version from the highest existing tag, tags the tip
+# of main, and starts release.yaml on that tag. Everything that builds and
+# publishes is in release.yaml; this only decides the number.
+#
+# Secrets required: none.
+
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      version:
+        description: Exact version instead, such as v0.2.0-rc.1 (leave empty to use the bump)
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag main and start the release
+    # Releases are cut from main, in the project's own repository.
+    if: github.repository == 'model-delivery/registry' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+      actions: write # start release.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Decide the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EXACT" ]; then
+            next="$EXACT"
+          else
+            # The highest released version; pre-releases do not count.
+            # `|| true`: with no tags yet, grep finds nothing and would
+            # otherwise end the script before the first release.
+            last="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -Ev -- '-' | sort -V | tail -n 1 || true)"
+            if [ -z "$last" ]; then
+              next="v0.1.0"
+            else
+              IFS=. read -r major minor patch <<<"${last#v}"
+              case "$BUMP" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                patch) patch=$((patch + 1)) ;;
+              esac
+              next="v${major}.${minor}.${patch}"
+            fi
+            echo "Last release: ${last:-none}"
+          fi
+          if ! printf '%s' "$next" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${next}' is not a version like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "::error::${next} already exists"
+            exit 1
+          fi
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${next}"
+
+      - name: Tag
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git tag "$NEXT"
+          git push origin "refs/tags/${NEXT}"
+
+      # A tag pushed with GITHUB_TOKEN does not start workflows, so start
+      # the release on the tag explicitly.
+      - name: Start release.yaml on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          gh workflow run release.yaml --ref "$NEXT"
+          {
+            echo "### Cutting ${NEXT}"
+            echo "release.yaml was started on \`${NEXT}\`. Follow it in the Actions tab."
+          } >> "$GITHUB_STEP_SUMMARY"

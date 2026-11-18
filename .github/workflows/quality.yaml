@@ -1,0 +1,143 @@
+# The checks every change must pass. This workflow has no trigger of its
+# own: the trigger-named workflows call it, so a pull request, a push to
+# main and a release all run exactly the same gate.
+#
+#   pull-request.yaml  on a pull request
+#   merge.yaml         on a push to main
+#   release.yaml       on a version tag
+#
+# Everything here also runs locally: `task check`, `task test:e2e`,
+# `task test:s3`, `task docker`.
+#
+# Secrets required: none.
+
+name: Quality
+
+on:
+  workflow_call:
+    inputs:
+      mirror-from-huggingface:
+        description: Also mirror a real model from huggingface.co. Off for pull requests, so an outage there cannot fail someone's unrelated change.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format, lint and vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Module files are verified and tidy
+        run: |
+          go mod verify
+          go mod tidy -diff
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (echo "unformatted Go files:" && gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet -tags=integration ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Pinned, not `latest`: a new linter release should not turn a pull
+          # request red that changed nothing. Raise it on purpose, and keep
+          # it in step with the version contributors are told to install.
+          version: v2.14.0
+          args: --timeout=5m
+      # Fails only on advisories reachable from this code, so it can be a
+      # hard gate without being noise.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  test:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        if: matrix.os != 'ubuntu-latest'
+        run: go test ./...
+      - name: Unit tests with the race detector
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./...
+
+  compatibility:
+    name: huggingface_hub compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # Deliberately unpinned: this job exists to find out when a new
+      # huggingface_hub release stops working against the registry.
+      - run: pip install huggingface_hub
+      - name: The real client against the registry (no network)
+        run: go test -tags=integration -count=1 -v ./test/e2e/
+      - name: Mirror a real model from huggingface.co, then download it offline
+        if: inputs.mirror-from-huggingface
+        env:
+          REGISTRY_E2E_NETWORK: "1"
+        run: go test -tags=integration -count=1 -v -run TestMirrorFromHuggingFace ./test/e2e/
+
+  s3:
+    name: Real S3-compatible storage
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_TEST_S3_ENDPOINT: http://127.0.0.1:9005
+      REGISTRY_TEST_S3_BUCKET: registry-test
+      REGISTRY_TEST_S3_ACCESS_KEY: any
+      REGISTRY_TEST_S3_SECRET_KEY: anysecret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: pip install huggingface_hub
+      - name: Start an S3-compatible server
+        run: |
+          docker run -d --name s3 -p 127.0.0.1:9005:8333 chrislusf/seaweedfs server -s3 -dir=/data
+          for i in $(seq 1 40); do curl -fs -o /dev/null http://127.0.0.1:9005/ && exit 0; sleep 1; done
+          docker logs s3; exit 1
+      # The only place multipart uploads are exercised.
+      - name: Storage contract
+        run: go test -count=1 -v ./internal/blob/
+      - name: huggingface_hub against an S3-backed registry
+        run: go test -tags=integration -count=1 -v -run TestHubClientAgainstS3 ./test/e2e/
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: docker build --build-arg VERSION=ci -t registry:ci .
+      # Proves the image starts as its unprivileged user and can write its
+      # data directory: the server exits at start if it cannot.
+      - name: Starts and answers
+        run: |
+          docker run -d --name registry -p 127.0.0.1:8080:8080 registry:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then exit 0; fi
+            sleep 1
+          done
+          docker logs registry
+          exit 1

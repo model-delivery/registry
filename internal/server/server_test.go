@@ -366,6 +366,70 @@ func TestAccessControl(t *testing.T) {
 		{"open: write token creates token", open, http.MethodPost, "/api/v1/tokens", write, `{"name":"x","role":"admin"}`, 403},
 		{"open: write token gc", open, http.MethodPost, "/api/v1/gc", write, "", 403},
 		{"open: admin lists tokens", open, http.MethodGet, "/api/v1/tokens", admin, "", 200},
+
+		// The routes below do not go through Server.need: each checks access
+		// in a way of its own. They are pinned here all the same.
+
+		// Web UI pages apply the read rule and send a visitor who may not
+		// read to the sign-in page instead of answering 401.
+		{"open: home page", open, http.MethodGet, "/", none, "", 200},
+		{"open: repository page", open, http.MethodGet, "/ui/repo/acme/tiny", none, "", 200},
+		{"private: home page", private, http.MethodGet, "/", none, "", 303},
+		{"private: home page, unknown token", private, http.MethodGet, "/", foreign, "", 303},
+		{"private: home page, read token", private, http.MethodGet, "/", read, "", 200},
+		{"private: repository page", private, http.MethodGet, "/ui/repo/acme/tiny", none, "", 303},
+		{"private: repository page, read token", private, http.MethodGet, "/ui/repo/acme/tiny", read, "", 200},
+		// A hub-style link only points at the repository page, which is gated.
+		{"private: hub-style repository link", private, http.MethodGet, "/acme/tiny", none, "", 302},
+		// Signing in has to be possible without a token; it grants nothing
+		// without a valid one.
+		{"private: sign-in form", private, http.MethodGet, "/ui/login", none, "", 200},
+		{"private: sign-in without a token", private, http.MethodPost, "/ui/login", none, "", 401},
+		{"private: sign-out", private, http.MethodPost, "/ui/logout", none, "", 303},
+		{"private: stylesheet", private, http.MethodGet, "/static/app.css", none, "", 200},
+		{"private: health check", private, http.MethodGet, "/healthz", none, "", 200},
+		// Deleting from the web UI needs the admin role, and then the typed name.
+		{"open: anonymous UI delete", open, http.MethodPost, "/ui/repo/acme/tiny/delete", none, "", 403},
+		{"open: read token UI delete", open, http.MethodPost, "/ui/repo/acme/tiny/delete", read, "", 403},
+		{"open: write token UI delete", open, http.MethodPost, "/ui/repo/acme/tiny/delete", write, "", 403},
+		{"private: anonymous UI delete", private, http.MethodPost, "/ui/repo/acme/tiny/delete", none, "", 403},
+		{"open: admin UI delete without the typed name", open, http.MethodPost, "/ui/repo/acme/tiny/delete", admin, "", 303},
+
+		// whoami answers only for a token this registry knows.
+		{"open: anonymous whoami", open, http.MethodGet, "/api/whoami-v2", none, "", 401},
+		{"open: unknown token whoami", open, http.MethodGet, "/api/whoami-v2", foreign, "", 401},
+		{"open: read token whoami", open, http.MethodGet, "/api/whoami-v2", read, "", 200},
+
+		// Hugging Face upload steps: every POST under /api/models, and the
+		// large-file batch, need the write role.
+		{"open: anonymous preupload", open, http.MethodPost, "/api/models/acme/tiny/preupload/main", none, `{}`, 401},
+		{"open: read token preupload", open, http.MethodPost, "/api/models/acme/tiny/preupload/main", read, `{}`, 403},
+		{"open: anonymous HF commit", open, http.MethodPost, "/api/models/acme/tiny/commit/main", none, `{}`, 401},
+		{"open: read token HF commit", open, http.MethodPost, "/api/models/acme/tiny/commit/main", read, `{}`, 403},
+		{"open: anonymous create branch", open, http.MethodPost, "/api/models/acme/tiny/branch/dev", none, `{}`, 401},
+		{"open: read token create branch", open, http.MethodPost, "/api/models/acme/tiny/branch/dev", read, `{}`, 403},
+		{"open: anonymous POST to an unknown model route", open, http.MethodPost, "/api/models/acme/tiny/anything/else", none, `{}`, 401},
+		{"open: anonymous create repository", open, http.MethodPost, "/api/repos/create", none, `{"name":"x","organization":"acme"}`, 401},
+		{"open: read token create repository", open, http.MethodPost, "/api/repos/create", read, `{"name":"x","organization":"acme"}`, 403},
+		{"open: anonymous large-file batch", open, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", none, `{"operation":"upload"}`, 401},
+		{"open: read token large-file batch", open, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", read, `{"operation":"upload"}`, 403},
+		{"private: anonymous large-file batch", private, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", none, `{"operation":"upload"}`, 401},
+		// The upload route is opened by a signed URL and by nothing else,
+		// whatever token comes with the request.
+		{"open: anonymous upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + sha("new"), none, "new", 403},
+		{"open: admin upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + sha("new"), admin, "new", 403},
+
+		// The rest of the Hugging Face surface follows the read rule.
+		{"open: anonymous validate-yaml", open, http.MethodPost, "/api/validate-yaml", none, `{}`, 200},
+		{"private: anonymous validate-yaml", private, http.MethodPost, "/api/validate-yaml", none, `{}`, 401},
+		{"private: anonymous refs", private, http.MethodGet, "/api/models/acme/tiny/refs", none, "", 401},
+		{"private: read token refs", private, http.MethodGet, "/api/models/acme/tiny/refs", read, "", 200},
+		{"private: anonymous file metadata", private, http.MethodHead, "/acme/tiny/resolve/main/config.json", none, "", 401},
+		{"private: anonymous xet token", private, http.MethodGet, "/api/models/acme/tiny/xet-write-token/main", none, "", 401},
+		{"private: anonymous method not offered", private, http.MethodDelete, "/api/models/acme/tiny", none, "", 401},
+		// Fixed answers that say nothing about what the registry holds.
+		{"private: xet explanation", private, http.MethodGet, "/api/xet-is-not-supported/x", none, "", 400},
+		{"private: unimplemented API route", private, http.MethodGet, "/api/something-else", none, "", 404},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -607,12 +671,46 @@ func TestWebUI(t *testing.T) {
 			t.Fatalf("cross-site delete: status %d, repo exists %v", resp.StatusCode, exists())
 		}
 		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=wrong"), form(cookie(open, open.admin)))
-		if resp.StatusCode != http.StatusSeeOther || !exists() {
-			t.Fatalf("wrong confirmation: status %d, repo exists %v", resp.StatusCode, exists())
+		if resp.StatusCode != http.StatusSeeOther || !exists() || resp.Header.Get("Location") != "/ui/repo/acme/tiny?notice=not-deleted" {
+			t.Fatalf("wrong confirmation: status %d to %q, repo exists %v", resp.StatusCode, resp.Header.Get("Location"), exists())
+		}
+		// The page it lands on says what happened.
+		page := do(t, http.MethodGet, open.url+resp.Header.Get("Location"), "", nil, nil)
+		if got := body(t, page); !strings.Contains(got, "Nothing deleted: the name you typed did not match.") {
+			t.Fatal("the page after a refused delete does not say so")
 		}
 		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme%2Ftiny"), form(cookie(open, open.admin)))
-		if resp.StatusCode != http.StatusSeeOther || exists() {
-			t.Fatalf("confirmed delete: status %d, repo exists %v", resp.StatusCode, exists())
+		if resp.StatusCode != http.StatusSeeOther || exists() || resp.Header.Get("Location") != "/?notice=deleted" {
+			t.Fatalf("confirmed delete: status %d to %q, repo exists %v", resp.StatusCode, resp.Header.Get("Location"), exists())
+		}
+		page = do(t, http.MethodGet, open.url+resp.Header.Get("Location"), "", nil, nil)
+		if got := body(t, page); !strings.Contains(got, "The repository was deleted") {
+			t.Fatal("the page after a delete does not say so")
+		}
+	})
+	t.Run("a notice is a code for fixed text, never text from the address", func(t *testing.T) {
+		const banner = `class="notice"`
+		for _, tc := range []struct {
+			query string
+			shown bool
+		}{
+			{"", false},
+			{"?notice=deleted", true},
+			{"?notice=not-deleted", true},
+			{"?notice=Your+session+expired.+Sign+in+again+at+evil.example", false},
+			{"?notice=%3Cscript%3Ealert(1)%3C/script%3E", false},
+			{"?notice=DELETED", false},
+			{"?notice=", false},
+		} {
+			for _, path := range []string{"/", "/ui/login"} {
+				got := body(t, do(t, http.MethodGet, open.url+path+tc.query, "", nil, nil))
+				if strings.Contains(got, banner) != tc.shown {
+					t.Errorf("%s%s: banner shown = %v, want %v", path, tc.query, !tc.shown, tc.shown)
+				}
+				if strings.Contains(got, "evil.example") || strings.Contains(got, "alert(1)") {
+					t.Errorf("%s%s: text from the address is on the page", path, tc.query)
+				}
+			}
 		}
 	})
 }

@@ -82,6 +82,15 @@ func ago(t time.Time) string {
 	}
 }
 
+// notices are the messages one page can ask the next to show, after a
+// redirect. The address carries a code (?notice=deleted) and the text comes
+// from here, so a link cannot make the registry display words of someone
+// else's choosing. An unknown code shows nothing.
+var notices = map[string]string{
+	"deleted":     "The repository was deleted, and the files nothing else uses were freed.",
+	"not-deleted": "Nothing deleted: the name you typed did not match.",
+}
+
 type uiPage struct {
 	Title   string
 	Version string
@@ -106,7 +115,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, status int, page
 	w.WriteHeader(status)
 	err := uiPages[page].Execute(w, uiPage{
 		Title: title, Version: s.cfg.Version, Viewer: tok.Name, IsAdmin: rl >= roleAdmin,
-		Host: scheme + "://" + r.Host, Flash: r.URL.Query().Get("notice"), Data: data,
+		Host: scheme + "://" + r.Host, Flash: notices[r.URL.Query().Get("notice")], Data: data,
 	})
 	if err != nil {
 		s.log.Error("render page", "page", page, "error", err)
@@ -217,7 +226,7 @@ func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	name := repoParam(r)
 	// Typing the name guards against deleting the wrong repository.
 	if s.formValue(w, r, "confirm") != name {
-		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice="+url.QueryEscape("Nothing deleted: the name you typed did not match."), http.StatusSeeOther)
+		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice=not-deleted", http.StatusSeeOther)
 		return
 	}
 	res, err := s.reg.DeleteRepo(r.Context(), name)
@@ -226,7 +235,7 @@ func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("repository deleted", "repo", name, "blobs_freed", res.Blobs, "bytes_freed", res.Bytes, "via", "ui")
-	http.Redirect(w, r, "/?notice="+url.QueryEscape(fmt.Sprintf("Deleted %s and freed %s.", name, humanBytes(res.Bytes))), http.StatusSeeOther)
+	http.Redirect(w, r, "/?notice=deleted", http.StatusSeeOther)
 }
 
 func (s *Server) uiLoginForm(w http.ResponseWriter, r *http.Request) {

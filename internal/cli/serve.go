@@ -145,7 +145,7 @@ func bootstrapAdmin(e *env, reg *registry.Registry, log *slog.Logger, requireSup
 		if secret != "" {
 			return usagef("set REGISTRY_ADMIN_TOKEN or REGISTRY_ADMIN_TOKEN_FILE, not both")
 		}
-		raw, err := os.ReadFile(file)
+		raw, err := os.ReadFile(file) //nolint:gosec // G304: the operator names this file in the server's own configuration.
 		if err != nil {
 			return fmt.Errorf("read REGISTRY_ADMIN_TOKEN_FILE: %w", err)
 		}

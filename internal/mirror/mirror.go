@@ -255,18 +255,30 @@ func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo,
 		}
 		// For LFS files the hub publishes the SHA-256 of the content.
 		want.SHA256 = e.LFSSHA256
-		if info, ok, err := reg.StatBlob(ctx, e.LFSSHA256); err != nil {
+		// Reusing a stored blob marks it as just used, as a push does, so
+		// garbage collection cannot remove it while this revision is still
+		// being put together.
+		if info, ok, err := reg.TouchBlob(ctx, e.LFSSHA256); err != nil {
 			return f, false, err
 		} else if ok {
 			f.SHA256, f.Size = info.SHA256, info.Size
 			return f, false, nil
 		}
 	} else {
-		// For regular files the listed id is the git blob id of the content.
+		// For regular files the listed id is the git blob id of the content:
+		// a SHA-1, and the only digest the upstream publishes for them. That
+		// is enough to check a download against, but not to pick out stored
+		// content by, since anyone with the write role chooses what is
+		// stored. So a stored blob stands in only if a mirrored revision
+		// already uses it, meaning it once came from an upstream under this
+		// same id. Otherwise the file is downloaded; such files are small.
 		want.GitOID = e.OID
-		if info, ok, err := reg.FindBlobByGitOID(ctx, e.OID, e.Size); err != nil {
+		if info, ok, err := reg.FindMirroredBlob(ctx, e.OID, e.Size); err != nil {
 			return f, false, err
 		} else if ok {
+			if _, _, err := reg.TouchBlob(ctx, info.SHA256); err != nil {
+				return f, false, err
+			}
 			f.SHA256, f.Size = info.SHA256, info.Size
 			return f, false, nil
 		}

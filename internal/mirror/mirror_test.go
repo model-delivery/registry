@@ -6,6 +6,7 @@ package mirror
 import (
 	"context"
 	"crypto/sha1" //nolint:gosec // git blob ids are SHA-1 by definition.
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,10 +25,12 @@ import (
 const hubSHA = "1111111111111111111111111111111111111111"
 
 // hub is a minimal upstream holding one revision of acme/tiny. Its files
-// are listed the way a hub lists files kept in git: by git blob id.
+// are listed the way a hub lists files kept in git, by git blob id, unless
+// they are named in lfs, which lists them by SHA-256 as well.
 type hub struct {
 	*httptest.Server
 	files map[string]string
+	lfs   map[string]bool
 	// info is extra members for the model description.
 	info map[string]any
 	// wrap, when set, sees every request first; returning true means it
@@ -81,8 +84,16 @@ func (h *hub) listing() []map[string]any {
 	out := make([]map[string]any, len(paths))
 	for i, p := range paths {
 		out[i] = map[string]any{"type": "file", "path": p, "size": len(h.files[p]), "oid": gitBlobID(h.files[p])}
+		if h.lfs[p] {
+			out[i]["lfs"] = map[string]any{"oid": sha256Hex(h.files[p]), "size": len(h.files[p])}
+		}
 	}
 	return out
+}
+
+func sha256Hex(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
 }
 
 func openRegistry(t *testing.T) *registry.Registry {

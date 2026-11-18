@@ -210,6 +210,37 @@ func TestPullThroughAsksUpstreamOnlyAboutValidRevisions(t *testing.T) {
 	}
 }
 
+// What the upstream writes in an error answer is not passed on to whoever
+// asked the registry: it could be some other service's page.
+func TestUpstreamErrorPagesAreNotRelayed(t *testing.T) {
+	t.Parallel()
+	const page = "internal status page: db-password=hunter2"
+	_, hubURL, _ := upstreamHub(t, server.Config{AnonymousRead: true}, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/revision/") {
+				http.Error(w, page, http.StatusInternalServerError)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	local := start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
+
+	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+	msg := body(t, resp)
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(msg, "upstream returned 500") {
+		t.Fatalf("pull-through: status %d: %s", resp.StatusCode, msg)
+	}
+	if strings.Contains(msg, "hunter2") || strings.Contains(resp.Header.Get("X-Error-Message"), "hunter2") {
+		t.Fatalf("pull-through relayed the upstream's error page: %s", msg)
+	}
+
+	resp = do(t, http.MethodPost, local.url+"/api/v1/mirror", local.write, jsonBody(t, map[string]any{"repo": "acme/tiny"}), nil)
+	if msg := body(t, resp); resp.StatusCode < 400 || strings.Contains(msg, "hunter2") {
+		t.Fatalf("mirror: status %d: %s", resp.StatusCode, msg)
+	}
+}
+
 func TestPullThroughFileSizeLimit(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})

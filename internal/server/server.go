@@ -62,6 +62,8 @@ type Config struct {
 	// taken through the API; 0 keeps them all.
 	BackupKeep int
 	// UpstreamClient overrides the HTTP client used to reach the upstream.
+	// The default one refuses redirects that lead to local and private
+	// addresses; see mirror.Upstream.Client before replacing it.
 	UpstreamClient *http.Client
 	Version        string
 	Logger         *slog.Logger
@@ -186,7 +188,7 @@ func splitPath(escaped string) ([]string, bool) {
 
 // upstream is the hub this registry mirrors from, with the operator's token.
 func (s *Server) upstream() *mirror.Upstream {
-	return &mirror.Upstream{Endpoint: s.cfg.Upstream, Token: s.cfg.UpstreamToken, Client: s.cfg.UpstreamClient}
+	return &mirror.Upstream{Endpoint: s.cfg.Upstream, Token: s.cfg.UpstreamToken, Client: s.cfg.UpstreamClient, Log: s.log}
 }
 
 // ---- authentication ----
@@ -298,7 +300,7 @@ func statusFor(err error) (int, string) {
 		return http.StatusConflict, ""
 	case errors.Is(err, mirror.ErrUpstreamNotFound):
 		return http.StatusNotFound, ""
-	case errors.Is(err, mirror.ErrUpstreamAuth):
+	case errors.Is(err, mirror.ErrUpstreamAuth), errors.Is(err, mirror.ErrUnsafeUpstream):
 		return http.StatusBadGateway, ""
 	case errors.Is(err, context.Canceled):
 		return 499, ""

@@ -317,6 +317,22 @@ gets an error naming the `modelctl mirror` command that would fetch it.
 server that implements the same download API works, including another
 Model Delivery registry, which is how you copy models between registries.
 
+The upstream may be on a private network or on the same machine. What it
+may not do is redirect the registry to a *different* host on a loopback,
+private or link-local address: such a redirect is refused, so that a hub
+which is compromised or impersonated cannot make the registry fetch from
+services only your network can reach. Redirects to public hosts, which is
+how hubs hand out file content, are followed, without the upstream token.
+
+One setup runs into this: mirroring from another registry that has
+`REGISTRY_S3_REDIRECT=true` and a bucket on a private address. Its
+downloads are redirects to that bucket, and the mirror fails with "the
+upstream pointed at an address the registry does not follow". Turn
+redirects off on the source registry while you copy from it, so that it
+streams the files itself.
+
+Use an `https://` upstream unless the network between the two is yours.
+
 ## Backup and restore
 
 There are two things to protect:

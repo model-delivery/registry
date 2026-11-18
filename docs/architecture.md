@@ -115,21 +115,58 @@ a new revision.
 1. Ask the upstream which revision id the requested branch or tag is, and
    list that revision's files. The listing carries a digest for every file:
    a SHA-256 for LFS files, a git blob id for the rest.
-2. For each file, skip the download if a blob with that digest is already
-   stored. Otherwise download it and verify it against the digest. A
-   dropped connection is resumed with a range request, up to five times
-   per file.
+2. For each file, skip the download if its content is already stored (see
+   below for what counts). Otherwise download it and verify it against
+   the digest. A dropped connection is resumed with a range request, up
+   to five times per file.
 3. Once every file is stored and verified, record the revision under its
-   upstream id, with the upstream's model description kept as provenance.
+   upstream id, with the upstream's model description kept as provenance
+   (unless it is over 1 MiB, in which case none is kept).
 
 If any file fails, nothing is recorded. The repository does not appear, or
 keeps pointing at its previous revision. Blobs downloaded before the
-failure stay, so a retry does not fetch them again; `modelctl gc` removes
-them if the mirror is abandoned.
+failure stay, so a retry does not fetch the LFS files again;
+`modelctl gc` removes them if the mirror is abandoned. A blob the mirror
+reuses is marked as just used, so a `gc` running at the same time leaves
+it alone.
 
-The upstream address is set by the operator when the server starts. It is
-never taken from a request, so an API caller cannot make the server fetch
-from an arbitrary host.
+**What a file is verified against.** The upstream publishes one digest per
+file, and which one depends on how it stores the file:
+
+- A file tracked with LFS (weights, and anything large) has a SHA-256 of
+  its content. That is also the name the registry stores it under, so
+  "already stored" is a lookup by name.
+- A file kept in git itself (configuration, tokenizer files, the model
+  card) has only its git blob id, which is a SHA-1 over a short header and
+  the content. The registry verifies the download against that, because
+  it is the only digest the upstream offers. SHA-1 is no longer collision
+  resistant, so this is a weaker check than the one LFS files get: it
+  catches corruption and truncation, not someone able to construct two
+  files with the same SHA-1 who also controls the upstream copy.
+
+  For the same reason a stored blob stands in for such a file only if a
+  mirrored revision already uses it, that is, only if it reached the
+  registry from an upstream under this same id. Content that was pushed
+  is never matched by git blob id; the file is downloaded instead.
+
+Once stored, every file is named and served by the SHA-256 of what was
+actually received, whichever digest it was checked against on arrival.
+
+**Where the upstream can send the registry.** The upstream address is set
+by the operator when the server starts. It is never taken from a request,
+so an API caller cannot make the server fetch from an arbitrary host. The
+upstream's own answers are held to rules as well (`internal/mirror/guard.go`):
+
+- The upstream token is sent to the configured scheme, host and port and
+  nowhere else, not to wherever a redirect leads.
+- The next page of a file listing must be on the configured host.
+- A redirect to another host is followed, since hubs keep file content on
+  separate storage hosts, but not if that host is a loopback, private,
+  link-local or unspecified address. The check is made against the
+  address the connection is actually opened to, so a host name that
+  resolves to a private address is refused too.
+- What the upstream writes in the body of an error answer is logged by the
+  server and is not included in the error returned to the client.
 
 ## Pull-through caching
 

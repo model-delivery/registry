@@ -287,10 +287,21 @@ func (r *Registry) StatBlob(ctx context.Context, digest string) (blob.Info, bool
 	return info, err == nil, err
 }
 
-// FindBlobByGitOID looks a blob up by the git blob id of its content.
-func (r *Registry) FindBlobByGitOID(ctx context.Context, oid string, size int64) (blob.Info, bool, error) {
+// FindMirroredBlob looks a blob up by the git blob id of its content, among
+// the blobs that a mirrored revision already uses.
+//
+// A git blob id is a SHA-1, and it is how an upstream names the files it
+// does not track with LFS. Content that merely has the right id is not
+// trusted to stand in for an upstream file: it has to have come from an
+// upstream itself. A blob that was only pushed, or is not referenced at
+// all, is never returned.
+func (r *Registry) FindMirroredBlob(ctx context.Context, oid string, size int64) (blob.Info, bool, error) {
 	info := blob.Info{GitOID: oid, Size: size}
-	err := r.db.QueryRowContext(ctx, "SELECT sha256 FROM blobs WHERE git_oid = ? AND size = ? LIMIT 1", oid, size).
+	err := r.db.QueryRowContext(ctx,
+		`SELECT b.sha256 FROM blobs b WHERE b.git_oid = ? AND b.size = ?
+		 AND EXISTS (SELECT 1 FROM files f JOIN commits c ON c.id = f.commit_id
+		             WHERE f.sha256 = b.sha256 AND c.source = ?)
+		 LIMIT 1`, oid, size, SourceMirror).
 		Scan(&info.SHA256)
 	if errors.Is(err, sql.ErrNoRows) {
 		return blob.Info{}, false, nil

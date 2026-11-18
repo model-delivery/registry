@@ -375,6 +375,43 @@ func TestDeleteAndParentCheckInMergeCommits(t *testing.T) {
 	}
 }
 
+// A blob is found by git blob id only once a mirrored revision uses it.
+func TestFindMirroredBlob(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := open(t)
+	info := put(t, r, "a small file kept in git upstream")
+	found := func() bool {
+		got, ok, err := r.FindMirroredBlob(ctx, info.GitOID, info.Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok && got.SHA256 != info.SHA256 {
+			t.Fatalf("found %s, want %s", got.SHA256, info.SHA256)
+		}
+		return ok
+	}
+	if found() {
+		t.Fatal("found a blob that nothing references")
+	}
+	if _, err := r.Commit(ctx, CommitInput{Repo: "acme/pushed", Branch: "main", Files: []File{{Path: "f", SHA256: info.SHA256}}}); err != nil {
+		t.Fatal(err)
+	}
+	if found() {
+		t.Fatal("found a blob that only a pushed revision references")
+	}
+	if _, err := r.Commit(ctx, CommitInput{Repo: "acme/mirrored", SHA: strings.Repeat("a", 40), Source: SourceMirror,
+		Upstream: "https://hub.example", Files: []File{{Path: "f", SHA256: info.SHA256}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !found() {
+		t.Fatal("did not find a blob a mirrored revision references")
+	}
+	if _, ok, _ := r.FindMirroredBlob(ctx, info.GitOID, info.Size+1); ok {
+		t.Fatal("found a blob of another size")
+	}
+}
+
 func TestCreateRepoAndBranch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

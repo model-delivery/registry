@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -26,13 +27,27 @@ const DefaultEndpoint = "https://huggingface.co"
 var (
 	ErrUpstreamNotFound = errors.New("not found upstream")
 	ErrUpstreamAuth     = errors.New("upstream denied access")
+	// ErrUnsafeUpstream reports that the upstream pointed the registry at
+	// an address it does not follow: see guard.go.
+	ErrUnsafeUpstream = errors.New("the upstream pointed at an address the registry does not follow")
 )
 
 // Upstream talks to a hub's public HTTP API.
+//
+// The operator configures one address, Endpoint, and trusts it. Everything
+// else the upstream can make the registry contact (a redirect, a link to
+// the next page of a listing) is held to the rules in guard.go.
 type Upstream struct {
 	Endpoint string
 	Token    string
-	Client   *http.Client
+	// Client overrides the HTTP client. The default refuses to connect to
+	// local and private addresses other than the configured endpoint's; a
+	// client supplied here does its own dialling, so that check is then
+	// limited to addresses written as IP literals.
+	Client *http.Client
+	// Log receives what the upstream sent with an error answer, which is
+	// kept out of the errors returned to callers. Nil discards it.
+	Log *slog.Logger
 }
 
 func (u *Upstream) endpoint() string {
@@ -46,7 +61,7 @@ func (u *Upstream) client() *http.Client {
 	if u.Client != nil {
 		return u.Client
 	}
-	return http.DefaultClient
+	return guardedClient
 }
 
 // Info is the part of a hub's model description the mirror relies on, plus
@@ -67,32 +82,109 @@ type Entry struct {
 	LFSSHA256 string
 }
 
+// maxRedirects is how many redirects one request follows, as net/http does.
+const maxRedirects = 10
+
+// get fetches rawURL, following redirects itself, one hop at a time, so
+// that each hop is checked before it is contacted:
+//
+//   - The token goes only to the configured endpoint's own scheme, host and
+//     port. Go's client would also send it to any subdomain of the first
+//     host a request went to; a hub's file storage is often exactly that,
+//     and has no use for the token.
+//   - A hop to any other host is refused if that host is a loopback,
+//     private or link-local address (guard.go).
 func (u *Upstream) get(ctx context.Context, rawURL string, header http.Header) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	home, err := url.Parse(u.endpoint())
+	if err != nil || home.Host == "" {
+		return nil, fmt.Errorf("the upstream address %q is not a URL", u.endpoint())
+	}
+	target, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range header {
-		req.Header[k] = v
+	client := *u.client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	for hop := 0; ; hop++ {
+		trusted := sameOrigin(home, target)
+		hopCtx := ctx
+		if !trusted {
+			if hopCtx, err = guardHop(ctx, target); err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(hopCtx, http.MethodGet, target.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range header {
+			req.Header[k] = v
+		}
+		req.Header.Set("User-Agent", "model-delivery-registry")
+		if u.Token != "" && trusted {
+			req.Header.Set("Authorization", "Bearer "+u.Token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("reach upstream: %w", err)
+		}
+		if !isRedirect(resp.StatusCode) {
+			return u.checked(ctx, resp, trusted)
+		}
+		next, err := resp.Location()
+		_ = resp.Body.Close()
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("upstream answered %d without saying where to go: %w", resp.StatusCode, err)
+		case hop == maxRedirects:
+			return nil, fmt.Errorf("upstream redirected more than %d times", maxRedirects)
+		case next.Scheme != "http" && next.Scheme != "https":
+			return nil, fmt.Errorf("%w: it redirected to a %q address", ErrUnsafeUpstream, next.Scheme)
+		}
+		target = next
 	}
-	req.Header.Set("User-Agent", "model-delivery-registry")
-	// net/http drops this header by itself when a redirect leaves the host,
-	// so the token never reaches the hub's CDN.
-	if u.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+u.Token)
+}
+
+func isRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
 	}
-	resp, err := u.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("reach upstream: %w", err)
-	}
+	return false
+}
+
+// checked returns resp if it is a success, and otherwise the error it
+// stands for. What the upstream wrote in an error body goes to the log and
+// never into the error: the error travels back to whoever made the request,
+// and the body could be another service's page.
+func (u *Upstream) checked(ctx context.Context, resp *http.Response, trusted bool) (*http.Response, error) {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	detail := strings.TrimSpace(resp.Header.Get("X-Error-Message"))
-	if detail == "" {
-		detail = strings.TrimSpace(string(body))
+	if u.Log != nil {
+		level := slog.LevelWarn
+		if resp.StatusCode == http.StatusNotFound {
+			level = slog.LevelDebug // an everyday answer to a wrong name
+		}
+		at := *resp.Request.URL
+		at.RawQuery, at.User = "", nil // a signed address carries its grant in the query
+		u.Log.Log(ctx, level, "the upstream answered with an error", "status", resp.StatusCode, "url", at.String(), "body", string(body))
+	}
+	// The one-line reason a hub puts in this header is worth passing on,
+	// when it is the configured hub that said it.
+	detail := ""
+	if trusted {
+		detail = strings.TrimSpace(resp.Header.Get("X-Error-Message"))
+		if len(detail) > 200 {
+			detail = detail[:200]
+		}
+	}
+	if detail != "" {
+		detail = ": " + detail
 	}
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -102,9 +194,9 @@ func (u *Upstream) get(ctx context.Context, rawURL string, header http.Header) (
 		}
 		return nil, fmt.Errorf("%w (%d): %s", ErrUpstreamAuth, resp.StatusCode, hint)
 	case http.StatusNotFound:
-		return nil, fmt.Errorf("%w: %s", ErrUpstreamNotFound, detail)
+		return nil, fmt.Errorf("%w%s", ErrUpstreamNotFound, detail)
 	default:
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, detail)
+		return nil, fmt.Errorf("upstream returned %d%s", resp.StatusCode, detail)
 	}
 }
 
@@ -136,6 +228,10 @@ var nextLinkRe = regexp.MustCompile(`<([^>]+)>\s*;\s*rel="next"`)
 
 // Tree lists every file in a revision, following the hub's pagination.
 func (u *Upstream) Tree(ctx context.Context, repo, sha string) ([]Entry, error) {
+	home, err := url.Parse(u.endpoint())
+	if err != nil {
+		return nil, fmt.Errorf("the upstream address %q is not a URL", u.endpoint())
+	}
 	next := u.endpoint() + "/api/models/" + repo + "/tree/" + url.PathEscape(sha) + "?recursive=true&expand=false"
 	var out []Entry
 	for pages := 0; next != ""; pages++ {
@@ -177,6 +273,11 @@ func (u *Upstream) Tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 			ref, err := resp.Request.URL.Parse(m[1])
 			if err != nil {
 				return nil, fmt.Errorf("parse upstream pagination link: %w", err)
+			}
+			// A listing continues where it began. The next page is an API
+			// call, sent with the token, so it goes nowhere else.
+			if !sameOrigin(home, ref) {
+				return nil, fmt.Errorf("%w: its file listing continues on another host, %s", ErrUnsafeUpstream, ref.Host)
 			}
 			next = ref.String()
 		}
@@ -255,7 +356,7 @@ func (r *resumeReader) Read(p []byte) (int, error) {
 // retryable decides whether to reconnect after err, waiting first if so.
 func (r *resumeReader) retryable(err error) bool {
 	if r.ctx.Err() != nil || r.resumes >= maxResumes ||
-		errors.Is(err, ErrUpstreamNotFound) || errors.Is(err, ErrUpstreamAuth) {
+		errors.Is(err, ErrUpstreamNotFound) || errors.Is(err, ErrUpstreamAuth) || errors.Is(err, ErrUnsafeUpstream) {
 		return false
 	}
 	r.resumes++

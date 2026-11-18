@@ -427,7 +427,11 @@ func cmdInspect(e *env, args []string) error {
 	if rev != nil {
 		fmt.Fprintf(tw, "\nFILES AT %s\tSIZE\tSHA256\n", short(rev.SHA))
 		for _, f := range rev.Files {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", f.Path, humanBytes(f.Size), f.SHA256)
+			digest := f.SHA256
+			if f.Pending {
+				digest = "(not fetched yet: fetched on first download)"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", f.Path, humanBytes(f.Size), digest)
 		}
 	}
 	return tw.Flush()

@@ -60,6 +60,15 @@ func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
 	return in
 }
 
+// httptestServer serves an existing registry a second time, with another
+// configuration, and returns its URL.
+func httptestServer(t *testing.T, reg *registry.Registry, cfg server.Config) string {
+	t.Helper()
+	srv := httptest.NewServer(server.New(reg, cfg))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
 func writeTree(t *testing.T, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()

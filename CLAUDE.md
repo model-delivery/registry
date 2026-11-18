@@ -55,6 +55,11 @@ Docker; the only place multipart uploads are exercised), `task build`,
   New content is a new revision; only refs move, and tags never move.
 - **A failed operation leaves nothing half-visible.** Recording a revision
   is one transaction. A mirror records nothing unless every file verified.
+- **`files` rows always point at stored, verified content.** A file that
+  pull-through has listed but not fetched is a row in `pending_files`, and
+  moves to `files` only in `Registry.Fulfil`, after its content matched its
+  digest. Never insert into `files` for content that is not stored, and
+  never serve a pending file's content.
 - **Stream, never buffer.** Model files are many gigabytes. No
   `io.ReadAll` on file content, in the server or the client.
 - **The upstream host comes from server configuration only**, never from a

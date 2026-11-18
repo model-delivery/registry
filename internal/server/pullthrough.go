@@ -16,20 +16,30 @@ import (
 	"github.com/model-delivery/registry/internal/registry"
 )
 
-// Pull-through caching: when a client asks for a revision the registry
-// does not hold, fetch it from the upstream hub, store it, and then answer.
-// It is the same verified, all-or-nothing mirror that `modelctl mirror`
-// runs, started by a read instead of a command.
+// Pull-through caching: when a client asks for something the registry does
+// not hold, get it from the upstream hub, store it, and then answer.
 //
-// Two properties matter:
+// It works at two levels, and neither fetches more than was asked for:
 //
-//   - The fetch belongs to the server, not to the request that started it.
-//     A large model takes minutes, and clients give up sooner than that. If
-//     the client disconnects the fetch carries on, and the next request for
-//     the same revision joins it instead of starting another.
-//   - A revision the registry already holds is served as is. Pull-through
-//     fills gaps; it never refreshes a branch that has moved upstream.
-//     `modelctl mirror` does that.
+//   - A revision the registry has never seen is recorded from the upstream's
+//     file listing: every path, size and digest, and no content. That is one
+//     small request, so listings and file metadata answer at once.
+//   - A file's content is fetched the first time a client downloads that
+//     file, verified against the digest in the listing, and stored. A
+//     client that wants one file of a large repository costs one file.
+//
+// Three properties matter:
+//
+//   - A fetch belongs to the server, not to the request that started it. A
+//     large file takes minutes, and clients give up sooner than that. If the
+//     client disconnects the fetch carries on, and the next request for the
+//     same thing joins it instead of starting another.
+//   - Nothing is served unverified. A file is only handed to a client once
+//     all of it is stored and has matched its digest.
+//   - What the registry already holds is served as is. Pull-through fills
+//     gaps; it never refreshes a branch that has moved upstream.
+//     `modelctl mirror` does that, and also fetches a whole revision at
+//     once, which is what guarantees it is available offline.
 
 // errUpstream wraps a pull-through failure that is the upstream's or the
 // network's doing, so it is reported as a gateway error, not as "not found".
@@ -42,9 +52,8 @@ const (
 	// How long an upstream "not found" is remembered, so a client retrying
 	// a wrong name does not turn into a stream of upstream requests.
 	missTTL = time.Minute
-	// How many revisions may be fetched at once. Each fetches several files
-	// in parallel already.
-	maxConcurrentPulls = 2
+	// How many fetches may run at once.
+	maxConcurrentPulls = 4
 	// The most time one fetch may take before it is abandoned.
 	pullTimeout = 12 * time.Hour
 )
@@ -63,7 +72,7 @@ type puller struct {
 
 type pullJob struct {
 	done chan struct{}
-	repo string // the id the revision was stored under
+	repo string // for a revision: the id it was stored under
 	err  error
 }
 
@@ -90,14 +99,46 @@ func (p *puller) allowed(repo string) bool {
 	return false
 }
 
-// ensure makes repo@rev available, fetching it if no fetch is already under
-// way. It returns the id the revision is stored under, which is the
-// upstream's canonical id and can differ from repo after a rename there.
-// It waits for the fetch only as long as ctx lives; the fetch itself is
-// not tied to ctx.
+// share runs work once per key however many callers ask for it at the same
+// time, on the server's own context, and lets each caller wait only as
+// long as its own ctx lives.
+func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
+	p.mu.Lock()
+	job := p.jobs[key]
+	if job == nil {
+		job = &pullJob{done: make(chan struct{})}
+		p.jobs[key] = job
+		// Deliberately not the request's context: the fetch must outlive the
+		// request that started it (see the note at the top of this file).
+		go func() { //nolint:gosec // G118: detached from the request on purpose.
+			bg, cancel := context.WithTimeout(context.Background(), pullTimeout)
+			defer cancel()
+			defer func() {
+				p.mu.Lock()
+				delete(p.jobs, key)
+				p.mu.Unlock()
+				close(job.done)
+			}()
+			p.slots <- struct{}{}
+			defer func() { <-p.slots }()
+			work(bg, job)
+		}()
+	}
+	p.mu.Unlock()
+
+	select {
+	case <-job.done:
+		return job, job.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// ensure records repo@rev from the upstream's listing if the registry does
+// not hold it. It returns the id the revision is stored under, which is
+// the upstream's canonical id and can differ from repo after a rename.
 func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	key := repo + "@" + rev
-
 	p.mu.Lock()
 	if until, missed := p.misses[key]; missed {
 		if time.Now().Before(until) {
@@ -106,68 +147,57 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 		}
 		delete(p.misses, key)
 	}
-	job := p.jobs[key]
-	if job == nil {
-		job = &pullJob{done: make(chan struct{})}
-		p.jobs[key] = job
-		// Deliberately not the request's context: the fetch must outlive the
-		// request that started it (see the note at the top of this file).
-		go p.run(key, repo, rev, job) //nolint:gosec // G118: detached from the request on purpose.
-	}
 	p.mu.Unlock()
 
-	select {
-	case <-job.done:
-		return job.repo, job.err
-	case <-ctx.Done():
-		return "", ctx.Err()
+	job, err := p.share(ctx, key, func(ctx context.Context, job *pullJob) {
+		plan, err := mirror.Prepare(ctx, p.upstream(), repo, rev)
+		if err != nil {
+			job.err = err
+			if errors.Is(err, mirror.ErrUpstreamNotFound) {
+				p.mu.Lock()
+				if len(p.misses) > 10_000 {
+					clear(p.misses)
+				}
+				p.misses[key] = time.Now().Add(missTTL)
+				p.mu.Unlock()
+				return
+			}
+			p.log.Warn("pull-through could not resolve upstream", "repo", repo, "revision", rev, "error", err)
+			return
+		}
+		c, err := plan.RecordLazy(ctx, p.reg)
+		if err != nil {
+			job.err = err
+			p.log.Warn("pull-through could not record the revision", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+			return
+		}
+		job.repo = c.Repo
+		p.log.Info("pull-through recorded a revision; its files are fetched on demand", "repo", c.Repo, "revision", rev,
+			"sha", c.SHA, "files", len(plan.Entries), "bytes", plan.Bytes())
+	})
+	if err != nil {
+		return "", err
 	}
+	return job.repo, nil
 }
 
-func (p *puller) run(key, repo, rev string, job *pullJob) {
-	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
-	defer cancel()
-	defer func() {
-		p.mu.Lock()
-		delete(p.jobs, key)
-		if errors.Is(job.err, mirror.ErrUpstreamNotFound) {
-			if len(p.misses) > 10_000 {
-				clear(p.misses)
-			}
-			p.misses[key] = time.Now().Add(missTTL)
+// ensureFile fetches the content of one pending file of revision c.
+func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.File) error {
+	_, err := p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context, job *pullJob) {
+		started := time.Now()
+		if err := mirror.FetchFile(ctx, p.upstream(), p.reg, c, f); err != nil {
+			job.err = err
+			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
+			return
 		}
-		p.mu.Unlock()
-		close(job.done)
-	}()
-
-	p.slots <- struct{}{}
-	defer func() { <-p.slots }()
-
-	started := time.Now()
-	plan, err := mirror.Prepare(ctx, p.upstream(), repo, rev)
-	if err != nil {
-		job.err = err
-		if !errors.Is(err, mirror.ErrUpstreamNotFound) {
-			p.log.Warn("pull-through could not resolve upstream", "repo", repo, "revision", rev, "error", err)
-		}
-		return
-	}
-	p.log.Info("pull-through started", "repo", plan.Info.ID, "revision", rev, "sha", plan.Info.SHA,
-		"files", len(plan.Entries), "bytes", plan.Bytes())
-	done, err := plan.Execute(ctx, p.reg, 4, nil)
-	if err != nil {
-		job.err = err
-		p.log.Warn("pull-through failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
-		return
-	}
-	job.repo = done.Repo
-	p.log.Info("pull-through complete", "repo", done.Repo, "sha", done.SHA, "files", done.Files,
-		"downloaded_bytes", done.DownloadedBytes, "reused_bytes", done.ReusedBytes,
-		"took", time.Since(started).Round(time.Millisecond))
+		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
+			"took", time.Since(started).Round(time.Millisecond))
+	})
+	return err
 }
 
 // resolve is Registry.Resolve with pull-through: a revision the registry
-// does not hold is fetched from upstream first, when that is enabled and
+// does not hold is recorded from upstream first, when that is enabled and
 // the repository is allowed.
 func (s *Server) resolve(ctx context.Context, repo, rev string) (registry.Commit, error) {
 	c, err := s.reg.Resolve(ctx, repo, rev)

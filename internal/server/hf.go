@@ -4,9 +4,11 @@
 package server
 
 import (
+	"context"
 	"crypto/sha1" //nolint:gosec // placeholder ids for directories, not a security boundary.
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -251,6 +253,36 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		h.Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
 		h.Set("Cache-Control", "no-cache")
+	}
+
+	if f.Pending {
+		// The revision lists this file but its content has not been fetched.
+		if r.Method == http.MethodHead {
+			// Everything a HEAD reports (identity, size) is in the listing,
+			// so a client checking what it would download costs nothing.
+			h.Set("Content-Type", "application/octet-stream")
+			h.Set("Content-Length", strconv.FormatInt(f.Size, 10))
+			h.Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if s.puller == nil {
+			w.Header().Set("X-Error-Code", "EntryNotFound")
+			hfError(w, http.StatusNotFound, fmt.Sprintf(
+				"%s is listed in this revision but was never fetched from upstream, and pull-through is off: run `modelctl mirror %s` or turn pull-through on", filePath, repo))
+			return
+		}
+		if err := s.puller.ensureFile(r.Context(), c, f); err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				err = errUpstream{err}
+			}
+			s.fail(w, r, err)
+			return
+		}
+		if f, err = s.reg.File(r.Context(), c, filePath); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 	}
 
 	if s.cfg.RedirectDownloads {

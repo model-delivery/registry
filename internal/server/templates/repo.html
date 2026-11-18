@@ -22,7 +22,7 @@ hf download {{$repo}} --revision {{$sha}}</pre>
   <tr>
     <td><a href="{{fileURL $repo $sha .Path}}">{{.Path}}</a></td>
     <td class="num">{{bytes .Size}}</td>
-    <td><code title="{{.SHA256}}">{{short .SHA256}}</code></td>
+    <td>{{if .Pending}}<span class="tag" title="Listed from upstream. Its content is fetched the first time someone downloads it.">fetched on demand</span>{{else}}<code title="{{.SHA256}}">{{short .SHA256}}</code>{{end}}</td>
   </tr>
   {{end}}
   </tbody>

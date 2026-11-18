@@ -159,11 +159,13 @@ saying so; it does not pretend to succeed.
 - **A mirror is a snapshot.** `main` in the registry points at the revision
   that was current when you last ran `modelctl mirror`, or when
   pull-through first fetched it.
-- **The first pull-through request for a large model can time out.** The
-  registry answers only once the whole revision is stored, and
-  `huggingface_hub` waits about ten seconds for metadata. The fetch carries
-  on after the client gives up; run the download again when it has
-  finished, or warm the registry with `modelctl mirror`. Small models
-  (tested in `test/e2e`) complete within the timeout.
+- **The first download of a large file through pull-through can time
+  out.** The registry hands over a file only once it has fetched and
+  verified all of it, and `huggingface_hub` waits about ten seconds between
+  bytes. The fetch carries on after the client gives up; run the download
+  again when it has finished, or fetch everything ahead of time with
+  `modelctl mirror`. Listings and file metadata answer immediately, and
+  small files (tested in `test/e2e`, including against huggingface.co)
+  arrive within the timeout.
 - **Model cards are not rendered.** `README.md` is stored and served like
   any other file.

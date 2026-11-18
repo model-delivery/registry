@@ -498,3 +498,72 @@ func mustResolve(t *testing.T, in *instance, repo, rev string) registry.Commit {
 	}
 	return c
 }
+
+// TestPullThroughOneFileFromHuggingFace asks a pull-through registry for a
+// single file of a real model on huggingface.co, with the stock client,
+// and checks that one file is all that was fetched.
+func TestPullThroughOneFileFromHuggingFace(t *testing.T) {
+	if os.Getenv("REGISTRY_E2E_NETWORK") != "1" {
+		t.Skip("set REGISTRY_E2E_NETWORK=1 to fetch from huggingface.co")
+	}
+	python(t)
+	ctx := context.Background()
+	repo := os.Getenv("REGISTRY_E2E_REPO")
+	if repo == "" {
+		repo = "hf-internal-testing/tiny-random-bert"
+	}
+	local := start(t, server.Config{AnonymousRead: true, PullThrough: true})
+
+	const script = `
+import json, sys
+from huggingface_hub import hf_hub_download, HfApi
+path = hf_hub_download(sys.argv[1], "config.json")
+info = HfApi().model_info(sys.argv[1])
+print(json.dumps({"path": path, "sha": info.sha, "files": len(info.siblings)}))
+`
+	stdout, stderr, err := runPython(t, local.srv.URL, "", script, nil, repo)
+	if err != nil {
+		t.Fatalf("download through a pull-through registry failed: %v\n%s", err, stderr)
+	}
+	var res struct {
+		Path  string `json:"path"`
+		SHA   string `json:"sha"`
+		Files int    `json:"files"`
+	}
+	lastJSON(t, stdout, &res)
+
+	c := mustResolve(t, local, repo, "main")
+	if c.SHA != res.SHA {
+		t.Fatalf("client saw revision %s, registry recorded %s", res.SHA, c.SHA)
+	}
+	files, err := local.reg.Files(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := 0
+	for _, f := range files {
+		if !f.Pending {
+			stored++
+			if f.Path != "config.json" {
+				t.Errorf("%s was fetched although nobody asked for it", f.Path)
+			}
+		}
+	}
+	if stored != 1 || len(files) != res.Files || len(files) < 2 {
+		t.Fatalf("%d of %d files fetched; the client saw %d listed", stored, len(files), res.Files)
+	}
+	st, _ := local.reg.Stats(ctx)
+	t.Logf("%s@%s: %d files listed, 1 fetched, %d bytes stored", repo, c.SHA, len(files), st.StoredBytes)
+	if got := fileSHA256(t, res.Path); got != files[indexOf(files, "config.json")].SHA256 {
+		t.Errorf("downloaded config.json hashes to %s", got)
+	}
+}
+
+func indexOf(files []registry.File, path string) int {
+	for i, f := range files {
+		if f.Path == path {
+			return i
+		}
+	}
+	return 0
+}

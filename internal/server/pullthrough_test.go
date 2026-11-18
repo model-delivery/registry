@@ -5,16 +5,13 @@ package server_test
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
-	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -57,50 +54,6 @@ func newCountingHub(t *testing.T, cfg server.Config) *countingHub {
 	return h
 }
 
-func TestPullThroughFetchesOnFirstRequestThenServesLocally(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-
-	// Nothing is in the registry. A client simply asks for a file.
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/tokenizer/vocab.txt", "", nil, nil)
-	if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["tokenizer/vocab.txt"] {
-		t.Fatalf("first request: status %d", resp.StatusCode)
-	}
-	if got := resp.Header.Get("X-Repo-Commit"); got != hub.pushed.SHA {
-		t.Fatalf("served revision %s, upstream is %s", got, hub.pushed.SHA)
-	}
-
-	// The whole revision was stored, verified, under its upstream id.
-	c, err := local.reg.Resolve(ctx, "acme/tiny", "main")
-	if err != nil || c.SHA != hub.pushed.SHA || c.Source != registry.SourceMirror {
-		t.Fatalf("stored revision = %+v, %v", c, err)
-	}
-	files, _ := local.reg.Files(ctx, c)
-	if len(files) != len(modelFiles) {
-		t.Fatalf("stored %d files, upstream has %d", len(files), len(modelFiles))
-	}
-
-	// Every later request is answered locally: the upstream is not asked again.
-	lookups, downloads := hub.lookups.Load(), hub.files.Load()
-	for _, path := range []string{
-		"/acme/tiny/resolve/main/model.safetensors",
-		"/acme/tiny/resolve/" + hub.pushed.SHA + "/config.json",
-		"/api/models/acme/tiny/revision/main",
-		"/api/models/acme/tiny/tree/" + hub.pushed.SHA + "?recursive=true",
-		"/api/v1/repos/acme/tiny/revisions/main",
-	} {
-		if resp := do(t, http.MethodGet, local.url+path, "", nil, nil); resp.StatusCode != http.StatusOK {
-			t.Errorf("%s: status %d", path, resp.StatusCode)
-		}
-	}
-	if hub.lookups.Load() != lookups || hub.files.Load() != downloads {
-		t.Fatalf("upstream was contacted again: lookups %d -> %d, files %d -> %d",
-			lookups, hub.lookups.Load(), downloads, hub.files.Load())
-	}
-}
-
 // Each kind of request a client might make first has to trigger the fetch.
 func TestPullThroughStartsFromAnyEntryPoint(t *testing.T) {
 	t.Parallel()
@@ -132,56 +85,6 @@ func TestPullThroughStartsFromAnyEntryPoint(t *testing.T) {
 	}
 }
 
-func TestPullThroughConcurrentRequestsShareOneFetch(t *testing.T) {
-	t.Parallel()
-	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	hub.hold = make(chan struct{})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-
-	const clients = 12
-	var wg sync.WaitGroup
-	statuses := make(chan int, clients)
-	for i := range clients {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Different files and both ref forms: all the same revision.
-			path := "/acme/tiny/resolve/main/config.json"
-			if i%2 == 1 {
-				path = "/api/models/acme/tiny/tree/main"
-			}
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, local.url+path, nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				statuses <- 0
-				return
-			}
-			_ = resp.Body.Close()
-			statuses <- resp.StatusCode
-		}()
-	}
-	// Let every client arrive while the upstream is still holding files back.
-	deadline := time.Now().Add(5 * time.Second)
-	for hub.files.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(150 * time.Millisecond)
-	close(hub.hold)
-	wg.Wait()
-	close(statuses)
-	for s := range statuses {
-		if s != http.StatusOK {
-			t.Errorf("a waiting client got status %d", s)
-		}
-	}
-	if got := hub.lookups.Load(); got != 1 {
-		t.Fatalf("upstream revision was looked up %d times for one revision, want 1", got)
-	}
-	if got := hub.files.Load(); got != int64(len(modelFiles)) {
-		t.Fatalf("upstream served %d files, want each of the %d once", got, len(modelFiles))
-	}
-}
-
 func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
@@ -201,8 +104,10 @@ func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 	close(hub.hold)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := local.reg.Resolve(context.Background(), "acme/tiny", "main"); err == nil {
-			break
+		if c, err := local.reg.Resolve(context.Background(), "acme/tiny", "main"); err == nil {
+			if f, err := local.reg.File(context.Background(), c, "config.json"); err == nil && !f.Pending {
+				break
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the fetch stopped when the client that started it disconnected")
@@ -210,10 +115,11 @@ func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	// The retry is answered at once, from the registry.
-	lookups := hub.lookups.Load()
+	lookups, downloads := hub.lookups.Load(), hub.files.Load()
 	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
-	if resp.StatusCode != http.StatusOK || hub.lookups.Load() != lookups {
-		t.Fatalf("retry: status %d, upstream lookups %d -> %d", resp.StatusCode, lookups, hub.lookups.Load())
+	if resp.StatusCode != http.StatusOK || hub.lookups.Load() != lookups || hub.files.Load() != downloads {
+		t.Fatalf("retry: status %d, upstream lookups %d -> %d, files %d -> %d",
+			resp.StatusCode, lookups, hub.lookups.Load(), downloads, hub.files.Load())
 	}
 }
 
@@ -313,35 +219,6 @@ func TestPullThroughWhenUpstreamDoesNotHaveIt(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != "EntryNotFound" || hub.lookups.Load() != before {
 		t.Fatalf("missing file: status %d code %q, upstream lookups %d -> %d",
 			resp.StatusCode, resp.Header.Get("X-Error-Code"), before, hub.lookups.Load())
-	}
-}
-
-func TestPullThroughRejectsTamperedContentAndCanRetry(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	hub.tampered.Store(true)
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-
-	// Even a request for a file that is intact fails: a revision is
-	// all-or-nothing, and one of its files does not verify.
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status %d, want 502", resp.StatusCode)
-	}
-	if msg := body(t, resp); !strings.Contains(msg, "could not fetch from upstream") || !strings.Contains(msg, "verification failed") {
-		t.Fatalf("error does not explain itself: %s", msg)
-	}
-	if _, err := local.reg.GetRepo(ctx, "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
-		t.Fatalf("a repository exists after a failed fetch: %v", err)
-	}
-
-	// A failure is not remembered: once the upstream is sound, the next
-	// request succeeds.
-	hub.tampered.Store(false)
-	resp = do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
-	if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["model.safetensors"] {
-		t.Fatalf("retry: status %d", resp.StatusCode)
 	}
 }
 

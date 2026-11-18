@@ -133,21 +133,42 @@ from an arbitrary host.
 
 ## Pull-through caching
 
-Pull-through is the mirror above, started by a read instead of a command.
-The three Hugging Face routes and the registry's own revision lookup all
-resolve a revision through one function. When that lookup misses, and
-pull-through is on and the repository is allowed, it asks a small
-coordinator to make the revision available and then looks again.
+Pull-through fetches what is asked for and nothing more, at two levels.
 
-The coordinator keeps one job per `repository@revision`. A request for a
-revision that is already being fetched waits on the existing job. The job
-runs on the server's own context, not the request's, so a client that
-disconnects does not stop it. Because it is the same mirror, the same
-guarantees hold: every file verified, nothing visible until all of it is
-stored.
+**Revisions.** The three Hugging Face routes and the registry's own
+revision lookup all resolve a revision through one function. When that
+lookup misses, and pull-through is on and the repository is allowed, the
+registry asks the upstream for the revision's file listing and records it:
+the revision under its upstream id, with every file's path, size and
+digest, and no content. Such files are *pending*.
+
+**Files.** Pending files live in their own table, `pending_files`. The
+`files` table keeps its guarantee that every row points at stored,
+verified content. A request for a pending file's metadata (`HEAD`) is
+answered from the listing. A request for its content fetches it from the
+upstream, verifies it against the listed digest (a SHA-256 for LFS files,
+a git blob id for the rest) while storing it, and then moves the row from
+`pending_files` to `files` in one transaction. When the last pending file
+of a revision arrives, the revision is complete and indistinguishable from
+a mirrored one.
+
+A small coordinator keeps one job per thing being fetched, whether a
+revision's listing or one file. A request for something already being
+fetched waits on the existing job. Jobs run on the server's own context,
+not the request's, so a client that disconnects does not stop one.
+
+Two rules follow from "nothing unverified is served":
+
+- A file is handed to a client only after all of it is stored and has
+  matched its digest. The first download of a file therefore waits for the
+  whole file.
+- A revision cannot be built on (by an upload that merges into its branch)
+  while it has pending files, because that would record a new revision
+  referring to content the registry has never seen.
 
 A lookup that hits is never sent upstream, so pull-through cannot change
-what a stored branch points at.
+what a recorded branch points at. `modelctl mirror` on a partly fetched
+revision fetches whatever is still pending and completes it.
 
 ## Serving downloads
 

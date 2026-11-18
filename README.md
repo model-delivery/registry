@@ -93,7 +93,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | | |
 |---|---|
 | **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id. Private and gated repositories work with your Hugging Face token. |
-| **Cache on demand** | Optionally, fetch a model from Hugging Face the first time a client asks for it, then serve it from the registry from then on. Point your tools at the registry and it fills itself. |
+| **Cache on demand** | Optionally, let the registry fetch from Hugging Face what it does not have: the file listing the first time a model is asked for, and each file the first time it is downloaded. Point your tools at the registry and it fills itself, one requested file at a time. |
 | **Serve** | Existing clients download through the Hugging Face compatible API, including resumable range requests. |
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
 | **Version** | Every revision is immutable and addressed by id. Branches move, tags never do. |
@@ -162,13 +162,17 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 Metadata stays in SQLite in the data directory, so keep that directory on a
 persistent disk and back it up. See [docs/operations.md](docs/operations.md#s3-storage).
 
-**Pull-through caching.** With `--pull-through`, a request for a model the
-registry does not have makes it fetch that revision from the upstream hub,
-verify and store it, and then answer. The first request for a large model
-waits for the whole download; if the client gives up, the fetch carries on
-and the next request is served from the registry. Anyone allowed to
-download can trigger a fetch, so on a registry others can reach, combine it
-with `--require-auth` or an allow list. See
+**Pull-through caching.** With `--pull-through`, the registry fetches what
+it is asked for and does not have. The first request for a model records
+its file listing from the upstream hub, which takes a moment. Each file's
+content is then fetched the first time someone downloads that file, checked
+against its digest, and stored. Asking for one file of a large repository
+fetches one file. The first download of a large file waits while the
+registry fetches it; if the client gives up, the fetch carries on and a
+retry is served from the registry. Anyone allowed to download can trigger a
+fetch, so on a registry others can reach, combine it with `--require-auth`
+or an allow list. To have a whole model available offline, run
+`modelctl mirror`. See
 [docs/operations.md](docs/operations.md#pull-through-caching).
 
 **Access.** Writing (push, mirror) always needs a token with the `write`
@@ -220,8 +224,9 @@ Details, including the exact routes, are in
   up a newer upstream revision. There is no automatic sync. Pull-through
   caching fetches what the registry lacks, but it never refreshes a branch
   it already holds.
-- **A mirror copies whole revisions.** You cannot yet mirror only some
-  files of a repository.
+- **`modelctl mirror` copies whole revisions.** To fetch only some files of
+  a repository, use pull-through caching, which fetches each file when it
+  is first downloaded.
 - **Repository ids are `namespace/name`**, and are case-sensitive.
 - **Uploads are not resumable.** An interrupted `modelctl push` re-sends the
   file it was in the middle of; files that finished are skipped.

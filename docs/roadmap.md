@@ -6,8 +6,10 @@ of dates. Issues and pull requests that move an item forward are welcome.
 
 ## Next
 
-- **Partial mirrors.** `modelctl mirror --include "*.gguf"` to copy only
-  some files of a large repository, recorded honestly as a subset.
+- **Mirror selected files.** `modelctl mirror --include "*.gguf"` to fetch
+  chosen files of a large repository ahead of time. Pull-through caching
+  already fetches only the files that are downloaded; this is the same for
+  the explicit command.
 - **Xet uploads.** Uploads from Hugging Face clients work today, but a
   stock client needs `HF_HUB_DISABLE_XET=1` for large files. Speaking the
   Xet protocol would remove that step.
@@ -18,9 +20,10 @@ of dates. Issues and pull requests that move an item forward are welcome.
 ## After that
 
 - **Scheduled sync.** Keep chosen mirrors up to date with upstream.
-- **Serve while fetching.** Today the first pull-through request for a
-  model waits until the whole revision is stored. Stream files to that
-  first client as they arrive.
+- **Serve while fetching.** Today the first download of a file through
+  pull-through waits until the whole file is stored and verified. Stream
+  it to that first client as it arrives, holding back the end until the
+  digest has been checked.
 - **Mirror every branch and tag** of a repository in one command.
 - **Resumable uploads** for `modelctl push`.
 - **A migration command** to move stored files between local disk and S3.

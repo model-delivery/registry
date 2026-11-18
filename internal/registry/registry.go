@@ -183,14 +183,29 @@ func (r *Registry) migrate() error {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.ExecContext(ctx, schema); err != nil {
+		if _, err := tx.ExecContext(ctx, schema+pendingSchema); err != nil {
 			return fmt.Errorf("create schema: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
 			return err
 		}
 		return tx.Commit()
 	case 1:
+		// Version 2 adds the table for files a revision lists but has not
+		// fetched yet. Nothing existing changes.
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(ctx, pendingSchema); err != nil {
+			return fmt.Errorf("upgrade schema to version 2: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+			return err
+		}
+		return tx.Commit()
+	case 2:
 		return nil
 	default:
 		return fmt.Errorf("data directory was written by a newer version (schema %d)", v)

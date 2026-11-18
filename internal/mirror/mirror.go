@@ -114,7 +114,7 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 			defer wg.Done()
 			for i := range jobs {
 				e := p.Entries[i]
-				f, fetched, err := p.fetch(ctx, reg, e)
+				f, fetched, err := ensureBlob(ctx, p.up, reg, repo, sha, e)
 				mu.Lock()
 				if err != nil {
 					if firstErr == nil {
@@ -168,16 +168,64 @@ feed:
 	if !registry.IsSHA(p.revision) {
 		in.Branch = p.revision
 	}
-	if _, err := reg.Commit(ctx, in); err != nil {
+	if existing, err := reg.Resolve(ctx, repo, sha); err == nil {
+		// The revision is already recorded, perhaps by pull-through with
+		// some files still to fetch. Every file is stored now, so complete
+		// it, and move the branch.
+		for _, f := range files {
+			if err := reg.Fulfil(ctx, existing, f.Path, f.SHA256); err != nil {
+				return Event{}, fmt.Errorf("%s: %w", f.Path, err)
+			}
+		}
+		if _, err := reg.CommitLazy(ctx, p.lazyInput(in.Branch)); err != nil {
+			return Event{}, err
+		}
+	} else if _, err := reg.Commit(ctx, in); err != nil {
 		return Event{}, err
 	}
 	return Event{Event: "done", Repo: repo, SHA: sha, Ref: in.Branch, Files: len(files),
 		Bytes: downloaded + reused, DownloadedBytes: downloaded, ReusedBytes: reused}, nil
 }
 
-// fetch makes sure one upstream file's bytes are stored, downloading and
-// verifying them only if they are not already present.
-func (p *Plan) fetch(ctx context.Context, reg *registry.Registry, e Entry) (registry.File, bool, error) {
+func (p *Plan) lazyInput(branch string) registry.LazyInput {
+	files := make([]registry.File, len(p.Entries))
+	for i, e := range p.Entries {
+		files[i] = registry.File{Path: e.Path, Size: e.Size, GitOID: e.OID, LFS: e.LFSSHA256 != "", SHA256: e.LFSSHA256}
+	}
+	return registry.LazyInput{
+		Repo: p.Info.ID, Branch: branch, SHA: p.Info.SHA, Files: files,
+		Upstream: p.up.endpoint(), UpstreamInfo: string(p.Info.Raw), Message: "Mirrored from " + p.up.endpoint(),
+	}
+}
+
+// RecordLazy records the revision from its upstream file listing without
+// fetching any content. Every file is listed with its size and digest;
+// FetchFile brings in one file's bytes when it is first wanted.
+func (p *Plan) RecordLazy(ctx context.Context, reg *registry.Registry) (registry.Commit, error) {
+	branch := ""
+	if !registry.IsSHA(p.revision) {
+		branch = p.revision
+	}
+	return reg.CommitLazy(ctx, p.lazyInput(branch))
+}
+
+// FetchFile fetches the content of one pending file of revision c from up,
+// verifies it against the digest recorded for it, and marks it stored.
+func FetchFile(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File) error {
+	e := Entry{Path: f.Path, Size: f.Size, OID: f.GitOID}
+	if f.LFS {
+		e.LFSSHA256 = f.SHA256
+	}
+	got, _, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e)
+	if err != nil {
+		return err
+	}
+	return reg.Fulfil(ctx, c, f.Path, got.SHA256)
+}
+
+// ensureBlob makes sure one upstream file's bytes are stored, downloading
+// and verifying them only if they are not already present.
+func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo, sha string, e Entry) (registry.File, bool, error) {
 	f := registry.File{Path: e.Path, GitOID: e.OID, LFS: e.LFSSHA256 != ""}
 	want := blob.Expect{Size: e.Size}
 	if f.LFS {
@@ -202,7 +250,7 @@ func (p *Plan) fetch(ctx context.Context, reg *registry.Registry, e Entry) (regi
 			return f, false, nil
 		}
 	}
-	body := p.up.Open(ctx, p.Info.ID, p.Info.SHA, e.Path)
+	body := up.Open(ctx, repo, sha, e.Path)
 	defer func() { _ = body.Close() }()
 	info, err := reg.PutBlob(ctx, body, want)
 	if err != nil {

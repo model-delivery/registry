@@ -108,6 +108,10 @@ type File struct {
 	// id of the content, or of the LFS pointer when LFS is true.
 	GitOID string `json:"git_oid"`
 	LFS    bool   `json:"lfs"`
+	// Pending means the revision lists this file but its content has not
+	// been fetched yet (see pending.go). SHA256 is then known only for LFS
+	// files.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // ETag is the identifier Hugging Face clients cache the file under.
@@ -224,6 +228,14 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 
 	files := map[string]File{}
 	if in.Merge && parentID != 0 {
+		var pending int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pending_files WHERE commit_id = ?", parentID).Scan(&pending); err != nil {
+			return Commit{}, err
+		}
+		if pending > 0 {
+			return Commit{}, fmt.Errorf("%w: %s has %d files that were never fetched from upstream, so a revision cannot be built on it; run `modelctl mirror %s` to fetch them first",
+				ErrConflict, in.Branch, pending, in.Repo)
+		}
 		prev, err := queryFiles(ctx, tx, parentID)
 		if err != nil {
 			return Commit{}, err
@@ -464,7 +476,7 @@ func (r *Registry) Resolve(ctx context.Context, repoName, rev string) (Commit, e
 
 // Files lists a revision's files in path order.
 func (r *Registry) Files(ctx context.Context, c Commit) ([]File, error) {
-	return queryFiles(ctx, r.db, c.ID)
+	return allFiles(ctx, r.db, c.ID)
 }
 
 // File returns one file of a revision.
@@ -473,7 +485,12 @@ func (r *Registry) File(ctx context.Context, c Commit, path string) (File, error
 	err := r.db.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM files WHERE commit_id = ? AND path = ?", c.ID, path).
 		Scan(&f.Size, &f.SHA256, &f.GitOID, &f.LFS)
 	if errors.Is(err, sql.ErrNoRows) {
-		return File{}, fmt.Errorf("%w: %s", ErrEntryNotFound, path)
+		f.Pending = true
+		err = r.db.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM pending_files WHERE commit_id = ? AND path = ?", c.ID, path).
+			Scan(&f.Size, &f.SHA256, &f.GitOID, &f.LFS)
+		if errors.Is(err, sql.ErrNoRows) {
+			return File{}, fmt.Errorf("%w: %s", ErrEntryNotFound, path)
+		}
 	}
 	return f, err
 }
@@ -508,8 +525,8 @@ type CommitSummary struct {
 // Commits lists a repository's revisions, newest first.
 func (r *Registry) Commits(ctx context.Context, repo Repo) ([]CommitSummary, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT c.id, c.repo_id, r.name, c.sha, c.parent, c.message, c.source, c.upstream_info, c.created_at,
-		(SELECT COUNT(*) FROM files f WHERE f.commit_id = c.id),
-		(SELECT COALESCE(SUM(size), 0) FROM files f WHERE f.commit_id = c.id)
+		(SELECT COUNT(*) FROM files f WHERE f.commit_id = c.id) + (SELECT COUNT(*) FROM pending_files p WHERE p.commit_id = c.id),
+		(SELECT COALESCE(SUM(size), 0) FROM files f WHERE f.commit_id = c.id) + (SELECT COALESCE(SUM(size), 0) FROM pending_files p WHERE p.commit_id = c.id)
 		FROM commits c JOIN repos r ON r.id = c.repo_id WHERE c.repo_id = ? ORDER BY c.id DESC`, repo.ID)
 	if err != nil {
 		return nil, err

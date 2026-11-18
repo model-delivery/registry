@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // git blob ids are SHA-1 by definition.
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -125,6 +126,43 @@ type File struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	// GitOID is the file's git object id. SHA256 is empty for a file the
+	// registry lists but has not fetched from its upstream yet, unless the
+	// file is LFS-tracked; such a file is then verified against GitOID,
+	// which for a non-LFS file is the git blob id of its content.
+	GitOID string `json:"git_oid"`
+	LFS    bool   `json:"lfs"`
+	// Pending is true while the registry has not fetched the file's content.
+	Pending bool `json:"pending"`
+}
+
+// matches reports whether the file at path has the content f describes.
+func (f File) matches(path string) bool {
+	if f.SHA256 != "" {
+		digest, _, err := hashFile(path)
+		return err == nil && digest == f.SHA256
+	}
+	oid, err := gitBlobID(path)
+	return err == nil && !f.LFS && oid == f.GitOID
+}
+
+// gitBlobID is the id git gives a file's content.
+func gitBlobID(path string) (string, error) {
+	file, err := os.Open(path) //nolint:gosec // a path under the directory the user named.
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	fi, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	h := sha1.New() //nolint:gosec // git blob ids are SHA-1 by definition.
+	fmt.Fprintf(h, "blob %d\x00", fi.Size())
+	if _, err := io.Copy(h, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Revision is a revision and its files.
@@ -314,7 +352,7 @@ func (c *Client) Pull(ctx context.Context, repo, rev, dir string, progress func(
 			return Revision{}, err
 		}
 		fetched := false
-		if digest, _, err := hashFile(dst); err != nil || digest != f.SHA256 {
+		if !f.matches(dst) {
 			if err := c.download(ctx, revision, f, dst); err != nil {
 				return Revision{}, fmt.Errorf("download %s: %w", f.Path, err)
 			}
@@ -369,10 +407,22 @@ func (c *Client) download(ctx context.Context, rev Revision, f File, dst string)
 			return err
 		}
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
+	if got := hex.EncodeToString(h.Sum(nil)); f.SHA256 != "" && got != f.SHA256 {
 		_ = out.Close()
 		_ = os.Remove(part)
 		return fmt.Errorf("integrity check failed: expected sha256 %s, got %s", f.SHA256, got)
+	}
+	if f.SHA256 == "" {
+		// The registry had not fetched this file when it was listed, so it
+		// could only name it by git blob id. Check against that.
+		if err := out.Sync(); err != nil {
+			return err
+		}
+		if !f.matches(part) {
+			_ = out.Close()
+			_ = os.Remove(part)
+			return fmt.Errorf("integrity check failed: content does not match git blob id %s", f.GitOID)
+		}
 	}
 	if err := out.Sync(); err != nil {
 		return err

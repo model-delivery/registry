@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -28,13 +29,16 @@ func TestSignedUploadEnforcesTheSizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
+	if _, err := reg.CreateToken(context.Background(), "ci", registry.RoleWrite); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{reg: reg, cfg: Config{MaxBlobBytes: 100}, log: slog.New(slog.DiscardHandler), uploadKey: newUploadKey()}
 
 	content := strings.Repeat("x", 101)
 	sum := sha256.Sum256([]byte(content))
 	oid := hex.EncodeToString(sum[:])
 	expires := time.Now().Add(time.Hour).Unix()
-	target := fmt.Sprintf("/api/lfs/upload/%s?size=%d&expires=%d&signature=%s", oid, len(content), expires, s.signUpload(oid, int64(len(content)), expires))
+	target := fmt.Sprintf("/api/lfs/upload/%s?size=%d&expires=%d&token=ci&signature=%s", oid, len(content), expires, s.signUpload(oid, int64(len(content)), expires, "ci"))
 	req := httptest.NewRequest(http.MethodPut, target, strings.NewReader(content))
 	req.SetPathValue("sha256", oid)
 	rec := httptest.NewRecorder()

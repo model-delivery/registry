@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -228,6 +229,8 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 		Actions map[string]action `json:"actions,omitempty"`
 		Error   *map[string]any   `json:"error,omitempty"`
 	}
+	// The URLs issued below are bound to the token that asked for them.
+	_, tok := s.roleOf(r)
 	out := make([]object, len(req.Objects))
 	for i, o := range req.Objects {
 		out[i] = object{OID: o.OID, Size: o.Size}
@@ -251,8 +254,8 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 		}
 		expires := time.Now().Add(uploadURLTTL).Unix()
 		out[i].Actions = map[string]action{"upload": {
-			Href: fmt.Sprintf("%s/api/lfs/upload/%s?size=%d&expires=%d&signature=%s",
-				baseURL(r), o.OID, o.Size, expires, s.signUpload(o.OID, o.Size, expires)),
+			Href: fmt.Sprintf("%s/api/lfs/upload/%s?size=%d&expires=%d&token=%s&signature=%s",
+				baseURL(r), o.OID, o.Size, expires, url.QueryEscape(tok.Name), s.signUpload(o.OID, o.Size, expires, tok.Name)),
 			ExpiresIn: int(uploadURLTTL.Seconds()),
 		}}
 	}
@@ -261,12 +264,15 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 	_ = json.NewEncoder(w).Encode(map[string]any{"transfer": "basic", "objects": out})
 }
 
-// signUpload authorises one upload: this digest, this size, until expires.
-// The client sends the file to the signed URL without its token (on the
-// Hub that URL is the object store's), so the URL itself carries the grant.
-func (s *Server) signUpload(oid string, size, expires int64) string {
+// signUpload authorises one upload: this digest, this size, until expires,
+// on behalf of the token called tokenName. The client sends the file to the
+// signed URL without its token (on the Hub that URL is the object store's),
+// so the URL itself carries the grant. Naming the token in it lets the
+// grant end when the token does. The name comes last in the signed text,
+// so nothing in it can pass for another field.
+func (s *Server) signUpload(oid string, size, expires int64, tokenName string) string {
 	mac := hmac.New(sha256.New, s.uploadKey)
-	fmt.Fprintf(mac, "lfs-upload\n%s\n%d\n%d", oid, size, expires)
+	fmt.Fprintf(mac, "lfs-upload\n%s\n%d\n%d\n%s", oid, size, expires, tokenName)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -276,13 +282,25 @@ func (s *Server) hfLFSUpload(w http.ResponseWriter, r *http.Request) {
 	size, errSize := strconv.ParseInt(q.Get("size"), 10, 64)
 	expires, errExp := strconv.ParseInt(q.Get("expires"), 10, 64)
 	given, errSig := hex.DecodeString(q.Get("signature"))
-	want, _ := hex.DecodeString(s.signUpload(oid, size, expires))
+	tokenName := q.Get("token")
+	want, _ := hex.DecodeString(s.signUpload(oid, size, expires, tokenName))
 	if errSize != nil || errExp != nil || errSig != nil || !hmac.Equal(given, want) {
 		writeError(w, http.StatusForbidden, "this upload URL is not valid: ask the registry for a new one")
 		return
 	}
 	if time.Now().Unix() > expires {
 		writeError(w, http.StatusForbidden, "this upload URL has expired: start the upload again")
+		return
+	}
+	// The URL is only as good as the token it was issued to: revoking the
+	// token, or taking the write role from it, ends its uploads in flight.
+	tok, err := s.reg.Token(r.Context(), tokenName)
+	switch {
+	case errors.Is(err, registry.ErrTokenNotFound), err == nil && roleFromName(tok.Role) < roleWrite:
+		writeError(w, http.StatusForbidden, "the access token this upload URL was issued to has been revoked or no longer has the write role: start the upload again with a current token")
+		return
+	case err != nil:
+		s.fail(w, r, err)
 		return
 	}
 	if over, err := s.blobTooLarge(size); over {

@@ -110,7 +110,7 @@ What an upload does and does not do:
 | `POST /api/repos/create` | Models only. `409` if the repository exists, which `exist_ok` clients accept |
 | `POST /api/models/{repo}/preupload/{branch}` | Files up to 10 MiB are sent inline, larger ones through the large-file protocol |
 | `POST /{repo}.git/info/lfs/objects/batch` | git-lfs batch API, `upload` operation, `basic` transfer. Returns a signed, expiring URL per object, or nothing for an object already stored |
-| `PUT /api/lfs/upload/{sha256}` | The signed URL. Accepts only the bytes it was issued for |
+| `PUT /api/lfs/upload/{sha256}` | The signed URL. Accepts only the bytes it was issued for, for up to 12 hours, and only while the token that asked for it still exists and has the write role |
 | `POST /api/models/{repo}/commit/{branch}` | Line-delimited commit: `file`, `lfsFile`, `deletedFile`, `deletedFolder`. `412` if `parentCommit` is no longer the branch's revision |
 | `POST /api/models/{repo}/branch/{branch}` | |
 | `POST /api/validate-yaml` | Always accepts; the registry stores `README.md` as a file |

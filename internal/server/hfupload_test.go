@@ -156,6 +156,8 @@ func TestLargeFileUploadURLs(t *testing.T) {
 			},
 			"another size":      func(q url.Values, _ *string) { q.Set("size", strconv.Itoa(len(other))) },
 			"a later expiry":    func(q url.Values, _ *string) { q.Set("expires", "99999999999") },
+			"another token":     func(q url.Values, _ *string) { q.Set("token", "admin") },
+			"no token":          func(q url.Values, _ *string) { q.Del("token") },
 			"no signature":      func(q url.Values, _ *string) { q.Del("signature") },
 			"a wrong signature": func(q url.Values, _ *string) { q.Set("signature", strings.Repeat("0", 64)) },
 		}
@@ -206,6 +208,57 @@ func TestLargeFileUploadURLs(t *testing.T) {
 			jsonBody(t, map[string]any{"operation": "download", "objects": []map[string]any{}}), nil)
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+}
+
+// An upload URL is issued to a token, and is worth nothing once that token
+// is revoked or loses the write role.
+func TestUploadURLEndsWithItsToken(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	content := strings.Repeat("uploaded after the token was gone ", 512)
+	refused := func(t *testing.T, in *instance, href string) {
+		t.Helper()
+		resp := do(t, http.MethodPut, href, "", strings.NewReader(content), nil)
+		msg := body(t, resp)
+		if resp.StatusCode != http.StatusForbidden || !strings.Contains(msg, "revoked or no longer has the write role") {
+			t.Fatalf("status %d, want 403 saying why: %s", resp.StatusCode, msg)
+		}
+		if _, ok, _ := in.reg.StatBlob(ctx, sha(content)); ok {
+			t.Fatal("the upload was stored")
+		}
+	}
+
+	t.Run("revoked", func(t *testing.T) {
+		t.Parallel()
+		in := start(t, server.Config{AnonymousRead: true})
+		href := batch(t, in, "acme/up", content)[sha(content)]
+		if err := in.reg.RevokeToken(ctx, "write"); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, in, href)
+	})
+	t.Run("reduced to the read role", func(t *testing.T) {
+		t.Parallel()
+		in := start(t, server.Config{AnonymousRead: true})
+		href := batch(t, in, "acme/up", content)[sha(content)]
+		if err := in.reg.SetToken(ctx, "write", registry.RoleRead, in.write, true); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, in, href)
+	})
+	t.Run("still valid: accepted, with a name that needs escaping", func(t *testing.T) {
+		t.Parallel()
+		in := start(t, server.Config{AnonymousRead: true})
+		secret, err := in.reg.CreateToken(ctx, "ci & deploy/main", registry.RoleWrite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		in.write = secret
+		href := batch(t, in, "acme/up", content)[sha(content)]
+		if resp := do(t, http.MethodPut, href, "", strings.NewReader(content), nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 		}
 	})
 }

@@ -464,6 +464,21 @@ func (r *Registry) Authenticate(ctx context.Context, secret string) (Token, bool
 	return t, true
 }
 
+// Token returns the record of the token called name, or ErrTokenNotFound.
+func (r *Registry) Token(ctx context.Context, name string) (Token, error) {
+	t := Token{Name: name}
+	var created string
+	err := r.db.QueryRowContext(ctx, "SELECT role, created_at FROM tokens WHERE name = ?", name).Scan(&t.Role, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Token{}, fmt.Errorf("%w: %s", ErrTokenNotFound, name)
+	}
+	if err != nil {
+		return Token{}, err
+	}
+	t.CreatedAt = parseTime(created)
+	return t, nil
+}
+
 // ListTokens returns every token record, oldest first.
 func (r *Registry) ListTokens(ctx context.Context) ([]Token, error) {
 	rows, err := r.db.QueryContext(ctx, "SELECT name, role, created_at FROM tokens ORDER BY id")

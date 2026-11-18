@@ -6,14 +6,23 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # Reachable from this machine only. To serve other machines, put a
+      # reverse proxy with HTTPS in front (docs/operations.md), or publish
+      # the port on every interface with "8080:8080". Before you do either,
+      # read the note on REGISTRY_REQUIRE_AUTH below.
+      - "127.0.0.1:8080:8080"
     volumes:
       - registry-data:/data
     environment:
-      # Require a token for downloads and browsing too (default: only for writes).
+      # "false": anyone who can reach the port can download and browse, and
+      # only writing needs a token. That suits a machine or a network of
+      # your own. Set "true" to require a token for downloads and the web UI
+      # too, and do so before the registry is reachable from anywhere you
+      # do not control.
       REGISTRY_REQUIRE_AUTH: "false"
-      # Set your own admin token instead of reading a generated one from the log.
-      # REGISTRY_ADMIN_TOKEN: "change-me-to-a-long-random-string"
+      # Set your own admin token instead of reading a generated one from the
+      # log. Generate it, do not type one: openssl rand -hex 24
+      # REGISTRY_ADMIN_TOKEN: "paste the output of: openssl rand -hex 24"
       # Token for the upstream hub, for mirroring private or gated repositories.
       # REGISTRY_UPSTREAM_TOKEN: "hf_..."
 

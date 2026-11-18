@@ -249,6 +249,10 @@ func envBool(e *env, key string) bool {
 	return b
 }
 
+// recommendedAdminTokenLen is the length below which a supplied admin token
+// draws a warning at start. `openssl rand -hex 24` gives 48 characters.
+const recommendedAdminTokenLen = 32
+
 // bootstrapAdmin makes sure someone can administer the registry. A token in
 // REGISTRY_ADMIN_TOKEN is applied on every start; otherwise a fresh
 // registry mints one and prints it once.
@@ -279,6 +283,14 @@ func bootstrapAdmin(e *env, reg *registry.Registry, log *slog.Logger, requireSup
 			return fmt.Errorf("apply %s: %w", source, err)
 		}
 		log.Info("admin token set from " + source)
+		if len(secret) < recommendedAdminTokenLen {
+			// Shorter tokens are still accepted, as they always were. The
+			// length matters because the token's hash is in the database
+			// and in every backup, where candidates can be tried offline.
+			log.Warn(fmt.Sprintf("the admin token from %s is shorter than %d characters: use a long random one, for example from `openssl rand -hex 24`; "+
+				"its hash is stored in the database and in every backup, where a short or guessable token can be found by trying candidates",
+				source, recommendedAdminTokenLen))
+		}
 		return nil
 	}
 	toks, err := reg.ListTokens(ctx)

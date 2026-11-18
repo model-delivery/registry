@@ -84,12 +84,47 @@ On its first start against an empty data directory the server creates an
 admin token and prints it once, to standard error. With Docker, read it
 from `docker logs`.
 
-To choose the token yourself, set `REGISTRY_ADMIN_TOKEN` (at least 16
-characters). It is applied at every start, so changing the variable and
-restarting rotates it.
+To choose the token yourself, set `REGISTRY_ADMIN_TOKEN`. It is applied at
+every start, so changing the variable and restarting rotates it. Generate
+it; do not type one:
+
+```bash
+openssl rand -hex 24
+```
+
+The registry stores a SHA-256 of each token, not the token, and that hash
+is in the database and in every backup. For the tokens the registry
+generates, which are 192 random bits, the hash gives nothing away. A token
+you choose is only as strong as it is hard to guess: someone who can read a
+backup or the bucket can try candidates against the hash at their leisure.
+The server accepts 16 characters or more, and logs a warning at every
+start while the supplied token is shorter than 32.
 
 If you lose every admin token, start the server once with
 `REGISTRY_ADMIN_TOKEN` set.
+
+### Where tokens end up
+
+- **In the database**, as hashes. The registry keeps `registry.db`, its
+  write-ahead log, snapshots and restored databases readable by the
+  account it runs as and no other (mode `0600`). Stored blobs and backups
+  have always been written that way.
+- **On the command line, if you put them there.** `--token` works, but
+  command-line arguments are visible to every account on the machine
+  through the process list, and are kept in shell history. Use the
+  `MODELCTL_TOKEN` environment variable instead; the same goes for
+  `--upstream-token` and `MODELCTL_UPSTREAM_TOKEN`.
+- **In the browser, after signing in to the web UI.** The sign-in cookie
+  (`md_token`) holds the access token itself and lasts 30 days. Scripts
+  cannot read it (`HttpOnly`) and it is not sent on requests from other
+  sites (`SameSite=Strict`). It is marked `Secure`, so that it is never
+  sent over plain HTTP, when the sign-in arrived over HTTPS; see
+  [HTTPS](#https). Signing out removes the cookie but does not revoke the
+  token: to end a browser session for good, revoke the token with
+  `modelctl token revoke`. Sign in with a token made for the purpose, not
+  with the admin token, on a machine you share.
+- **Never in the log**, apart from the one generated at first start, which
+  is printed once so that you can read it.
 
 ### On Kubernetes, or anywhere logs are collected
 
@@ -435,6 +470,19 @@ If you ran `modelctl gc` or `modelctl delete` after the backup you are
 restoring, some restored revisions may list files that were removed.
 Downloads of those files fail until the revision is pushed or mirrored
 again.
+
+### What a restore brings back
+
+**Tokens you revoked after the backup was taken work again.** A backup
+holds the tokens as they were at that moment, so restoring it undoes every
+revocation made since, and that includes the automatic restore of
+`REGISTRY_RESTORE_IF_EMPTY`. After any restore, run `modelctl token list`
+and revoke again whatever should not be there. If a token was revoked
+because it leaked, do this before the registry is reachable again.
+
+An admin token supplied with `REGISTRY_ADMIN_TOKEN` or
+`REGISTRY_ADMIN_TOKEN_FILE` is not affected: it is applied at every start
+and replaces the restored one.
 
 ### Copying everything by hand
 

@@ -47,6 +47,7 @@ func (r *Registry) Snapshot(ctx context.Context, path string) (SnapshotInfo, err
 	if _, err := r.db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
 		return SnapshotInfo{}, fmt.Errorf("snapshot the database: %w", err)
 	}
+	ownerOnly(path) // a snapshot holds the same token hashes as the database
 	info, err := VerifySnapshot(ctx, path)
 	if err != nil {
 		_ = os.Remove(path)
@@ -193,6 +194,7 @@ func Restore(ctx context.Context, dataDir, snapshot string, replace bool) (info 
 	if err := copyFile(snapshot, target); err != nil {
 		return SnapshotInfo{}, previous, fmt.Errorf("install the snapshot: %w", err)
 	}
+	ownerOnly(target)
 	return info, previous, nil
 }
 

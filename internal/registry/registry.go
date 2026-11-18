@@ -172,7 +172,22 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// The database holds every token's hash. SQLite creates it readable by
+	// everyone the data directory lets in; the write-ahead log and its
+	// index take their mode from the database, so they follow.
+	path := filepath.Join(dataDir, "registry.db")
+	ownerOnly(path, path+"-wal", path+"-shm")
 	return r, nil
+}
+
+// ownerOnly makes each file that exists readable and writable by its owner
+// alone. It is best effort: on Windows, where access is not expressed in
+// mode bits, it changes nothing, and a failure is not worth refusing to
+// start over.
+func ownerOnly(paths ...string) {
+	for _, p := range paths {
+		_ = os.Chmod(p, 0o600)
+	}
 }
 
 // Close releases the database.

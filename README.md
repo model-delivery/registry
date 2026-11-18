@@ -82,7 +82,9 @@ docker logs registry        # the admin token is printed here on first start
 ```
 
 Or `docker compose up -d` with the [`compose.yaml`](compose.yaml) in this
-repository. The image contains the same `modelctl` binary:
+repository. That file publishes the port on `127.0.0.1` only; a comment in
+it says how to serve other machines. The image contains the same
+`modelctl` binary:
 
 ```bash
 docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/gpt2

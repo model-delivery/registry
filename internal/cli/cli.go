@@ -134,7 +134,7 @@ func newCommand(e *env, name, synopsis string) *command {
 func newClientCommand(e *env, name, synopsis string) *command {
 	c := newCommand(e, name, synopsis)
 	c.StringVar(&c.endpoint, "endpoint", e.envOr("MODELCTL_ENDPOINT", "http://localhost:8080"), "registry URL (env MODELCTL_ENDPOINT)")
-	c.StringVar(&c.token, "token", "", "access token (env MODELCTL_TOKEN)")
+	c.StringVar(&c.token, "token", "", "access token; prefer the environment variable MODELCTL_TOKEN, which does not show in the process list")
 	c.BoolVar(&c.jsonOut, "json", false, "print machine-readable JSON")
 	return c
 }

@@ -101,7 +101,7 @@ func TestDownloadResumesAfterADroppedConnection(t *testing.T) {
 				}
 				return true
 			}
-			body := (&Upstream{Endpoint: h.URL}).Open(ctx, "acme/tiny", hubSHA, "config.json")
+			body := (&Upstream{Endpoint: h.URL}).open(ctx, "acme/tiny", hubSHA, "config.json")
 			defer func() { _ = body.Close() }()
 			body.(*resumeReader).backoff = 1 // do not spend seconds waiting
 			got, err := io.ReadAll(body)
@@ -311,7 +311,7 @@ func TestTreeFollowsEveryPageOfAListing(t *testing.T) {
 		return true
 	}
 
-	got, err := (&Upstream{Endpoint: h.URL}).Tree(ctx, "acme/tiny", hubSHA)
+	got, err := (&Upstream{Endpoint: h.URL}).tree(ctx, "acme/tiny", hubSHA)
 	if err != nil {
 		t.Fatal(err)
 	}

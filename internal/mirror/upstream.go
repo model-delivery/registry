@@ -217,8 +217,8 @@ func (u *Upstream) checked(ctx context.Context, resp *http.Response, trusted boo
 	}
 }
 
-// Info resolves a revision (branch, tag or revision id) upstream.
-func (u *Upstream) Info(ctx context.Context, repo, revision string) (Info, error) {
+// info resolves a revision (branch, tag or revision id) upstream.
+func (u *Upstream) info(ctx context.Context, repo, revision string) (Info, error) {
 	resp, err := u.get(ctx, u.endpoint()+"/api/models/"+repo+"/revision/"+url.PathEscape(revision), nil)
 	if err != nil {
 		return Info{}, err
@@ -243,8 +243,8 @@ func (u *Upstream) Info(ctx context.Context, repo, revision string) (Info, error
 
 var nextLinkRe = regexp.MustCompile(`<([^>]+)>\s*;\s*rel="next"`)
 
-// Tree lists every file in a revision, following the hub's pagination.
-func (u *Upstream) Tree(ctx context.Context, repo, sha string) ([]Entry, error) {
+// tree lists every file in a revision, following the hub's pagination.
+func (u *Upstream) tree(ctx context.Context, repo, sha string) ([]Entry, error) {
 	home, err := url.Parse(u.endpoint())
 	if err != nil {
 		return nil, fmt.Errorf("the upstream address %q is not a URL", u.endpoint())
@@ -302,9 +302,9 @@ func (u *Upstream) Tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 	return out, nil
 }
 
-// Open streams a file's content. If the connection drops part-way the
+// open streams a file's content. If the connection drops part-way the
 // returned reader reconnects and continues from where it stopped.
-func (u *Upstream) Open(ctx context.Context, repo, sha, path string) io.ReadCloser {
+func (u *Upstream) open(ctx context.Context, repo, sha, path string) io.ReadCloser {
 	segs := strings.Split(path, "/")
 	for i, s := range segs {
 		segs[i] = url.PathEscape(s)

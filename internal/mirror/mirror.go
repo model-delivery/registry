@@ -105,7 +105,7 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 	if revision == "" {
 		revision = defaultRevision
 	}
-	info, err := up.Info(ctx, repo, revision)
+	info, err := up.info(ctx, repo, revision)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 	if !registry.IsSHA(info.SHA) {
 		return nil, fmt.Errorf("upstream revision id %q is not a 40-character hash", info.SHA)
 	}
-	entries, err := up.Tree(ctx, info.ID, info.SHA)
+	entries, err := up.tree(ctx, info.ID, info.SHA)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +342,7 @@ func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo,
 			return f, false, nil
 		}
 	}
-	body := up.Open(ctx, repo, sha, e.Path)
+	body := up.open(ctx, repo, sha, e.Path)
 	defer func() { _ = body.Close() }()
 	info, err := reg.PutBlob(ctx, body, want)
 	if err != nil {

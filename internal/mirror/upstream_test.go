@@ -91,7 +91,7 @@ func TestListingPaginationStaysOnTheUpstreamHost(t *testing.T) {
 			}
 			return true
 		}
-		entries, err := (&Upstream{Endpoint: h.URL, Token: token}).Tree(ctx, "acme/tiny", hubSHA)
+		entries, err := (&Upstream{Endpoint: h.URL, Token: token}).tree(ctx, "acme/tiny", hubSHA)
 		if err != nil || len(entries) != 2 {
 			t.Fatalf("entries = %+v, %v", entries, err)
 		}
@@ -112,7 +112,7 @@ func TestListingPaginationStaysOnTheUpstreamHost(t *testing.T) {
 			writeJSON(w, h.listing())
 			return true
 		}
-		_, err := (&Upstream{Endpoint: h.URL, Token: token}).Tree(ctx, "acme/tiny", hubSHA)
+		_, err := (&Upstream{Endpoint: h.URL, Token: token}).tree(ctx, "acme/tiny", hubSHA)
 		if !errors.Is(err, ErrUnsafeUpstream) {
 			t.Fatalf("got %v, want ErrUnsafeUpstream", err)
 		}
@@ -169,7 +169,7 @@ func TestRedirectsToLocalAddressesAreRefused(t *testing.T) {
 			other := newElsewhere(t, "an internal service's page")
 			h := redirectingHub(t, func() string { return tc.to(other.port(t)) })
 			// The default client: this is what the server uses.
-			body := (&Upstream{Endpoint: h.URL, Token: token}).Open(ctx, "acme/tiny", hubSHA, "config.json")
+			body := (&Upstream{Endpoint: h.URL, Token: token}).open(ctx, "acme/tiny", hubSHA, "config.json")
 			defer func() { _ = body.Close() }()
 			got, err := io.ReadAll(body)
 			if !errors.Is(err, ErrUnsafeUpstream) {
@@ -200,7 +200,7 @@ func TestRedirectsToLocalAddressesAreRefused(t *testing.T) {
 			}
 			return true
 		}
-		body := (&Upstream{Endpoint: h.URL, Token: token}).Open(ctx, "acme/tiny", hubSHA, "config.json")
+		body := (&Upstream{Endpoint: h.URL, Token: token}).open(ctx, "acme/tiny", hubSHA, "config.json")
 		defer func() { _ = body.Close() }()
 		got, err := io.ReadAll(body)
 		if err != nil || string(got) != "from the hub" || auth != "Bearer "+token {
@@ -211,7 +211,7 @@ func TestRedirectsToLocalAddressesAreRefused(t *testing.T) {
 	t.Run("redirects that never end are given up on", func(t *testing.T) {
 		t.Parallel()
 		h := redirectingHub(t, func() string { return filePath })
-		body := (&Upstream{Endpoint: h.URL}).Open(ctx, "acme/tiny", hubSHA, "config.json")
+		body := (&Upstream{Endpoint: h.URL}).open(ctx, "acme/tiny", hubSHA, "config.json")
 		defer func() { _ = body.Close() }()
 		// Not one of the errors that stop a retry, so cap the retries' wait.
 		body.(*resumeReader).backoff = 1
@@ -247,7 +247,7 @@ func TestTokenIsOnlySentToTheUpstreamHost(t *testing.T) {
 		},
 	}}
 
-	body := (&Upstream{Endpoint: h.URL, Token: token, Client: client}).Open(context.Background(), "acme/tiny", hubSHA, "config.json")
+	body := (&Upstream{Endpoint: h.URL, Token: token, Client: client}).open(context.Background(), "acme/tiny", hubSHA, "config.json")
 	defer func() { _ = body.Close() }()
 	got, err := io.ReadAll(body)
 	if err != nil || string(got) != "from the hub" {
@@ -289,7 +289,7 @@ func TestUpstreamErrorBodiesAreLoggedNotReturned(t *testing.T) {
 	var logged bytes.Buffer
 	up := &Upstream{Endpoint: h.URL, Log: slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 
-	_, err := up.Info(context.Background(), "acme/tiny", "broken")
+	_, err := up.info(context.Background(), "acme/tiny", "broken")
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("got %v, want an error naming the status", err)
 	}
@@ -300,7 +300,7 @@ func TestUpstreamErrorBodiesAreLoggedNotReturned(t *testing.T) {
 		t.Fatalf("the response body was not logged: %s", logged.String())
 	}
 
-	_, err = up.Info(context.Background(), "acme/tiny", "gone")
+	_, err = up.info(context.Background(), "acme/tiny", "gone")
 	if !errors.Is(err, ErrUpstreamNotFound) || !strings.Contains(err.Error(), "Revision not found") || strings.Contains(err.Error(), "hunter2") {
 		t.Fatalf("got %v", err)
 	}

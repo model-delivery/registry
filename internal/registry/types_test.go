@@ -41,12 +41,12 @@ func TestRoleAllows(t *testing.T) {
 		}
 	}
 	for _, r := range []Role{RoleRead, RoleWrite, RoleAdmin} {
-		if !r.Valid() {
+		if !r.valid() {
 			t.Errorf("%q is not valid", r)
 		}
 	}
 	for _, r := range []Role{"", "owner", "READ", " read"} {
-		if r.Valid() {
+		if r.valid() {
 			t.Errorf("%q is valid", r)
 		}
 	}

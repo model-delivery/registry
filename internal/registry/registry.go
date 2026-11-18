@@ -588,13 +588,13 @@ func (r Role) rank() int {
 	return 0
 }
 
-// Valid reports whether r is one of the roles.
-func (r Role) Valid() bool { return r.rank() > 0 }
+// valid reports whether r is one of the roles.
+func (r Role) valid() bool { return r.rank() > 0 }
 
 // Allows reports whether a token with role r may do what needs at least
 // minimum. No role, and a name that is not a role, allow nothing.
 func (r Role) Allows(minimum Role) bool {
-	return r.Valid() && minimum.Valid() && r.rank() >= minimum.rank()
+	return r.valid() && minimum.valid() && r.rank() >= minimum.rank()
 }
 
 // Limits on what a token may be called and how short its secret may be.
@@ -632,7 +632,7 @@ func (r *Registry) SetToken(ctx context.Context, name string, role Role, secret 
 	if name == "" || len(name) > maxTokenName {
 		return fmt.Errorf("%w: token name must be 1-%d characters", ErrInvalid, maxTokenName)
 	}
-	if !role.Valid() {
+	if !role.valid() {
 		return fmt.Errorf("%w: role must be read, write or admin", ErrInvalid)
 	}
 	if len(secret) < minTokenSecret {

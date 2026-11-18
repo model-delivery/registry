@@ -329,7 +329,7 @@ func (s *Server) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
-	secret, err := s.reg.CreateToken(r.Context(), req.Name, req.Role)
+	secret, err := s.reg.CreateToken(r.Context(), req.Name, registry.Role(req.Role))
 	if err != nil {
 		s.fail(w, r, err)
 		return

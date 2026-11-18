@@ -95,7 +95,7 @@ func VerifySnapshot(ctx context.Context, path string) (SnapshotInfo, error) {
 // under the data directory, which is known to be writable, and the caller
 // removes it.
 func (r *Registry) Scratch() (string, error) {
-	scratch := filepath.Join(r.dataDir, "tmp")
+	scratch := r.dir.Staging()
 	if err := os.MkdirAll(scratch, 0o750); err != nil {
 		return "", err
 	}

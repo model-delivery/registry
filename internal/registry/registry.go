@@ -23,6 +23,7 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite".
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/datadir"
 )
 
 // Errors callers can match with errors.Is.
@@ -43,6 +44,13 @@ var (
 const schemaVersion = 2
 
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// SQLite keeps a database's write-ahead log and that log's index in two
+// files beside it, named after it with these suffixes.
+const (
+	walSuffix = "-wal"
+	shmSuffix = "-shm"
+)
 
 const schema = `
 CREATE TABLE repos (
@@ -107,8 +115,8 @@ type Registry struct {
 	// recorded. Work on different digests never waits on each other.
 	locks keyLock
 	now   func() time.Time
-	// dataDir holds the database and scratch space.
-	dataDir string
+	// dir holds the database and scratch space.
+	dir datadir.Dir
 }
 
 // keyLock is a mutex per key.
@@ -160,14 +168,15 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 		}
 		store = fs
 	}
-	dsn := "file:" + filepath.ToSlash(filepath.Join(dataDir, "registry.db")) +
+	dir := datadir.Dir(dataDir)
+	dsn := "file:" + filepath.ToSlash(dir.Database()) +
 		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(1)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	r := &Registry{db: db, blobs: store, now: time.Now, dataDir: dataDir}
+	r := &Registry{db: db, blobs: store, now: time.Now, dir: dir}
 	if err := r.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -175,8 +184,7 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 	// The database holds every token's hash. SQLite creates it readable by
 	// everyone the data directory lets in; the write-ahead log and its
 	// index take their mode from the database, so they follow.
-	path := filepath.Join(dataDir, "registry.db")
-	ownerOnly(path, path+"-wal", path+"-shm")
+	ownerOnly(dir.Database(), dir.Database()+walSuffix, dir.Database()+shmSuffix)
 	return r, nil
 }
 
@@ -193,53 +201,66 @@ func ownerOnly(paths ...string) {
 // Close releases the database.
 func (r *Registry) Close() error { return r.db.Close() }
 
+// migrate brings the database to schemaVersion. Each step adds to what
+// the one before it left; nothing existing is ever rewritten.
 func (r *Registry) migrate() error {
 	ctx := context.Background()
 	var v int
 	if err := r.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	switch v {
-	case 0:
-		tx, err := r.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.ExecContext(ctx, schema+pendingSchema); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
-			return err
-		}
-		return tx.Commit()
-	case 1:
-		// Version 2 adds the table for files a revision lists but has not
-		// fetched yet. Nothing existing changes.
-		tx, err := r.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.ExecContext(ctx, pendingSchema); err != nil {
-			return fmt.Errorf("upgrade schema to version 2: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
-			return err
-		}
-		return tx.Commit()
-	case 2:
+	if v == schemaVersion {
 		return nil
-	default:
+	}
+	if v > schemaVersion {
 		return fmt.Errorf("data directory was written by a newer version (schema %d)", v)
 	}
+	// What each version added, in order. Index i takes a database from
+	// version i to version i+1.
+	steps := [schemaVersion]string{
+		schema,
+		// Version 2 adds the table for files a revision lists but has not
+		// fetched yet.
+		pendingSchema,
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for from := v; from < schemaVersion; from++ {
+		if _, err := tx.ExecContext(ctx, steps[from]); err != nil {
+			return fmt.Errorf("upgrade schema to version %d: %w", from+1, err)
+		}
+	}
+	// A pragma takes no bound parameter; the value is this package's constant.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (r *Registry) stamp() string { return r.now().UTC().Format(timeLayout) }
+// clock reads the time once, as the value and as the text stored for it,
+// so what a call returns and what it wrote are the same instant.
+func (r *Registry) clock() (time.Time, string) {
+	t := r.now().UTC().Round(0)
+	return t, t.Format(timeLayout)
+}
 
-func parseTime(s string) time.Time {
-	t, _ := time.Parse(timeLayout, s)
-	return t
+func (r *Registry) stamp() string {
+	_, s := r.clock()
+	return s
+}
+
+// parseTime reads a timestamp this package stored. One that does not parse
+// means the database holds something this package did not write; that is
+// reported, not turned into the year 1.
+func parseTime(s string) (time.Time, error) {
+	t, err := time.Parse(timeLayout, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("the database holds a timestamp that cannot be read, %q: %w", s, err)
+	}
+	return t, nil
 }
 
 // ---- blobs ----
@@ -406,20 +427,49 @@ func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutof
 
 // ---- tokens ----
 
-// Roles, weakest first.
+// Role is what a token allows. The zero value allows nothing.
+type Role string
+
+// Roles, weakest first. Each allows everything the one before it does.
 const (
-	RoleRead  = "read"
-	RoleWrite = "write"
-	RoleAdmin = "admin"
+	RoleRead  Role = "read"
+	RoleWrite Role = "write"
+	RoleAdmin Role = "admin"
 )
 
-// ValidRole reports whether s names a role.
-func ValidRole(s string) bool { return s == RoleRead || s == RoleWrite || s == RoleAdmin }
+// rank orders the roles; 0 is no role at all.
+func (r Role) rank() int {
+	switch r {
+	case RoleRead:
+		return 1
+	case RoleWrite:
+		return 2
+	case RoleAdmin:
+		return 3
+	}
+	return 0
+}
+
+// Valid reports whether r is one of the roles.
+func (r Role) Valid() bool { return r.rank() > 0 }
+
+// Allows reports whether a token with role r may do what needs at least
+// minimum. No role, and a name that is not a role, allow nothing.
+func (r Role) Allows(minimum Role) bool {
+	return r.Valid() && minimum.Valid() && r.rank() >= minimum.rank()
+}
+
+// Limits on what a token may be called and how short its secret may be.
+const (
+	maxTokenName    = 64
+	minTokenSecret  = 16
+	tokenSecretSize = 24 // random bytes in a minted secret, before hex
+)
 
 // Token is an access token's record. The secret itself is never stored.
 type Token struct {
 	Name      string    `json:"name"`
-	Role      string    `json:"role"`
+	Role      Role      `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -429,8 +479,8 @@ func hashToken(secret string) string {
 }
 
 // CreateToken mints a token and returns its secret, which is shown once.
-func (r *Registry) CreateToken(ctx context.Context, name, role string) (string, error) {
-	buf := make([]byte, 24)
+func (r *Registry) CreateToken(ctx context.Context, name string, role Role) (string, error) {
+	buf := make([]byte, tokenSecretSize)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
@@ -440,15 +490,15 @@ func (r *Registry) CreateToken(ctx context.Context, name, role string) (string, 
 
 // SetToken records secret under name. With replace, an existing token of
 // that name is overwritten; this is how a configured admin token is applied.
-func (r *Registry) SetToken(ctx context.Context, name, role, secret string, replace bool) error {
-	if name == "" || len(name) > 64 {
-		return fmt.Errorf("%w: token name must be 1-64 characters", ErrInvalid)
+func (r *Registry) SetToken(ctx context.Context, name string, role Role, secret string, replace bool) error {
+	if name == "" || len(name) > maxTokenName {
+		return fmt.Errorf("%w: token name must be 1-%d characters", ErrInvalid, maxTokenName)
 	}
-	if !ValidRole(role) {
+	if !role.Valid() {
 		return fmt.Errorf("%w: role must be read, write or admin", ErrInvalid)
 	}
-	if len(secret) < 16 {
-		return fmt.Errorf("%w: token must be at least 16 characters", ErrInvalid)
+	if len(secret) < minTokenSecret {
+		return fmt.Errorf("%w: token must be at least %d characters", ErrInvalid, minTokenSecret)
 	}
 	q := `INSERT INTO tokens (name, hash, role, created_at) VALUES (?, ?, ?, ?)`
 	if replace {
@@ -475,7 +525,9 @@ func (r *Registry) Authenticate(ctx context.Context, secret string) (Token, bool
 	if err != nil {
 		return Token{}, false
 	}
-	t.CreatedAt = parseTime(created)
+	if t.CreatedAt, err = parseTime(created); err != nil {
+		return Token{}, false
+	}
 	return t, true
 }
 
@@ -490,7 +542,9 @@ func (r *Registry) Token(ctx context.Context, name string) (Token, error) {
 	if err != nil {
 		return Token{}, err
 	}
-	t.CreatedAt = parseTime(created)
+	if t.CreatedAt, err = parseTime(created); err != nil {
+		return Token{}, err
+	}
 	return t, nil
 }
 
@@ -508,7 +562,9 @@ func (r *Registry) ListTokens(ctx context.Context) ([]Token, error) {
 		if err := rows.Scan(&t.Name, &t.Role, &created); err != nil {
 			return nil, err
 		}
-		t.CreatedAt = parseTime(created)
+		if t.CreatedAt, err = parseTime(created); err != nil {
+			return nil, err
+		}
 		out = append(out, t)
 	}
 	return out, rows.Err()

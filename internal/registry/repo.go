@@ -17,16 +17,28 @@ import (
 	"time"
 )
 
-// Where a revision came from.
+// Source is where a revision came from.
+type Source string
+
+// The sources of a revision.
 const (
-	SourcePush   = "push"
-	SourceMirror = "mirror"
+	SourcePush   Source = "push"
+	SourceMirror Source = "mirror"
 )
+
+// RefKind is what sort of name a ref is.
+type RefKind string
 
 // Ref kinds. Branches move; tags never do.
 const (
-	KindBranch = "branch"
-	KindTag    = "tag"
+	KindBranch RefKind = "branch"
+	KindTag    RefKind = "tag"
+)
+
+// Limits on the names a revision records.
+const (
+	maxRefName = 200
+	maxPathLen = 1024
 )
 
 var (
@@ -54,8 +66,8 @@ func ValidateRepoName(name string) error {
 // ValidateRefName checks a branch or tag name.
 func ValidateRefName(name string) error {
 	switch {
-	case name == "" || len(name) > 200:
-		return fmt.Errorf("%w: ref name must be 1-200 characters", ErrInvalid)
+	case name == "" || len(name) > maxRefName:
+		return fmt.Errorf("%w: ref name must be 1-%d characters", ErrInvalid, maxRefName)
 	case IsSHA(name):
 		return fmt.Errorf("%w: ref name cannot look like a revision id", ErrInvalid)
 	case strings.ContainsAny(name, " \t\r\n\\~^:?*[") || strings.Contains(name, "..") ||
@@ -69,7 +81,7 @@ func ValidateRefName(name string) error {
 // revision. Paths already recorded are not checked again when they are
 // read, so a revision written before a rule was added stays readable.
 func ValidatePath(p string) error {
-	if p == "" || len(p) > 1024 || strings.ContainsRune(p, '\\') {
+	if p == "" || len(p) > maxPathLen || strings.ContainsRune(p, '\\') {
 		return fmt.Errorf("%w: bad file path %q", ErrInvalid, p)
 	}
 	// Control characters: NUL, and the ones a terminal acts on (escape,
@@ -103,7 +115,7 @@ type Commit struct {
 	SHA          string    `json:"sha"`
 	Parent       string    `json:"parent,omitempty"`
 	Message      string    `json:"message,omitempty"`
-	Source       string    `json:"source"`
+	Source       Source    `json:"source"`
 	UpstreamInfo string    `json:"-"`
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -134,7 +146,7 @@ func (f File) ETag() string {
 // Ref is a named pointer to a revision.
 type Ref struct {
 	Name      string    `json:"name"`
-	Kind      string    `json:"kind"`
+	Kind      RefKind   `json:"kind"`
 	SHA       string    `json:"sha"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -150,7 +162,7 @@ type CommitInput struct {
 	// mirroring). Empty lets the registry derive one.
 	SHA          string
 	Message      string
-	Source       string
+	Source       Source
 	Upstream     string
 	UpstreamInfo string
 	// Files in the revision. SHA256 is required and must already be stored.
@@ -197,7 +209,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 		return Commit{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	now := r.stamp()
+	at, now := r.clock()
 
 	var repoID int64
 	err = tx.QueryRowContext(ctx, "SELECT id FROM repos WHERE name = ?", in.Repo).Scan(&repoID)
@@ -310,7 +322,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 	tree := treeDigest(sorted)
 
 	c := Commit{RepoID: repoID, Repo: in.Repo, Parent: parent, Message: in.Message, Source: in.Source,
-		UpstreamInfo: in.UpstreamInfo, CreatedAt: parseTime(now)}
+		UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
 	sha := in.SHA
 	switch {
 	case sha == "" && parentID != 0 && tree == parentTree:
@@ -358,7 +370,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 	}
 
 	if in.Branch != "" {
-		var kind string
+		var kind RefKind
 		err := tx.QueryRowContext(ctx, "SELECT kind FROM refs WHERE repo_id = ? AND name = ?", repoID, in.Branch).Scan(&kind)
 		if err == nil && kind == KindTag {
 			return Commit{}, fmt.Errorf("%w: %q is a tag and cannot be moved", ErrConflict, in.Branch)
@@ -415,7 +427,9 @@ func scanCommit(row rowScanner, c *Commit) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	c.CreatedAt = parseTime(created)
+	if c.CreatedAt, err = parseTime(created); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -452,7 +466,9 @@ func (r *Registry) GetRepo(ctx context.Context, name string) (Repo, error) {
 	if err != nil {
 		return Repo{}, err
 	}
-	repo.CreatedAt = parseTime(created)
+	if repo.CreatedAt, err = parseTime(created); err != nil {
+		return Repo{}, err
+	}
 	return repo, nil
 }
 
@@ -518,7 +534,9 @@ func (r *Registry) Refs(ctx context.Context, repo Repo) ([]Ref, error) {
 		if err := rows.Scan(&ref.Name, &ref.Kind, &ref.SHA, &updated); err != nil {
 			return nil, err
 		}
-		ref.UpdatedAt = parseTime(updated)
+		if ref.UpdatedAt, err = parseTime(updated); err != nil {
+			return nil, err
+		}
 		out = append(out, ref)
 	}
 	return out, rows.Err()
@@ -548,7 +566,9 @@ func (r *Registry) Commits(ctx context.Context, repo Repo) ([]CommitSummary, err
 		if err := rows.Scan(&s.ID, &s.RepoID, &s.Repo, &s.SHA, &s.Parent, &s.Message, &s.Source, &s.UpstreamInfo, &created, &s.Files, &s.Bytes); err != nil {
 			return nil, err
 		}
-		s.CreatedAt = parseTime(created)
+		if s.CreatedAt, err = parseTime(created); err != nil {
+			return nil, err
+		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
@@ -590,7 +610,12 @@ func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
 		if err := rows.Scan(&s.ID, &s.Name, &s.Upstream, &created, &s.Revisions, &s.StoredBytes, &updated); err != nil {
 			return nil, err
 		}
-		s.CreatedAt, s.UpdatedAt = parseTime(created), parseTime(updated)
+		if s.CreatedAt, err = parseTime(created); err != nil {
+			return nil, err
+		}
+		if s.UpdatedAt, err = parseTime(updated); err != nil {
+			return nil, err
+		}
 		out = append(out, s)
 	}
 	return out, rows.Err()

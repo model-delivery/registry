@@ -46,8 +46,8 @@ func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
 	}
 	ctx := context.Background()
 	in := &instance{reg: reg}
-	for name, dst := range map[string]*string{registry.RoleAdmin: &in.admin, registry.RoleWrite: &in.write, registry.RoleRead: &in.read} {
-		if *dst, err = reg.CreateToken(ctx, name, name); err != nil {
+	for role, dst := range map[registry.Role]*string{registry.RoleAdmin: &in.admin, registry.RoleWrite: &in.write, registry.RoleRead: &in.read} {
+		if *dst, err = reg.CreateToken(ctx, string(role), role); err != nil {
 			t.Fatal(err)
 		}
 	}

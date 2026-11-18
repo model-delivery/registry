@@ -344,6 +344,6 @@ func (s *Server) hfWhoami(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"type": "user", "name": tok.Name, "fullname": tok.Name, "orgs": []string{},
-		"auth": map[string]any{"type": "access_token", "accessToken": map[string]string{"displayName": tok.Name, "role": tok.Role}},
+		"auth": map[string]any{"type": "access_token", "accessToken": map[string]string{"displayName": tok.Name, "role": string(tok.Role)}},
 	})
 }

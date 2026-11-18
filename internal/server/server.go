@@ -203,7 +203,7 @@ const (
 	roleAdmin
 )
 
-func roleFromName(name string) role {
+func roleFromName(name registry.Role) role {
 	switch name {
 	case registry.RoleAdmin:
 		return roleAdmin

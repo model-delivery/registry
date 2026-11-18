@@ -81,7 +81,7 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		return Commit{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	now := r.stamp()
+	at, now := r.clock()
 
 	var repoID int64
 	var heldUpstream string
@@ -122,7 +122,7 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		}
 		id, _ := res.LastInsertId()
 		c = Commit{ID: id, RepoID: repoID, Repo: in.Repo, SHA: in.SHA, Message: in.Message, Source: SourceMirror,
-			UpstreamInfo: in.UpstreamInfo, CreatedAt: parseTime(now)}
+			UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
 		for _, f := range in.Files {
 			if _, err := tx.ExecContext(ctx,
 				"INSERT INTO pending_files (commit_id, path, size, sha256, git_oid, lfs) VALUES (?, ?, ?, ?, ?, ?)",
@@ -132,7 +132,7 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		}
 	}
 	if in.Branch != "" {
-		var kind string
+		var kind RefKind
 		err := tx.QueryRowContext(ctx, "SELECT kind FROM refs WHERE repo_id = ? AND name = ?", repoID, in.Branch).Scan(&kind)
 		if err == nil && kind == KindTag {
 			return Commit{}, fmt.Errorf("%w: %q is a tag and cannot be moved", ErrConflict, in.Branch)

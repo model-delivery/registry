@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,6 +25,7 @@ import (
 // storage it puts them off the server's disk.
 //
 // Archives are small named files, unlike blobs, which are named by digest.
+// Every Store is an Archive.
 type Archive interface {
 	PutArchive(ctx context.Context, name, localPath string) error
 	ListArchives(ctx context.Context) ([]ArchiveInfo, error)
@@ -44,7 +46,9 @@ var ErrArchiveNotFound = errors.New("backup not found")
 var archiveNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.db$`)
 
 // validArchiveName keeps archive names to plain file names, so one can
-// never address anything outside the backups area.
+// never address anything outside the backups area. The pattern already
+// rules out a path separator; "..", which it would allow inside a name, is
+// refused as well so that no name even resembles a path.
 func validArchiveName(name string) error {
 	if !archiveNameRe.MatchString(name) || strings.Contains(name, "..") {
 		return fmt.Errorf("%w: %q is not a backup name", ErrArchiveNotFound, name)
@@ -58,7 +62,7 @@ func sortArchives(list []ArchiveInfo) {
 
 // ---- filesystem ----
 
-func (s *FS) archiveDir() string { return filepath.Join(filepath.Dir(s.tmpDir), "backups") }
+func (s *FS) archivePath(name string) string { return filepath.Join(s.root.Backups(), name) }
 
 // PutArchive copies localPath into the backups directory under name. The
 // copy appears under its final name only once it is complete.
@@ -66,7 +70,14 @@ func (s *FS) PutArchive(_ context.Context, name, localPath string) error {
 	if err := validArchiveName(name); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.archiveDir(), 0o750); err != nil {
+	if err := s.putArchive(name, localPath); err != nil {
+		return fmt.Errorf("fs: store backup %s: %w", name, err)
+	}
+	return nil
+}
+
+func (s *FS) putArchive(name, localPath string) error {
+	if err := os.MkdirAll(s.root.Backups(), 0o750); err != nil {
 		return err
 	}
 	src, err := os.Open(localPath) //nolint:gosec // a snapshot this process just wrote.
@@ -74,7 +85,7 @@ func (s *FS) PutArchive(_ context.Context, name, localPath string) error {
 		return err
 	}
 	defer func() { _ = src.Close() }()
-	tmp, err := os.CreateTemp(s.archiveDir(), ".incoming-*")
+	tmp, err := os.CreateTemp(s.root.Backups(), ".incoming-*")
 	if err != nil {
 		return err
 	}
@@ -90,26 +101,37 @@ func (s *FS) PutArchive(_ context.Context, name, localPath string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(s.archiveDir(), name))
+	return os.Rename(tmp.Name(), s.archivePath(name))
 }
 
 // ListArchives lists stored backups, oldest first.
 func (s *FS) ListArchives(context.Context) ([]ArchiveInfo, error) {
-	entries, err := os.ReadDir(s.archiveDir())
+	entries, err := os.ReadDir(s.root.Backups())
 	if errors.Is(err, os.ErrNotExist) {
 		return []ArchiveInfo{}, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fs: list backups: %w", err)
 	}
+	return archiveInfos(entries)
+}
+
+// archiveInfos describes the backups among a directory's entries. A backup
+// that was removed since the directory was read is passed over; one that
+// is there and cannot be examined is an error, not a shorter list, because
+// what the list is used for is deciding which backups to delete.
+func archiveInfos(entries []fs.DirEntry) ([]ArchiveInfo, error) {
 	out := []ArchiveInfo{}
 	for _, e := range entries {
 		if e.IsDir() || validArchiveName(e.Name()) != nil {
 			continue
 		}
 		fi, err := e.Info()
-		if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("fs: list backups: examine %s: %w", e.Name(), err)
 		}
 		out = append(out, ArchiveInfo{Name: e.Name(), Size: fi.Size(), ModTime: fi.ModTime().UTC()})
 	}
@@ -122,11 +144,14 @@ func (s *FS) OpenArchive(_ context.Context, name string) (io.ReadCloser, error) 
 	if err := validArchiveName(name); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(filepath.Join(s.archiveDir(), name)) //nolint:gosec // name was validated above.
+	f, err := os.Open(s.archivePath(name)) //nolint:gosec // name was validated above.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("%w: %s", ErrArchiveNotFound, name)
 	}
-	return f, err
+	if err != nil {
+		return nil, fmt.Errorf("fs: open backup %s: %w", name, err)
+	}
+	return f, nil
 }
 
 // DeleteArchive removes a stored backup. Removing one that is not there is
@@ -135,8 +160,8 @@ func (s *FS) DeleteArchive(_ context.Context, name string) error {
 	if err := validArchiveName(name); err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(s.archiveDir(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	if err := os.Remove(s.archivePath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("fs: delete backup %s: %w", name, err)
 	}
 	return nil
 }
@@ -152,12 +177,12 @@ func (s *S3) PutArchive(ctx context.Context, name, localPath string) error {
 	}
 	f, err := os.Open(localPath) //nolint:gosec // a snapshot this process just wrote.
 	if err != nil {
-		return err
+		return fmt.Errorf("s3: upload backup %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("s3: upload backup %s: %w", name, err)
 	}
 	if _, err := s.client.PutObject(ctx, s.bucket, s.archiveKey(name), f, fi.Size(),
 		minio.PutObjectOptions{ContentType: "application/vnd.sqlite3"}); err != nil {

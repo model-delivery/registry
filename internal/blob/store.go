@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/model-delivery/registry/internal/datadir"
 )
 
 // ErrMismatch reports that received bytes did not match what was expected.
@@ -42,11 +44,6 @@ type Info struct {
 	Size   int64
 }
 
-// File is an open blob. It seeks so HTTP range requests can be served.
-type File interface {
-	io.ReadSeekCloser
-}
-
 // Staged is a fully received and verified blob that is not yet visible.
 type Staged interface {
 	Info() Info
@@ -60,8 +57,12 @@ type Staged interface {
 // and S3 (any S3-compatible object store).
 type Store interface {
 	Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error)
-	Open(ctx context.Context, sha256 string) (File, int64, error)
+	// Open returns a stored blob and its size. The blob seeks, so HTTP
+	// range requests can be served from it.
+	Open(ctx context.Context, sha256 string) (io.ReadSeekCloser, int64, error)
 	Delete(ctx context.Context, sha256 string) error
+	// Every backend also keeps metadata backups next to its blobs.
+	Archive
 }
 
 // Presigner is implemented by stores that can hand out a time-limited URL
@@ -81,23 +82,18 @@ func blobKey(digest string) (string, error) {
 
 // FS stores blobs as files under root/blobs/sha256/<2 hex>/<digest>.
 type FS struct {
-	blobDir string
-	tmpDir  string
+	root datadir.Dir
 }
 
-// NewFS opens (creating if needed) a filesystem store rooted at root.
-// Leftover partial uploads from a previous run are removed.
+// NewFS opens (creating if needed) a filesystem store in the data
+// directory root. It removes nothing: what a previous run left in the
+// staging directory is cleared by datadir.Dir.ClearStaging, which only the
+// server calls.
 func NewFS(root string) (*FS, error) {
-	s := &FS{
-		blobDir: filepath.Join(root, "blobs", "sha256"),
-		tmpDir:  filepath.Join(root, "tmp"),
-	}
-	if err := os.RemoveAll(s.tmpDir); err != nil {
-		return nil, fmt.Errorf("clear staging dir: %w", err)
-	}
-	for _, d := range []string{s.blobDir, s.tmpDir} {
+	s := &FS{root: datadir.Dir(root)}
+	for _, d := range []string{s.root.Blobs(), s.root.Staging()} {
 		if err := os.MkdirAll(d, 0o750); err != nil {
-			return nil, fmt.Errorf("create %s: %w", d, err)
+			return nil, fmt.Errorf("fs: create %s: %w", d, err)
 		}
 	}
 	return s, nil
@@ -117,44 +113,101 @@ func ValidDigest(s string) bool {
 }
 
 func (s *FS) path(digest string) (string, error) {
-	if !ValidDigest(digest) {
-		return "", fmt.Errorf("%w: malformed digest %q", ErrNotFound, digest)
+	key, err := blobKey(digest)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(s.blobDir, digest[:2], digest), nil
+	return filepath.Join(s.root.Blobs(), filepath.FromSlash(key)), nil
 }
 
 // Stage streams r to a temporary file while hashing it, then checks the
 // result against want. Nothing is buffered in memory beyond the copy buffer.
 func (s *FS) Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error) {
-	tmp, info, err := stageToFile(ctx, s.tmpDir, r, want)
+	return stage(ctx, s.root.Staging(), r, want, s.publish)
+}
+
+// publish moves a staged file to its digest path. A rename is atomic, so
+// the blob is either fully present under its name or absent.
+func (s *FS) publish(_ context.Context, tmp string, info Info) error {
+	dst, err := s.path(info.SHA256)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return nil // same digest means same bytes: keep the copy already published
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return fmt.Errorf("fs: publish %s: %w", info.SHA256, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		if _, statErr := os.Stat(dst); statErr == nil {
+			return nil // lost a race against an identical upload
+		}
+		return fmt.Errorf("fs: publish %s: %w", info.SHA256, err)
+	}
+	return nil
+}
+
+// staged is a received and verified upload sitting in a staging directory.
+// Every backend stages the same way and differs only in how it publishes.
+type staged struct {
+	tmp  string
+	info Info
+	// publish makes the staged file visible under its digest. It may move
+	// the file away or leave it where it is; Publish removes what is left.
+	publish func(ctx context.Context, tmp string, info Info) error
+	done    bool
+}
+
+// stage receives and verifies r into dir (see stageToFile) and returns it
+// ready to be made visible with publish.
+func stage(ctx context.Context, dir string, r io.Reader, want Expect,
+	publish func(ctx context.Context, tmp string, info Info) error) (Staged, error) {
+	tmp, info, err := stageToFile(ctx, dir, r, want)
 	if err != nil {
 		return nil, err
 	}
-	return &fsStaged{store: s, tmp: tmp, info: info}, nil
+	return &staged{tmp: tmp, info: info, publish: publish}, nil
+}
+
+func (st *staged) Info() Info { return st.info }
+
+func (st *staged) Publish(ctx context.Context) error {
+	if st.done {
+		return nil
+	}
+	if err := st.publish(ctx, st.tmp, st.info); err != nil {
+		return err
+	}
+	st.Discard()
+	return nil
+}
+
+func (st *staged) Discard() {
+	if st.done {
+		return
+	}
+	st.done = true
+	_ = os.Remove(st.tmp)
 }
 
 // stageToFile receives r into a new file under dir, hashing as it goes,
 // and checks the result against want. On any failure the file is removed.
 // Every backend stages this way, so nothing unverified ever leaves the
 // staging directory.
-func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (string, Info, error) {
-	info, path, err := receive(ctx, dir, r, want)
-	if err != nil {
-		if path != "" {
-			_ = os.Remove(path)
-		}
-		return "", Info{}, err
-	}
-	return path, info, nil
-}
-
-func receive(ctx context.Context, dir string, r io.Reader, want Expect) (Info, string, error) {
+func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (path string, info Info, err error) {
 	tmp, err := os.CreateTemp(dir, "stage-*")
 	if err != nil {
-		return Info{}, "", fmt.Errorf("create staging file: %w", err)
+		return "", Info{}, fmt.Errorf("create staging file: %w", err)
 	}
-	path := tmp.Name()
-	defer func() { _ = tmp.Close() }()
+	path = tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(path)
+			path, info = "", Info{}
+		}
+	}()
 
 	h256 := sha256.New()
 	writers := []io.Writer{tmp, h256}
@@ -169,35 +222,35 @@ func receive(ctx context.Context, dir string, r io.Reader, want Expect) (Info, s
 	}
 	n, err := io.Copy(io.MultiWriter(writers...), &ctxReader{ctx: ctx, r: src})
 	if err != nil {
-		return Info{}, path, fmt.Errorf("receive blob: %w", err)
+		return path, Info{}, fmt.Errorf("receive blob: %w", err)
 	}
 	if want.Size >= 0 && n != want.Size {
-		return Info{}, path, fmt.Errorf("%w: expected %d bytes, received %s", ErrMismatch, want.Size, received(n, want.Size))
+		return path, Info{}, fmt.Errorf("%w: expected %d bytes, received %s", ErrMismatch, want.Size, received(n, want.Size))
 	}
 	if err := tmp.Sync(); err != nil {
-		return Info{}, path, fmt.Errorf("flush blob: %w", err)
+		return path, Info{}, fmt.Errorf("flush blob: %w", err)
 	}
 	if hGit == nil {
 		hGit = gitHasher(n)
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			return Info{}, path, fmt.Errorf("rewind blob: %w", err)
+			return path, Info{}, fmt.Errorf("rewind blob: %w", err)
 		}
 		if _, err := io.Copy(hGit, &ctxReader{ctx: ctx, r: tmp}); err != nil {
-			return Info{}, path, fmt.Errorf("hash blob: %w", err)
+			return path, Info{}, fmt.Errorf("hash blob: %w", err)
 		}
 	}
-	info := Info{
+	info = Info{
 		SHA256: hex.EncodeToString(h256.Sum(nil)),
 		GitOID: hex.EncodeToString(hGit.Sum(nil)),
 		Size:   n,
 	}
 	if want.SHA256 != "" && want.SHA256 != info.SHA256 {
-		return Info{}, path, fmt.Errorf("%w: expected sha256 %s, received %s", ErrMismatch, want.SHA256, info.SHA256)
+		return path, Info{}, fmt.Errorf("%w: expected sha256 %s, received %s", ErrMismatch, want.SHA256, info.SHA256)
 	}
 	if want.GitOID != "" && want.GitOID != info.GitOID {
-		return Info{}, path, fmt.Errorf("%w: expected git blob id %s, received %s", ErrMismatch, want.GitOID, info.GitOID)
+		return path, Info{}, fmt.Errorf("%w: expected git blob id %s, received %s", ErrMismatch, want.GitOID, info.GitOID)
 	}
-	return info, path, nil
+	return path, info, nil
 }
 
 func received(n, want int64) string {
@@ -208,7 +261,7 @@ func received(n, want int64) string {
 }
 
 // Open returns the blob and its size.
-func (s *FS) Open(_ context.Context, digest string) (File, int64, error) {
+func (s *FS) Open(_ context.Context, digest string) (io.ReadSeekCloser, int64, error) {
 	p, err := s.path(digest)
 	if err != nil {
 		return nil, 0, err
@@ -218,12 +271,12 @@ func (s *FS) Open(_ context.Context, digest string) (File, int64, error) {
 		return nil, 0, fmt.Errorf("%w: %s", ErrNotFound, digest)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("fs: open %s: %w", digest, err)
 	}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("fs: stat %s: %w", digest, err)
 	}
 	return f, fi.Size(), nil
 }
@@ -235,53 +288,9 @@ func (s *FS) Delete(_ context.Context, digest string) error {
 		return err
 	}
 	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return fmt.Errorf("fs: delete %s: %w", digest, err)
 	}
 	return nil
-}
-
-type fsStaged struct {
-	store *FS
-	tmp   string
-	info  Info
-	done  bool
-}
-
-func (st *fsStaged) Info() Info { return st.info }
-
-func (st *fsStaged) Publish(context.Context) error {
-	if st.done {
-		return nil
-	}
-	dst, err := st.store.path(st.info.SHA256)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(dst); err == nil {
-		// Same digest means same bytes: keep the copy already published.
-		st.Discard()
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
-		return err
-	}
-	if err := os.Rename(st.tmp, dst); err != nil {
-		if _, statErr := os.Stat(dst); statErr == nil {
-			st.Discard() // lost a race against an identical upload
-			return nil
-		}
-		return fmt.Errorf("publish blob: %w", err)
-	}
-	st.done = true
-	return nil
-}
-
-func (st *fsStaged) Discard() {
-	if st.done {
-		return
-	}
-	st.done = true
-	_ = os.Remove(st.tmp)
 }
 
 // gitHasher returns a SHA-1 primed with the git blob header for size bytes.

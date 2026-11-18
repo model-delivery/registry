@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +25,7 @@ type hookStore struct {
 	onOpen func(digest string) error
 }
 
-func (h *hookStore) Open(ctx context.Context, digest string) (blob.File, int64, error) {
+func (h *hookStore) Open(ctx context.Context, digest string) (io.ReadSeekCloser, int64, error) {
 	h.mu.Lock()
 	hook := h.onOpen
 	h.mu.Unlock()

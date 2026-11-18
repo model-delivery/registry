@@ -325,7 +325,7 @@ func (r *Registry) FindMirroredBlob(ctx context.Context, oid string, size int64)
 }
 
 // OpenBlob opens stored bytes for reading.
-func (r *Registry) OpenBlob(ctx context.Context, digest string) (blob.File, int64, error) {
+func (r *Registry) OpenBlob(ctx context.Context, digest string) (io.ReadSeekCloser, int64, error) {
 	return r.blobs.Open(ctx, digest)
 }
 

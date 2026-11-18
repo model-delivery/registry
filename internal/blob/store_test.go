@@ -492,6 +492,44 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+// Opening a store is something a command does just to read a backup, while
+// a server may be receiving uploads into the same staging directory. So
+// opening one never removes what is staged there.
+func TestOpeningAStoreLeavesStagingAlone(t *testing.T) {
+	t.Parallel()
+	inProgress := func(t *testing.T, dir string) string {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, "stage-in-progress")
+		if err := os.WriteFile(p, []byte("half an upload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	t.Run("filesystem", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		p := inProgress(t, filepath.Join(root, "tmp"))
+		if _, err := blob.NewFS(root); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("opening the store removed a staged upload: %v", err)
+		}
+	})
+	t.Run("s3", func(t *testing.T) {
+		t.Parallel()
+		fake := blobtest.NewFakeS3(t)
+		p := inProgress(t, fake.Config.StagingDir)
+		fake.Store(t)
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("opening the store removed a staged upload: %v", err)
+		}
+	})
+}
+
 func TestFilesystemStoresBlobsByDigest(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

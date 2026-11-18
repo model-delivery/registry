@@ -35,7 +35,8 @@ type S3Config struct {
 	SessionToken string
 	// StagingDir is local scratch space. An upload is received and verified
 	// here before it is sent to the bucket, so it needs room for the
-	// largest file being received.
+	// largest file being received. It is created if missing and never
+	// emptied by the store (see datadir.Dir.ClearStaging).
 	StagingDir string
 }
 
@@ -67,11 +68,8 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3: %w", err)
 	}
-	if err := os.RemoveAll(cfg.StagingDir); err != nil {
-		return nil, fmt.Errorf("clear staging dir: %w", err)
-	}
 	if err := os.MkdirAll(cfg.StagingDir, 0o750); err != nil {
-		return nil, fmt.Errorf("create staging dir: %w", err)
+		return nil, fmt.Errorf("s3: create staging dir: %w", err)
 	}
 	prefix := strings.Trim(cfg.Prefix, "/")
 	if prefix != "" {
@@ -106,16 +104,37 @@ func isNoSuchKey(err error) bool {
 // the bucket until Publish, so an upload that fails verification never
 // becomes an object.
 func (s *S3) Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error) {
-	tmp, info, err := stageToFile(ctx, s.tmpDir, r, want)
+	return stage(ctx, s.tmpDir, r, want, s.publish)
+}
+
+// publish uploads a staged file to the bucket under its digest.
+func (s *S3) publish(ctx context.Context, tmp string, info Info) error {
+	key, err := s.key(info.SHA256)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &s3Staged{store: s, tmp: tmp, info: info}, nil
+	// Same digest and size means the object is already there.
+	if cur, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{}); err == nil && cur.Size == info.Size {
+		return nil
+	}
+	f, err := os.Open(tmp) //nolint:gosec // a staging file this store just wrote.
+	if err != nil {
+		return fmt.Errorf("s3: reopen staged %s: %w", info.SHA256, err)
+	}
+	// Closed before returning, so the caller can remove the staging file.
+	defer func() { _ = f.Close() }()
+	// The size is known, so large files go up as a multipart upload, which
+	// the object store only turns into an object once every part arrived.
+	if _, err := s.client.PutObject(ctx, s.bucket, key, f, info.Size,
+		minio.PutObjectOptions{ContentType: "application/octet-stream"}); err != nil {
+		return fmt.Errorf("s3: upload %s: %w", info.SHA256, err)
+	}
+	return nil
 }
 
 // Open returns the object. Reads and seeks become ranged requests, so a
 // client asking for part of a file only pulls that part from the bucket.
-func (s *S3) Open(ctx context.Context, digest string) (File, int64, error) {
+func (s *S3) Open(ctx context.Context, digest string) (io.ReadSeekCloser, int64, error) {
 	key, err := s.key(digest)
 	if err != nil {
 		return nil, 0, err
@@ -159,50 +178,4 @@ func (s *S3) PresignGet(ctx context.Context, digest string, ttl time.Duration) (
 		return "", fmt.Errorf("s3: presign %s: %w", digest, err)
 	}
 	return u.String(), nil
-}
-
-type s3Staged struct {
-	store *S3
-	tmp   string
-	info  Info
-	done  bool
-}
-
-func (st *s3Staged) Info() Info { return st.info }
-
-func (st *s3Staged) Publish(ctx context.Context) error {
-	if st.done {
-		return nil
-	}
-	key, err := st.store.key(st.info.SHA256)
-	if err != nil {
-		return err
-	}
-	// Same digest and size means the object is already there.
-	if cur, err := st.store.client.StatObject(ctx, st.store.bucket, key, minio.StatObjectOptions{}); err == nil && cur.Size == st.info.Size {
-		st.Discard()
-		return nil
-	}
-	f, err := os.Open(st.tmp)
-	if err != nil {
-		return fmt.Errorf("s3: reopen staged blob: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-	// The size is known, so large files go up as a multipart upload, which
-	// the object store only turns into an object once every part arrived.
-	if _, err := st.store.client.PutObject(ctx, st.store.bucket, key, f, st.info.Size,
-		minio.PutObjectOptions{ContentType: "application/octet-stream"}); err != nil {
-		return fmt.Errorf("s3: upload %s: %w", st.info.SHA256, err)
-	}
-	_ = f.Close()
-	st.Discard()
-	return nil
-}
-
-func (st *s3Staged) Discard() {
-	if st.done {
-		return
-	}
-	st.done = true
-	_ = os.Remove(st.tmp)
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/datadir"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
@@ -39,6 +40,12 @@ func cmdServe(e *env, args []string) error {
 
 	backupEvery, backupKeep, err := backupSettings(e)
 	if err != nil {
+		return err
+	}
+	// This process owns the data directory from here on, so whatever a
+	// previous run left half-received is cleared, once, before anything
+	// new is staged. No other command does this.
+	if err := datadir.Dir(*data).ClearStaging(); err != nil {
 		return err
 	}
 	store, redirect, err := openStore(e, *data, *storage, log)
@@ -146,7 +153,7 @@ func openStore(e *env, data, storage string, log *slog.Logger) (store blob.Store
 			AccessKey:    e.envOr("REGISTRY_S3_ACCESS_KEY", e.getenv("AWS_ACCESS_KEY_ID")),
 			SecretKey:    e.envOr("REGISTRY_S3_SECRET_KEY", e.getenv("AWS_SECRET_ACCESS_KEY")),
 			SessionToken: e.getenv("AWS_SESSION_TOKEN"),
-			StagingDir:   filepath.Join(data, "tmp"),
+			StagingDir:   datadir.Dir(data).Staging(),
 		}
 		if cfg.Bucket == "" {
 			return nil, false, usagef("--storage s3 needs a bucket: set REGISTRY_S3_BUCKET")

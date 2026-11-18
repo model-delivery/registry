@@ -67,8 +67,12 @@ Writing a blob (`internal/blob`):
    blob is either fully present under its name or absent; a reader can
    never see a partial file.
 
-`blob.Store` is a three-method interface (stage, open, delete) with two
-implementations, and one test suite that both must pass.
+`blob.Store` is a small interface (stage, open, delete, plus the four
+methods of `blob.Archive` that keep metadata backups beside the blobs)
+with two implementations, and one test suite that both must pass. Opening
+a store removes nothing; `modelctl serve` clears what a previous run left
+in `tmp/` once, at start (`internal/datadir`, which is also the one place
+that names the files and directories of the data directory).
 
 - **`blob.FS`** keeps blobs as files in the data directory, as above.
 - **`blob.S3`** keeps them as objects in an S3-compatible bucket, under the

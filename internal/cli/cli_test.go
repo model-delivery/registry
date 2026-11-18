@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
 )
@@ -28,7 +29,7 @@ type fixture struct {
 
 func newFixture(t *testing.T, upstream string) *fixture {
 	t.Helper()
-	reg, err := registry.Open(t.TempDir())
+	reg, err := registry.Open(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,6 +212,101 @@ func TestTokenLifecycle(t *testing.T) {
 	}
 	if code, _, _ := f.run(t, secret, "push", modelDir(t), "acme/other"); code == 0 {
 		t.Fatal("revoked token can still push")
+	}
+}
+
+func TestServeWithS3Storage(t *testing.T) {
+	t.Parallel()
+	fake := blobtest.NewFakeS3(t)
+	env := map[string]string{
+		"REGISTRY_STORAGE":       "s3",
+		"REGISTRY_S3_ENDPOINT":   fake.Config.Endpoint,
+		"REGISTRY_S3_BUCKET":     fake.Config.Bucket,
+		"REGISTRY_S3_PREFIX":     "prod",
+		"REGISTRY_S3_ACCESS_KEY": fake.Config.AccessKey,
+		"REGISTRY_S3_SECRET_KEY": fake.Config.SecretKey,
+		"REGISTRY_S3_REGION":     "us-east-1",
+		"REGISTRY_ADMIN_TOKEN":   "md_admin_token_for_the_s3_test",
+	}
+	data := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	logs := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
+			func(k string) string { return env[k] })
+	}()
+	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
+	var addr string
+	for deadline := time.Now().Add(10 * time.Second); addr == ""; {
+		if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
+			addr = m[1]
+			break
+		}
+		select {
+		case code := <-done:
+			t.Fatalf("serve exited early with code %d:\n%s", code, logs.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve did not start:\n%s", logs.String())
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	clientEnv := map[string]string{"MODELCTL_ENDPOINT": "http://" + addr, "MODELCTL_TOKEN": env["REGISTRY_ADMIN_TOKEN"]}
+	code := Run(context.Background(), []string{"push", modelDir(t), "acme/tiny"}, &stdout, &stderr, func(k string) string { return clientEnv[k] })
+	if code != 0 {
+		t.Fatalf("push to an S3-backed registry failed: %s", stderr.String())
+	}
+	keys := fake.Keys(t)
+	if len(keys) != 2 {
+		t.Fatalf("bucket holds %v, want the two pushed files", keys)
+	}
+	for _, k := range keys {
+		if !strings.HasPrefix(k, "prod/sha256/") {
+			t.Errorf("object %q is not under the configured prefix", k)
+		}
+	}
+	// The files live in the bucket, not in the data directory.
+	if _, err := os.Stat(filepath.Join(data, "blobs")); !os.IsNotExist(err) {
+		t.Errorf("a local blobs directory exists alongside S3 storage: %v", err)
+	}
+	if strings.Contains(logs.String(), fake.Config.SecretKey) {
+		t.Error("the S3 secret key was written to the log")
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exit code %d:\n%s", code, logs.String())
+	}
+}
+
+func TestServeStorageConfigurationErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"s3 without a bucket", map[string]string{"REGISTRY_STORAGE": "s3"}, "REGISTRY_S3_BUCKET"},
+		{"unknown storage", map[string]string{"REGISTRY_STORAGE": "tape"}, "use filesystem or s3"},
+		{"s3 bucket that does not exist", map[string]string{"REGISTRY_STORAGE": "s3", "REGISTRY_S3_BUCKET": "absent",
+			"REGISTRY_S3_ENDPOINT": "FAKE", "REGISTRY_S3_ACCESS_KEY": "k", "REGISTRY_S3_SECRET_KEY": "s"}, `bucket "absent" does not exist`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := tc.env
+			if env["REGISTRY_S3_ENDPOINT"] == "FAKE" {
+				env["REGISTRY_S3_ENDPOINT"] = blobtest.NewFakeS3(t).Config.Endpoint
+			}
+			var stderr bytes.Buffer
+			code := Run(context.Background(), []string{"serve", "--addr", "127.0.0.1:0", "--data", t.TempDir()},
+				&bytes.Buffer{}, &stderr, func(k string) string { return env[k] })
+			if code == 0 || !strings.Contains(stderr.String(), tc.wantErr) {
+				t.Fatalf("code %d, stderr %q, want an error mentioning %q", code, stderr.String(), tc.wantErr)
+			}
+		})
 	}
 }
 

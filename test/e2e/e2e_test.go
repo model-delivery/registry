@@ -24,7 +24,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/client"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
@@ -38,7 +41,13 @@ type instance struct {
 
 func start(t *testing.T, cfg server.Config) *instance {
 	t.Helper()
-	reg, err := registry.Open(t.TempDir())
+	return startWith(t, cfg, nil)
+}
+
+// startWith is start with a chosen storage backend; nil means local files.
+func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
+	t.Helper()
+	reg, err := registry.Open(t.TempDir(), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,6 +284,76 @@ func TestHubClientAgainstPush(t *testing.T) {
 	checkSnapshot(t, in, "team/own-model", pushed.SHA, res)
 	if res.Branches["main"] != pushed.SHA || res.Tags["v1.0"] != pushed.SHA {
 		t.Errorf("list_repo_refs: branches %v tags %v, want main and v1.0 at %s", res.Branches, res.Tags, pushed.SHA)
+	}
+}
+
+// s3Stores returns the S3 backends to test against: always the in-memory
+// fake, plus a real S3-compatible service when REGISTRY_TEST_S3_ENDPOINT
+// (and _BUCKET, _ACCESS_KEY, _SECRET_KEY) point at one.
+func s3Stores(t *testing.T) map[string]blob.Store {
+	t.Helper()
+	out := map[string]blob.Store{"in-memory": blobtest.NewFakeS3(t).Store(t)}
+	if endpoint := os.Getenv("REGISTRY_TEST_S3_ENDPOINT"); endpoint != "" {
+		real, err := blob.NewS3(context.Background(), blob.S3Config{
+			Endpoint:   endpoint,
+			Region:     "us-east-1",
+			Bucket:     os.Getenv("REGISTRY_TEST_S3_BUCKET"),
+			Prefix:     "e2e-" + strings.ReplaceAll(t.Name(), "/", "-") + "-" + time.Now().Format("150405.000000"),
+			AccessKey:  os.Getenv("REGISTRY_TEST_S3_ACCESS_KEY"),
+			SecretKey:  os.Getenv("REGISTRY_TEST_S3_SECRET_KEY"),
+			StagingDir: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out["real service"] = real
+	}
+	return out
+}
+
+// TestHubClientAgainstS3 downloads with huggingface_hub from a registry
+// that keeps its files in an S3 bucket, both streamed through the registry
+// and redirected to signed bucket URLs.
+func TestHubClientAgainstS3(t *testing.T) {
+	python(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	files := map[string]string{
+		"config.json":       `{"model_type":"tiny"}`,
+		"empty.txt":         "",
+		"model.safetensors": strings.Repeat("\x00weights\xff", 300_000),
+		"sub/vocab.txt":     "a\nb\n",
+	}
+	for p, content := range files {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, redirect := range map[string]bool{"streamed through the registry": false, "redirected to the bucket": true} {
+		for backend, store := range s3Stores(t) {
+			t.Run(name+"/"+backend, func(t *testing.T) {
+				// Reads need a token, so the redirected case also shows the
+				// client fetching from the bucket with only the signed URL.
+				in := startWith(t, server.Config{AnonymousRead: false, RedirectDownloads: redirect}, store)
+				pushed, err := client.New(in.srv.URL, in.write).Push(ctx, dir, "team/in-bucket", client.PushOptions{Branch: "main"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				read, err := in.reg.CreateToken(ctx, "reader", registry.RoleRead)
+				if err != nil {
+					t.Fatal(err)
+				}
+				res, stderr, err := runDownload(t, in.srv.URL, read, "team/in-bucket", "main", "sub/vocab.txt")
+				if err != nil {
+					t.Fatalf("download failed: %v\n%s", err, stderr)
+				}
+				checkSnapshot(t, in, "team/in-bucket", pushed.SHA, res)
+			})
+		}
 	}
 }
 

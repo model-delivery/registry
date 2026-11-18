@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/client"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
@@ -32,7 +33,13 @@ type instance struct {
 
 func start(t *testing.T, cfg server.Config) *instance {
 	t.Helper()
-	reg, err := registry.Open(t.TempDir())
+	return startWith(t, cfg, nil)
+}
+
+// startWith is start with a chosen storage backend; nil means local files.
+func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
+	t.Helper()
+	reg, err := registry.Open(t.TempDir(), store)
 	if err != nil {
 		t.Fatal(err)
 	}

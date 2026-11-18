@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ErrMismatch reports that received bytes did not match what was expected.
@@ -49,17 +50,32 @@ type File interface {
 type Staged interface {
 	Info() Info
 	// Publish makes the blob visible under its digest. It is idempotent.
-	Publish() error
+	Publish(ctx context.Context) error
 	// Discard drops the staged bytes. It is safe to call after Publish.
 	Discard()
 }
 
-// Store is the storage backend contract. The filesystem implementation is
-// the only one today; an object-store backend implements the same four calls.
+// Store is the storage backend contract, implemented by FS (local disk)
+// and S3 (any S3-compatible object store).
 type Store interface {
 	Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error)
-	Open(sha256 string) (File, int64, error)
-	Delete(sha256 string) error
+	Open(ctx context.Context, sha256 string) (File, int64, error)
+	Delete(ctx context.Context, sha256 string) error
+}
+
+// Presigner is implemented by stores that can hand out a time-limited URL
+// from which a client downloads a blob directly, bypassing the registry.
+type Presigner interface {
+	PresignGet(ctx context.Context, sha256 string, ttl time.Duration) (string, error)
+}
+
+// blobKey is the path of a blob relative to a store's root:
+// sha256/<first two hex>/<digest>.
+func blobKey(digest string) (string, error) {
+	if !ValidDigest(digest) {
+		return "", fmt.Errorf("%w: malformed digest %q", ErrNotFound, digest)
+	}
+	return "sha256/" + digest[:2] + "/" + digest, nil
 }
 
 // FS stores blobs as files under root/blobs/sha256/<2 hex>/<digest>.
@@ -109,18 +125,35 @@ func (s *FS) path(digest string) (string, error) {
 // Stage streams r to a temporary file while hashing it, then checks the
 // result against want. Nothing is buffered in memory beyond the copy buffer.
 func (s *FS) Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error) {
-	tmp, err := os.CreateTemp(s.tmpDir, "stage-*")
+	tmp, info, err := stageToFile(ctx, s.tmpDir, r, want)
 	if err != nil {
-		return nil, fmt.Errorf("create staging file: %w", err)
+		return nil, err
 	}
-	st := &fsStaged{store: s, tmp: tmp.Name()}
-	ok := false
-	defer func() {
-		_ = tmp.Close()
-		if !ok {
-			st.Discard()
+	return &fsStaged{store: s, tmp: tmp, info: info}, nil
+}
+
+// stageToFile receives r into a new file under dir, hashing as it goes,
+// and checks the result against want. On any failure the file is removed.
+// Every backend stages this way, so nothing unverified ever leaves the
+// staging directory.
+func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (string, Info, error) {
+	info, path, err := receive(ctx, dir, r, want)
+	if err != nil {
+		if path != "" {
+			_ = os.Remove(path)
 		}
-	}()
+		return "", Info{}, err
+	}
+	return path, info, nil
+}
+
+func receive(ctx context.Context, dir string, r io.Reader, want Expect) (Info, string, error) {
+	tmp, err := os.CreateTemp(dir, "stage-*")
+	if err != nil {
+		return Info{}, "", fmt.Errorf("create staging file: %w", err)
+	}
+	path := tmp.Name()
+	defer func() { _ = tmp.Close() }()
 
 	h256 := sha256.New()
 	writers := []io.Writer{tmp, h256}
@@ -135,36 +168,35 @@ func (s *FS) Stage(ctx context.Context, r io.Reader, want Expect) (Staged, error
 	}
 	n, err := io.Copy(io.MultiWriter(writers...), &ctxReader{ctx: ctx, r: src})
 	if err != nil {
-		return nil, fmt.Errorf("receive blob: %w", err)
+		return Info{}, path, fmt.Errorf("receive blob: %w", err)
 	}
 	if want.Size >= 0 && n != want.Size {
-		return nil, fmt.Errorf("%w: expected %d bytes, received %s", ErrMismatch, want.Size, received(n, want.Size))
+		return Info{}, path, fmt.Errorf("%w: expected %d bytes, received %s", ErrMismatch, want.Size, received(n, want.Size))
 	}
 	if err := tmp.Sync(); err != nil {
-		return nil, fmt.Errorf("flush blob: %w", err)
+		return Info{}, path, fmt.Errorf("flush blob: %w", err)
 	}
 	if hGit == nil {
 		hGit = gitHasher(n)
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("rewind blob: %w", err)
+			return Info{}, path, fmt.Errorf("rewind blob: %w", err)
 		}
 		if _, err := io.Copy(hGit, &ctxReader{ctx: ctx, r: tmp}); err != nil {
-			return nil, fmt.Errorf("hash blob: %w", err)
+			return Info{}, path, fmt.Errorf("hash blob: %w", err)
 		}
 	}
-	st.info = Info{
+	info := Info{
 		SHA256: hex.EncodeToString(h256.Sum(nil)),
 		GitOID: hex.EncodeToString(hGit.Sum(nil)),
 		Size:   n,
 	}
-	if want.SHA256 != "" && want.SHA256 != st.info.SHA256 {
-		return nil, fmt.Errorf("%w: expected sha256 %s, received %s", ErrMismatch, want.SHA256, st.info.SHA256)
+	if want.SHA256 != "" && want.SHA256 != info.SHA256 {
+		return Info{}, path, fmt.Errorf("%w: expected sha256 %s, received %s", ErrMismatch, want.SHA256, info.SHA256)
 	}
-	if want.GitOID != "" && want.GitOID != st.info.GitOID {
-		return nil, fmt.Errorf("%w: expected git blob id %s, received %s", ErrMismatch, want.GitOID, st.info.GitOID)
+	if want.GitOID != "" && want.GitOID != info.GitOID {
+		return Info{}, path, fmt.Errorf("%w: expected git blob id %s, received %s", ErrMismatch, want.GitOID, info.GitOID)
 	}
-	ok = true
-	return st, nil
+	return info, path, nil
 }
 
 func received(n, want int64) string {
@@ -175,7 +207,7 @@ func received(n, want int64) string {
 }
 
 // Open returns the blob and its size.
-func (s *FS) Open(digest string) (File, int64, error) {
+func (s *FS) Open(_ context.Context, digest string) (File, int64, error) {
 	p, err := s.path(digest)
 	if err != nil {
 		return nil, 0, err
@@ -196,7 +228,7 @@ func (s *FS) Open(digest string) (File, int64, error) {
 }
 
 // Delete removes a blob. Deleting a blob that is not there is not an error.
-func (s *FS) Delete(digest string) error {
+func (s *FS) Delete(_ context.Context, digest string) error {
 	p, err := s.path(digest)
 	if err != nil {
 		return err
@@ -216,7 +248,7 @@ type fsStaged struct {
 
 func (st *fsStaged) Info() Info { return st.info }
 
-func (st *fsStaged) Publish() error {
+func (st *fsStaged) Publish(context.Context) error {
 	if st.done {
 		return nil
 	}

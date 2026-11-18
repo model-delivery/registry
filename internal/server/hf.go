@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,10 @@ import (
 // docs/compatibility.md records what is and is not covered.
 
 const hfTime = "2006-01-02T15:04:05.000Z"
+
+// presignTTL is how long a redirected download URL stays valid. It only
+// has to cover starting the transfer; a transfer in progress is not cut off.
+const presignTTL = time.Hour
 
 func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -216,7 +221,36 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		s.fail(w, r, err)
 		return
 	}
-	content, size, err := s.reg.OpenBlob(f.SHA256)
+	h := w.Header()
+	h.Set("ETag", `"`+f.ETag()+`"`)
+	if registry.IsSHA(rev) {
+		// A revision id never changes meaning, so its files can be cached forever.
+		h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		h.Set("Cache-Control", "no-cache")
+	}
+
+	if s.cfg.RedirectDownloads {
+		// Send the client to the object store for the bytes. The headers
+		// below are how the Hugging Face Hub describes a file that lives
+		// behind a redirect, so clients learn its identity and size from
+		// this response and fetch the content from Location.
+		location, ok, err := s.reg.PresignBlob(r.Context(), f.SHA256, presignTTL)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if ok {
+			h.Set("X-Linked-Etag", `"`+f.ETag()+`"`)
+			h.Set("X-Linked-Size", strconv.FormatInt(f.Size, 10))
+			h.Set("Location", location)
+			h.Set("Cache-Control", "no-store") // the signed URL expires
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+	}
+
+	content, size, err := s.reg.OpenBlob(r.Context(), f.SHA256)
 	if err != nil {
 		s.log.Error("stored file is missing its blob", "repo", repo, "path", filePath, "sha256", f.SHA256, "error", err)
 		writeError(w, http.StatusInternalServerError, "the stored content for this file is missing; run a registry check")
@@ -229,17 +263,9 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 
-	h := w.Header()
-	h.Set("ETag", `"`+f.ETag()+`"`)
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(filePath)))
 	h.Set("X-Content-Type-Options", "nosniff")
-	if registry.IsSHA(rev) {
-		// A revision id never changes meaning, so its files can be cached forever.
-		h.Set("Cache-Control", "public, max-age=31536000, immutable")
-	} else {
-		h.Set("Cache-Control", "no-cache")
-	}
 	// ServeContent handles HEAD, Range, If-Range and If-None-Match, and
 	// streams straight from the file.
 	http.ServeContent(w, r, "", time.Time{}, content)

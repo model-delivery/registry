@@ -12,6 +12,68 @@ Free space equal to the largest single file is needed on the same volume
 while that file is being received, because uploads are written to
 `data/tmp/` and then moved into place.
 
+## S3 storage
+
+To keep model files in an object store instead of on the server's disk:
+
+```bash
+export REGISTRY_STORAGE=s3
+export REGISTRY_S3_BUCKET=my-models
+export REGISTRY_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com   # or your provider's URL
+export REGISTRY_S3_REGION=us-east-1
+export REGISTRY_S3_ACCESS_KEY=...
+export REGISTRY_S3_SECRET_KEY=...
+modelctl serve
+```
+
+The bucket must exist; the registry does not create it. It checks the
+bucket at start and exits with a clear message if it cannot reach it.
+
+Credentials: `REGISTRY_S3_ACCESS_KEY` and `REGISTRY_S3_SECRET_KEY`, else
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`
+if set), else the role of the instance or pod the registry runs on.
+
+The registry needs these permissions on the bucket, and nothing more:
+`s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject`,
+`s3:DeleteObject` and `s3:AbortMultipartUpload` on its objects (or on
+`<prefix>/*` if you set `REGISTRY_S3_PREFIX`).
+
+**What still lives on the server.** Two things, both in the data directory:
+
+- `registry.db`, the metadata. It is small, but it is the only record of
+  which objects make up which revision. Put the data directory on a
+  persistent disk and back it up (see below). A bucket without its
+  database is a pile of unnamed files.
+- `tmp/`, scratch space. Each upload or mirrored file is received and
+  verified locally before it is sent to the bucket, so you need free space
+  for the largest file being received, times the number received at once
+  (a mirror fetches four files in parallel).
+
+**Redirected downloads.** By default the registry streams files from the
+bucket to the client. Set `REGISTRY_S3_REDIRECT=true` to have it answer
+with a redirect to a signed bucket URL instead, valid for one hour, so
+clients download directly from the object store and the registry carries
+no file traffic. Use this when:
+
+- clients can reach the bucket endpoint (it is not on a private network
+  they cannot see), and
+- you are comfortable that anyone holding a signed URL can download that
+  one file until it expires, without a registry token. The registry only
+  issues a URL after checking the caller's access.
+
+If the registry reaches the bucket by an internal address that clients
+cannot use, leave redirects off.
+
+**Bucket settings worth having.** A lifecycle rule that aborts incomplete
+multipart uploads after a day or two cleans up after a crash mid-upload.
+Do not add a rule that expires or deletes objects: the registry decides
+what is unreferenced, with `modelctl gc`.
+
+**Moving existing data into S3.** There is no migration command yet. To
+move, copy `data/blobs/` into the bucket keeping the layout
+(`blobs/sha256/ab/abcd...` becomes `<prefix>/sha256/ab/abcd...`), then
+restart with S3 storage against the same `registry.db`.
+
 ## The first admin token
 
 On its first start against an empty data directory the server creates an
@@ -124,6 +186,14 @@ sqlite3 data/registry.db ".backup 'backup/registry.db'"
 To restore, put the directory back and start the server. Do not run
 `modelctl gc` or delete repositories while a backup is being taken.
 
+**With S3 storage,** the bucket holds the files and your provider's
+durability covers them; what you back up is `registry.db`, with the same
+`sqlite3 ... ".backup"` command, on a schedule. Keep the backups somewhere
+other than the server. If you restore an older database, revisions
+recorded after that backup are gone from the registry even though their
+objects are still in the bucket; `modelctl gc` cannot see those objects,
+because it only knows about files the database lists.
+
 ## Freeing space
 
 ```bash
@@ -146,6 +216,7 @@ before upgrading if you might need to go back.
 - Run one server per data directory. Two processes against the same
   directory are not supported.
 - Keep the data directory on a local filesystem. SQLite over a network
-  filesystem (NFS, SMB) is unreliable.
+  filesystem (NFS, SMB) is unreliable. This applies with S3 storage too,
+  since the database stays in the data directory.
 - There is no built-in rate limiting. Use the reverse proxy for that if the
   registry is public.

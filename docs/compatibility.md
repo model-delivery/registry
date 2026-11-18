@@ -61,6 +61,11 @@ does not work, please open an issue naming the library and the call.
 | `HEAD`, `GET /{repo}/resolve/{revision}/{path}` | Sends `ETag`, `X-Repo-Commit`, `Content-Length`, `Accept-Ranges`; honours `Range` and `If-None-Match` |
 | `GET /api/whoami-v2` | Reports the registry token's name |
 
+When the registry is configured to redirect downloads to S3, `resolve`
+answers `302` with `Location` (a signed bucket URL), `X-Linked-Etag`,
+`X-Linked-Size` and `X-Repo-Commit`, which is how the Hub itself describes
+files served from its CDN. `huggingface_hub` is tested in this mode too.
+
 Errors carry `X-Error-Code` (`RepoNotFound`, `RevisionNotFound`,
 `EntryNotFound`) so clients raise their usual exceptions.
 

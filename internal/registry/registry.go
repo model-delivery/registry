@@ -95,21 +95,61 @@ CREATE TABLE tokens (
 type Registry struct {
 	db    *sql.DB
 	blobs blob.Store
-	// blobMu orders blob publication against blob removal: publishers hold it
-	// shared, garbage collection holds it exclusively, so a blob can never be
-	// deleted between being written and being recorded.
-	blobMu sync.RWMutex
-	now    func() time.Time
+	// locks orders publishing a blob against removing it, one digest at a
+	// time, so a blob can never be deleted between being written and being
+	// recorded. Work on different digests never waits on each other.
+	locks keyLock
+	now   func() time.Time
 }
 
-// Open opens the registry stored in dataDir, creating it on first use.
-func Open(dataDir string) (*Registry, error) {
+// keyLock is a mutex per key.
+type keyLock struct {
+	mu sync.Mutex
+	m  map[string]*keyEntry
+}
+
+type keyEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock blocks until key is free and returns the function that releases it.
+func (k *keyLock) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[string]*keyEntry{}
+	}
+	e := k.m[key]
+	if e == nil {
+		e = &keyEntry{}
+		k.m[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		k.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
+}
+
+// Open opens the registry whose metadata lives in dataDir, creating it on
+// first use. File content goes to store; nil means local files in dataDir.
+func Open(dataDir string, store blob.Store) (*Registry, error) {
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	store, err := blob.NewFS(dataDir)
-	if err != nil {
-		return nil, err
+	if store == nil {
+		fs, err := blob.NewFS(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		store = fs
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dataDir, "registry.db")) +
 		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
@@ -174,19 +214,41 @@ func (r *Registry) PutBlob(ctx context.Context, rd io.Reader, want blob.Expect) 
 	defer st.Discard()
 	info := st.Info()
 
-	r.blobMu.RLock()
-	defer r.blobMu.RUnlock()
-	if err := st.Publish(); err != nil {
+	defer r.locks.lock(info.SHA256)()
+	if err := st.Publish(ctx); err != nil {
 		return blob.Info{}, err
 	}
+	// Re-sending a blob refreshes its age, so garbage collection keeps its
+	// hands off content a push is about to reference.
 	_, err = r.db.ExecContext(ctx,
 		`INSERT INTO blobs (sha256, size, git_oid, created_at) VALUES (?, ?, ?, ?)
-		 ON CONFLICT (sha256) DO NOTHING`,
+		 ON CONFLICT (sha256) DO UPDATE SET created_at = excluded.created_at`,
 		info.SHA256, info.Size, info.GitOID, r.stamp())
 	if err != nil {
 		return blob.Info{}, fmt.Errorf("record blob: %w", err)
 	}
 	return info, nil
+}
+
+// TouchBlob marks a stored blob as just used. A pusher that finds a file
+// already stored calls this instead of uploading, which protects the blob
+// from garbage collection until the push records its revision.
+func (r *Registry) TouchBlob(ctx context.Context, digest string) (blob.Info, bool, error) {
+	if _, err := r.db.ExecContext(ctx, "UPDATE blobs SET created_at = ? WHERE sha256 = ?", r.stamp(), digest); err != nil {
+		return blob.Info{}, false, err
+	}
+	return r.StatBlob(ctx, digest)
+}
+
+// PresignBlob returns a direct download URL for a blob when the storage
+// backend can provide one. ok is false when it cannot.
+func (r *Registry) PresignBlob(ctx context.Context, digest string, ttl time.Duration) (string, bool, error) {
+	p, can := r.blobs.(blob.Presigner)
+	if !can {
+		return "", false, nil
+	}
+	u, err := p.PresignGet(ctx, digest, ttl)
+	return u, err == nil, err
 }
 
 // StatBlob reports whether a blob is stored, and its details if so.
@@ -212,8 +274,8 @@ func (r *Registry) FindBlobByGitOID(ctx context.Context, oid string, size int64)
 }
 
 // OpenBlob opens stored bytes for reading.
-func (r *Registry) OpenBlob(digest string) (blob.File, int64, error) {
-	return r.blobs.Open(digest)
+func (r *Registry) OpenBlob(ctx context.Context, digest string) (blob.File, int64, error) {
+	return r.blobs.Open(ctx, digest)
 }
 
 // GCResult reports what garbage collection removed.
@@ -222,71 +284,70 @@ type GCResult struct {
 	Bytes int64 `json:"bytes"`
 }
 
-// GC removes blobs that no revision references and that are older than
-// minAge. The age guard protects uploads whose commit has not arrived yet.
+// GC removes blobs that no revision references and that were last written
+// or touched more than minAge ago. The age guard protects uploads whose
+// revision has not been recorded yet.
 func (r *Registry) GC(ctx context.Context, minAge time.Duration) (GCResult, error) {
 	cutoff := r.now().Add(-minAge).UTC().Format(timeLayout)
-	return r.removeBlobs(ctx, func(tx *sql.Tx) (*sql.Rows, error) {
-		return tx.QueryContext(ctx,
-			`SELECT sha256, size FROM blobs b
-			 WHERE b.created_at <= ? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = b.sha256)`, cutoff)
-	}, nil)
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT sha256 FROM blobs b
+		 WHERE b.created_at <= ? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = b.sha256)`, cutoff)
+	if err != nil {
+		return GCResult{}, err
+	}
+	digests, err := scanStrings(rows)
+	if err != nil {
+		return GCResult{}, err
+	}
+	return r.dropUnreferenced(ctx, digests, cutoff)
 }
 
-// removeBlobs deletes the blob rows selected by pick (run inside one write
-// transaction, after before if given) and then the bytes behind them.
-func (r *Registry) removeBlobs(ctx context.Context, pick func(*sql.Tx) (*sql.Rows, error), before func(*sql.Tx) error) (GCResult, error) {
-	r.blobMu.Lock()
-	defer r.blobMu.Unlock()
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return GCResult{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	rows, err := pick(tx)
-	if err != nil {
-		return GCResult{}, err
-	}
-	var res GCResult
-	var digests []string
+func scanStrings(rows *sql.Rows) ([]string, error) {
+	defer func() { _ = rows.Close() }()
+	var out []string
 	for rows.Next() {
-		var d string
-		var size int64
-		if err := rows.Scan(&d, &size); err != nil {
-			_ = rows.Close()
-			return GCResult{}, err
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
 		}
-		digests = append(digests, d)
-		res.Blobs++
-		res.Bytes += size
+		out = append(out, s)
 	}
-	if err := rows.Close(); err != nil {
-		return GCResult{}, err
-	}
-	if err := rows.Err(); err != nil {
-		return GCResult{}, err
-	}
-	if before != nil {
-		if err := before(tx); err != nil {
-			return GCResult{}, err
-		}
-	}
-	for _, d := range digests {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM blobs WHERE sha256 = ?", d); err != nil {
-			return GCResult{}, fmt.Errorf("forget blob %s: %w", d, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return GCResult{}, err
-	}
-	// Rows are gone, so nothing can reference these any more. A file that
-	// fails to delete is only wasted space, never a dangling reference.
+	return out, rows.Err()
+}
+
+// dropUnreferenced removes each candidate blob that is still unreferenced
+// and not newer than cutoff. The check and the removal of the record are
+// one statement, made while holding the blob's lock, so a blob that gained
+// a reference or was re-uploaded since it was picked is left alone.
+func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutoff string) (GCResult, error) {
+	var res GCResult
 	var firstErr error
 	for _, d := range digests {
-		if err := r.blobs.Delete(d); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("remove blob %s: %w", d, err)
+		err := func() error {
+			defer r.locks.lock(d)()
+			var size int64
+			err := r.db.QueryRowContext(ctx,
+				`DELETE FROM blobs WHERE sha256 = ? AND created_at <= ?
+				 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = blobs.sha256)
+				 RETURNING size`, d, cutoff).Scan(&size)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil // referenced or refreshed in the meantime
+			}
+			if err != nil {
+				return fmt.Errorf("forget blob %s: %w", d, err)
+			}
+			res.Blobs++
+			res.Bytes += size
+			// The record is gone, so nothing can reference these bytes any
+			// more. If removing them fails they are wasted space, never a
+			// dangling reference.
+			if err := r.blobs.Delete(ctx, d); err != nil {
+				return fmt.Errorf("remove blob %s: %w", d, err)
+			}
+			return nil
+		}()
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return res, firstErr

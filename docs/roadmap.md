@@ -6,8 +6,6 @@ of dates. Issues and pull requests that move an item forward are welcome.
 
 ## Next
 
-- **S3-compatible storage.** A second `blob.Store` backend for MinIO, S3,
-  R2 and similar, with downloads redirected to presigned URLs.
 - **Partial mirrors.** `modelctl mirror --include "*.gguf"` to copy only
   some files of a large repository, recorded honestly as a subset.
 - **Uploads from Hugging Face clients.** `upload_file`, `upload_folder` and
@@ -23,6 +21,11 @@ of dates. Issues and pull requests that move an item forward are welcome.
   the registry afterwards.
 - **Mirror every branch and tag** of a repository in one command.
 - **Resumable uploads** for `modelctl push`.
+- **A migration command** to move stored files between local disk and S3.
+- **Helm chart** for Kubernetes.
+- **A second metadata backend (PostgreSQL)**, so several registry instances
+  can share one database. SQLite is enough for a single node; this is what
+  running more than one needs.
 - **OIDC sign-in** for the web UI.
 - **Per-repository permissions.**
 - **Metrics endpoint** for Prometheus.

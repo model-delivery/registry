@@ -41,6 +41,9 @@ data/
   tmp/                     uploads in progress
 ```
 
+With S3 storage, `blobs/` is absent: the same `sha256/ab/abcd...` names are
+object keys in the bucket. `registry.db` and `tmp/` stay local.
+
 ## Content-addressed storage
 
 Every file's bytes are stored once, under the SHA-256 of the content. A
@@ -63,8 +66,25 @@ Writing a blob (`internal/blob`):
    blob is either fully present under its name or absent; a reader can
    never see a partial file.
 
-`blob.Store` is a four-method interface. The filesystem implementation is
-the only one today. An object-store backend implements the same interface.
+`blob.Store` is a three-method interface (stage, open, delete) with two
+implementations, and one test suite that both must pass.
+
+- **`blob.FS`** keeps blobs as files in the data directory, as above.
+- **`blob.S3`** keeps them as objects in an S3-compatible bucket, under the
+  same `sha256/ab/abcd...` names. An upload is still received and verified
+  on local disk first (step 1 and 2), and only then sent to the bucket, as
+  a multipart upload when it is large. The object store makes an object
+  visible only when the upload completes, which gives the same
+  all-or-nothing guarantee as the rename. The cost is local scratch space
+  for the largest file being received.
+
+Reading from S3 goes one of two ways. By default the registry opens the
+object and streams it, turning client range requests into ranged reads of
+the object. With redirects enabled, the registry answers the file request
+with a `302` to a signed, time-limited URL for the object, plus the
+headers a Hugging Face client needs to identify the file. The client then
+downloads straight from the bucket, and the registry carries no file
+traffic. The registry still checks the caller's access before it signs.
 
 ## Revisions and refs
 
@@ -126,8 +146,11 @@ no other repository references. `modelctl gc` removes blobs that nothing
 references at all, skipping any younger than an hour, since those may
 belong to a push that has uploaded files but not yet recorded its revision.
 
-Blob removal and blob publication take turns on one lock, so a blob cannot
-be deleted between being written and being recorded.
+Publishing a blob and removing it take turns on a lock held per digest, so
+a blob cannot be deleted between being written and being recorded, and a
+long upload of one file never holds up work on another. Removal re-checks,
+in the same statement that deletes the record, that the blob is still
+unreferenced and has not been re-sent or asked about since it was picked.
 
 ## Access control
 
@@ -163,3 +186,10 @@ plugin system; each is a small interface or a single function.
 No microservices, no message broker, no Kubernetes dependency, no separate
 database. One process against one data directory. Running two processes
 against the same directory is not supported.
+
+Metadata is SQLite on purpose. It is small (one row per file per revision)
+and SQLite serves it comfortably on one node, with nothing to operate. What
+SQLite rules out is several registry instances sharing one database, which
+is what high availability needs. All SQL is confined to
+`internal/registry`, so a second metadata backend is a contained change
+when that is wanted.

@@ -15,7 +15,7 @@ import (
 
 func open(t *testing.T) *Registry {
 	t.Helper()
-	r, err := Open(t.TempDir())
+	r, err := Open(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestCommitAndResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, _, err := r.OpenBlob(f.SHA256)
+	rc, _, err := r.OpenBlob(ctx, f.SHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,10 +214,10 @@ func TestDeleteRepoFreesOnlyUnsharedBlobs(t *testing.T) {
 	if res.Blobs != 1 || res.Bytes != int64(len("only in one")) {
 		t.Fatalf("delete freed %+v, want exactly the unshared blob", res)
 	}
-	if _, _, err := r.OpenBlob(only.SHA256); !errors.Is(err, blob.ErrNotFound) {
+	if _, _, err := r.OpenBlob(ctx, only.SHA256); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("unshared blob still on disk: %v", err)
 	}
-	if rc, _, err := r.OpenBlob(shared.SHA256); err != nil {
+	if rc, _, err := r.OpenBlob(ctx, shared.SHA256); err != nil {
 		t.Fatalf("shared blob was removed: %v", err)
 	} else {
 		_ = rc.Close()
@@ -296,7 +296,7 @@ func TestReopenKeepsData(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dir := t.TempDir()
-	r, err := Open(dir)
+	r, err := Open(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func TestReopenKeepsData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r2, err := Open(dir)
+	r2, err := Open(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +321,7 @@ func TestReopenKeepsData(t *testing.T) {
 	if err != nil || got.SHA != c.SHA {
 		t.Fatalf("after reopen main = %s (%v), want %s", got.SHA, err, c.SHA)
 	}
-	rc, _, err := r2.OpenBlob(info.SHA256)
+	rc, _, err := r2.OpenBlob(ctx, info.SHA256)
 	if err != nil {
 		t.Fatalf("blob missing after reopen: %v", err)
 	}

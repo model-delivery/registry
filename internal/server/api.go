@@ -138,7 +138,9 @@ func (s *Server) apiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiStatBlob(w http.ResponseWriter, r *http.Request) {
-	info, ok, err := s.reg.StatBlob(r.Context(), r.PathValue("sha256"))
+	// Asking whether a blob exists is what a push does before deciding not
+	// to upload it, so it also marks the blob as in use.
+	info, ok, err := s.reg.TouchBlob(r.Context(), r.PathValue("sha256"))
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return

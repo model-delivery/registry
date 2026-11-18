@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
+	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
@@ -23,12 +25,41 @@ func cmdServe(e *env, args []string) error {
 	data := c.String("data", e.envOr("REGISTRY_DATA", "./data"), "directory for the database and stored files (env REGISTRY_DATA)")
 	upstream := c.String("upstream", e.envOr("REGISTRY_UPSTREAM", mirror.DefaultEndpoint), "hub to mirror from (env REGISTRY_UPSTREAM)")
 	requireAuth := c.Bool("require-auth", envBool(e, "REGISTRY_REQUIRE_AUTH"), "require a token for downloads and browsing too (env REGISTRY_REQUIRE_AUTH)")
+	storage := c.String("storage", e.envOr("REGISTRY_STORAGE", "filesystem"), "where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with REGISTRY_S3_* variables")
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
 	}
 	log := slog.New(slog.NewTextHandler(e.stderr, nil))
 
-	reg, err := registry.Open(*data)
+	var store blob.Store // nil keeps files in the data directory
+	redirect := false
+	switch *storage {
+	case "filesystem":
+	case "s3":
+		cfg := blob.S3Config{
+			Endpoint:     e.getenv("REGISTRY_S3_ENDPOINT"),
+			Region:       e.envOr("REGISTRY_S3_REGION", e.getenv("AWS_REGION")),
+			Bucket:       e.getenv("REGISTRY_S3_BUCKET"),
+			Prefix:       e.getenv("REGISTRY_S3_PREFIX"),
+			AccessKey:    e.envOr("REGISTRY_S3_ACCESS_KEY", e.getenv("AWS_ACCESS_KEY_ID")),
+			SecretKey:    e.envOr("REGISTRY_S3_SECRET_KEY", e.getenv("AWS_SECRET_ACCESS_KEY")),
+			SessionToken: e.getenv("AWS_SESSION_TOKEN"),
+			StagingDir:   filepath.Join(*data, "tmp"),
+		}
+		if cfg.Bucket == "" {
+			return usagef("--storage s3 needs a bucket: set REGISTRY_S3_BUCKET")
+		}
+		s3, err := blob.NewS3(e.ctx, cfg)
+		if err != nil {
+			return err
+		}
+		store, redirect = s3, envBool(e, "REGISTRY_S3_REDIRECT")
+		log.Info("storing model files in S3", "bucket", cfg.Bucket, "endpoint", cfg.Endpoint, "prefix", cfg.Prefix, "redirect_downloads", redirect)
+	default:
+		return usagef("unknown --storage %q: use filesystem or s3", *storage)
+	}
+
+	reg, err := registry.Open(*data, store)
 	if err != nil {
 		return fmt.Errorf("open data directory %s: %w", *data, err)
 	}
@@ -39,11 +70,12 @@ func cmdServe(e *env, args []string) error {
 	}
 
 	handler := server.New(reg, server.Config{
-		AnonymousRead: !*requireAuth,
-		Upstream:      *upstream,
-		UpstreamToken: e.getenv("REGISTRY_UPSTREAM_TOKEN"),
-		Version:       Version,
-		Logger:        log,
+		AnonymousRead:     !*requireAuth,
+		Upstream:          *upstream,
+		UpstreamToken:     e.getenv("REGISTRY_UPSTREAM_TOKEN"),
+		RedirectDownloads: redirect,
+		Version:           Version,
+		Logger:            log,
 	})
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {

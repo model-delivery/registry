@@ -541,16 +541,27 @@ func (r *Registry) DeleteRepo(ctx context.Context, name string) (GCResult, error
 	if err != nil {
 		return GCResult{}, err
 	}
-	return r.removeBlobs(ctx,
-		func(tx *sql.Tx) (*sql.Rows, error) {
-			return tx.QueryContext(ctx, `SELECT b.sha256, b.size FROM blobs b WHERE b.sha256 IN
-					(SELECT f.sha256 FROM files f JOIN commits c ON c.id = f.commit_id WHERE c.repo_id = ?)
-				AND NOT EXISTS
-					(SELECT 1 FROM files f JOIN commits c ON c.id = f.commit_id WHERE f.sha256 = b.sha256 AND c.repo_id <> ?)`,
-				repo.ID, repo.ID)
-		},
-		func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, "DELETE FROM repos WHERE id = ?", repo.ID)
-			return err
-		})
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return GCResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx,
+		`SELECT DISTINCT f.sha256 FROM files f JOIN commits c ON c.id = f.commit_id WHERE c.repo_id = ?`, repo.ID)
+	if err != nil {
+		return GCResult{}, err
+	}
+	digests, err := scanStrings(rows)
+	if err != nil {
+		return GCResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM repos WHERE id = ?", repo.ID); err != nil {
+		return GCResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GCResult{}, err
+	}
+	// The repository is gone. Free what it alone was holding; blobs another
+	// repository uses are still referenced and are skipped.
+	return r.dropUnreferenced(ctx, digests, r.stamp())
 }

@@ -29,6 +29,11 @@ type Config struct {
 	// arbitrary hosts.
 	Upstream      string
 	UpstreamToken string
+	// RedirectDownloads answers file requests with a redirect to a signed
+	// URL on the object store instead of streaming the bytes through the
+	// registry. It only has an effect when the storage backend can sign
+	// URLs, and clients must be able to reach the object store directly.
+	RedirectDownloads bool
 	// UpstreamClient overrides the HTTP client used to reach the upstream.
 	UpstreamClient *http.Client
 	Version        string

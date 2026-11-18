@@ -14,8 +14,10 @@ environment variable:
 export HF_ENDPOINT=http://localhost:8080
 ```
 
-It is one binary with no external services: metadata in SQLite, files on
-disk. It runs the same on a Raspberry Pi, a homelab box or a server.
+It is one binary. Out of the box it needs nothing else: metadata in SQLite,
+model files on disk. For larger deployments the model files can live in
+any S3-compatible bucket instead. It runs the same on a Raspberry Pi, a
+homelab box or a server.
 
 > **Status: early release.** The download path, mirroring, the CLI and the
 > web UI work and are tested against the real `huggingface_hub` library.
@@ -95,6 +97,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
 | **Version** | Every revision is immutable and addressed by id. Branches move, tags never do. |
 | **Verify** | Files are stored under the SHA-256 of their content and verified on the way in. Identical files are stored once, across revisions and repositories. |
+| **Store** | Local disk, or an S3-compatible object store. It uses the standard S3 API, so AWS S3, Cloudflare R2, Backblaze B2, Ceph and MinIO are expected to work; CI tests against SeaweedFS. With S3, downloads can be redirected to signed bucket URLs so the bytes never pass through the registry. |
 | **Control access** | Access tokens with read, write and admin roles. Downloads can be open or require a token. |
 | **Browse** | A small web UI lists repositories, revisions, files and storage use. |
 
@@ -136,8 +139,23 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | `--data` | `REGISTRY_DATA` | `./data` | Database and stored files |
 | `--upstream` | `REGISTRY_UPSTREAM` | `https://huggingface.co` | Hub to mirror from |
 | `--require-auth` | `REGISTRY_REQUIRE_AUTH` | `false` | Require a token for downloads and browsing too |
+| `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
 | | `REGISTRY_UPSTREAM_TOKEN` | | Default token for the upstream hub |
+
+**S3 storage.** Set `REGISTRY_STORAGE=s3` and:
+
+| Environment | |
+|---|---|
+| `REGISTRY_S3_BUCKET` | Required. The bucket must already exist. |
+| `REGISTRY_S3_ENDPOINT` | Service URL. Default `https://s3.amazonaws.com`. For other services, for example `https://<account>.r2.cloudflarestorage.com` or `http://seaweedfs:8333`. |
+| `REGISTRY_S3_REGION` | Region, when the service needs one. |
+| `REGISTRY_S3_ACCESS_KEY`, `REGISTRY_S3_SECRET_KEY` | Credentials. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are used if these are unset; with neither, the instance or pod role is used. |
+| `REGISTRY_S3_PREFIX` | Key prefix, to share a bucket. |
+| `REGISTRY_S3_REDIRECT` | `true` sends downloads to signed bucket URLs instead of streaming them through the registry. Clients must be able to reach the bucket. |
+
+Metadata stays in SQLite in the data directory, so keep that directory on a
+persistent disk and back it up. See [docs/operations.md](docs/operations.md#s3-storage).
 
 **Access.** Writing (push, mirror) always needs a token with the `write`
 role; deleting and managing tokens needs `admin`. By default anyone who can
@@ -181,10 +199,9 @@ Details, including the exact routes, are in
 
 ## What is not supported yet
 
-- **Storage is the local filesystem.** S3-compatible object storage is
-  planned; the storage layer is built for it but only the filesystem
-  backend exists.
-- **One server, one data directory.** No replication or high availability.
+- **One server.** Model files can be in S3, but metadata is a SQLite file
+  on the server's disk, so you run a single instance. No replication or
+  high availability yet.
 - **A mirror is a point-in-time copy.** Run `modelctl mirror` again to pick
   up a newer upstream revision. There is no automatic sync and no
   pull-through caching.
@@ -202,7 +219,7 @@ The [roadmap](docs/roadmap.md) says what is planned and in what order.
 
 One process serves three things: the Hugging Face compatible routes, its
 own REST API, and the web UI. Metadata is a SQLite database; file content
-is stored once per unique SHA-256. A revision is a list of
+is stored once per unique SHA-256, on disk or in a bucket. A revision is a list of
 `path -> digest` entries, so revisions that share files share storage. See
 [docs/architecture.md](docs/architecture.md).
 
@@ -215,6 +232,7 @@ commands:
 task build        # bin/modelctl
 task check        # format, vet, unit tests
 task test:e2e     # the huggingface_hub compatibility tests (needs Python)
+task test:s3      # storage and compatibility tests against a real S3 server (needs Docker)
 task docker       # container image
 ```
 

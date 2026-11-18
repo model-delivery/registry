@@ -65,10 +65,19 @@ func ValidateRefName(name string) error {
 	return nil
 }
 
-// ValidatePath checks a file path inside a repository.
+// ValidatePath checks a file path that is about to be recorded in a
+// revision. Paths already recorded are not checked again when they are
+// read, so a revision written before a rule was added stays readable.
 func ValidatePath(p string) error {
-	if p == "" || len(p) > 1024 || strings.ContainsAny(p, "\\\x00") {
+	if p == "" || len(p) > 1024 || strings.ContainsRune(p, '\\') {
 		return fmt.Errorf("%w: bad file path %q", ErrInvalid, p)
+	}
+	// Control characters: NUL, and the ones a terminal acts on (escape,
+	// newline, carriage return, backspace) when a listing prints the path.
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return fmt.Errorf("%w: file path %q contains a control character", ErrInvalid, p)
+		}
 	}
 	for _, seg := range strings.Split(p, "/") {
 		if seg == "" || seg == "." || seg == ".." {

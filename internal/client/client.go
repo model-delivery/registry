@@ -425,6 +425,11 @@ func (c *Client) download(ctx context.Context, rev Revision, f File, dst string)
 	}
 	if have < f.Size {
 		if err := c.fetchRange(ctx, rev, f, have, out, h); err != nil {
+			if errors.Is(err, errOversized) {
+				// Nothing of an answer like that is worth resuming from.
+				_ = out.Close()
+				_ = os.Remove(part)
+			}
 			return err
 		}
 	}
@@ -471,6 +476,20 @@ func (c *Client) fetchRange(ctx context.Context, rev Revision, f File, offset in
 	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
 		return errors.New("registry did not honour the resume request")
 	}
-	_, err = io.Copy(io.MultiWriter(out, h), resp.Body)
-	return err
+	// The registry said how large the file is. Take that much and one byte
+	// more: enough to tell that it is sending too much, without writing
+	// whatever it sends to disk until the disk is full.
+	want := f.Size - offset
+	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(resp.Body, want+1))
+	if err != nil {
+		return err
+	}
+	if n > want {
+		return fmt.Errorf("%w: it lists this file as %d bytes. The download was stopped and discarded; "+
+			"check that %s is the registry you meant, and run `modelctl verify` against it if it is yours", errOversized, f.Size, c.Endpoint)
+	}
+	return nil
 }
+
+// errOversized reports a download that kept going past the file's size.
+var errOversized = errors.New("the registry sent more data than the size it lists")

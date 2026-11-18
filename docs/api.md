@@ -110,7 +110,7 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 
 | Field | |
 |---|---|
-| `files` | Required. `path` and `sha256` for each file. Every file must already be uploaded. |
+| `files` | Required. `path` and `sha256` for each file. Every file must already be uploaded. A path uses `/` between segments, is at most 1024 bytes, and may not contain a backslash, a control character, or an empty, `.` or `..` segment. |
 | `branch` | Branch to move to the new revision. Default `main`. |
 | `tags` | Tags to create at the new revision. A tag that already exists at a different revision is refused with `409`. |
 | `message` | Free text. |

@@ -154,6 +154,101 @@ func TestCommitRules(t *testing.T) {
 	}
 }
 
+func TestValidatePath(t *testing.T) {
+	t.Parallel()
+	good := []string{"config.json", "tokenizer/vocab.txt", "weights (final).bin", "模型/权重.bin", "a b/c~d", strings.Repeat("p", 1024)}
+	for _, p := range good {
+		if err := ValidatePath(p); err != nil {
+			t.Errorf("%q refused: %v", p, err)
+		}
+	}
+	bad := map[string]string{
+		"empty":                  "",
+		"too long":               strings.Repeat("p", 1025),
+		"backslash":              `dir\file`,
+		"parent directory":       "../x",
+		"current directory":      "a/./b",
+		"empty segment":          "a//b",
+		"leading slash":          "/a",
+		"trailing slash":         "a/",
+		"NUL":                    "a\x00b",
+		"escape sequence":        "ok\x1b[2J\x1b[Hfake listing",
+		"newline":                "a\nb",
+		"carriage return":        "a\rb",
+		"tab":                    "a\tb",
+		"backspace":              "a\bb",
+		"bell, the lowest":       "\x07",
+		"unit separator, 0x1f":   "a\x1fb",
+		"delete, 0x7f":           "a\x7fb",
+		"control char in subdir": "dir\x1b/file",
+	}
+	for name, p := range bad {
+		if err := ValidatePath(p); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s (%q): got %v, want ErrInvalid", name, p, err)
+		}
+	}
+}
+
+// A path rule added later applies to what is written from then on. A
+// revision recorded before it, with a path the rule would refuse, must
+// still be listed, served, built on and deleted.
+func TestRevisionsWithPathsNowRefusedStayReadable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := open(t)
+	const odd = "notes\x1b[31m.txt" // accepted by v0.3.0
+	if err := ValidatePath(odd); err == nil {
+		t.Fatal("the path is supposed to be one that is refused today")
+	}
+	first, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Files: []File{file(t, r, "a.txt", "a")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put the file there the way an older version would have.
+	info := put(t, r, "odd")
+	if _, err := r.db.ExecContext(ctx, "INSERT INTO files (commit_id, path, size, sha256, git_oid, lfs) VALUES (?, ?, ?, ?, ?, 1)",
+		first.ID, odd, info.Size, info.SHA256, info.GitOID); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := r.Resolve(ctx, "acme/model", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := r.Files(ctx, c)
+	if err != nil || len(files) != 2 {
+		t.Fatalf("files = %+v, %v", files, err)
+	}
+	if f, err := r.File(ctx, c, odd); err != nil || f.SHA256 != info.SHA256 {
+		t.Fatalf("file = %+v, %v", f, err)
+	}
+	// A commit that adds to the branch carries the old path along.
+	second, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true, Files: []File{file(t, r, "b.txt", "b")}})
+	if err != nil {
+		t.Fatalf("building on the revision: %v", err)
+	}
+	if files, _ := r.Files(ctx, second); len(files) != 3 {
+		t.Fatalf("%d files after a merge commit, want 3", len(files))
+	}
+	// And it can be removed by name.
+	third, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true, Delete: []string{odd},
+		Files: []File{file(t, r, "c.txt", "c")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.File(ctx, third, odd); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("after deleting it: %v", err)
+	}
+	// Recording it anew is what the rule refuses.
+	if _, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true,
+		Files: []File{{Path: odd, SHA256: info.SHA256}}}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("recording the path again: got %v, want ErrInvalid", err)
+	}
+	if _, err := r.DeleteRepo(ctx, "acme/model"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestIdenticalPushIsNotANewRevision(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

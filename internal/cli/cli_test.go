@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/server"
+)
+
+type fixture struct {
+	url   string
+	admin string
+	reg   *registry.Registry
+}
+
+func newFixture(t *testing.T, upstream string) *fixture {
+	t.Helper()
+	reg, err := registry.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := reg.CreateToken(context.Background(), "admin", registry.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(reg, server.Config{AnonymousRead: true, Upstream: upstream}))
+	t.Cleanup(func() {
+		srv.Close()
+		_ = reg.Close()
+	})
+	return &fixture{url: srv.URL, admin: admin, reg: reg}
+}
+
+// run executes modelctl against the fixture and returns exit code, stdout
+// and stderr.
+func (f *fixture) run(t *testing.T, token string, args ...string) (int, string, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	env := map[string]string{"MODELCTL_ENDPOINT": f.url, "MODELCTL_TOKEN": token}
+	code := Run(context.Background(), args, &stdout, &stderr, func(k string) string { return env[k] })
+	return code, stdout.String(), stderr.String()
+}
+
+func modelDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for p, c := range map[string]string{"config.json": "{}", "sub/weights.bin": strings.Repeat("w", 4096)} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(p)), []byte(c), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func TestCommandsEndToEnd(t *testing.T) {
+	t.Parallel()
+	hub := newFixture(t, "")
+	f := newFixture(t, hub.url)
+	src := modelDir(t)
+
+	// Flags may come before or after the positional arguments.
+	code, out, errOut := f.run(t, f.admin, "push", src, "acme/tiny", "--tag", "v1", "--message", "first")
+	if code != 0 || !strings.Contains(out, "Pushed acme/tiny at revision ") {
+		t.Fatalf("push: code %d\n%s\n%s", code, out, errOut)
+	}
+	if !strings.Contains(errOut, "uploaded") {
+		t.Errorf("push progress missing: %s", errOut)
+	}
+
+	code, out, _ = f.run(t, "", "list")
+	if code != 0 || !strings.Contains(out, "acme/tiny") || !strings.Contains(out, "REPOSITORY") {
+		t.Fatalf("list: code %d\n%s", code, out)
+	}
+
+	code, out, _ = f.run(t, "", "list", "--json")
+	var listing struct {
+		Repos []struct {
+			Name      string `json:"name"`
+			Revisions int    `json:"revisions"`
+		} `json:"repos"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &listing) != nil || len(listing.Repos) != 1 || listing.Repos[0].Revisions != 1 {
+		t.Fatalf("list --json: code %d\n%s", code, out)
+	}
+
+	code, out, _ = f.run(t, "", "inspect", "acme/tiny", "--revision", "v1")
+	for _, want := range []string{"main", "v1", "tag", "sub/weights.bin", "config.json"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q:\n%s", want, out)
+		}
+	}
+	if code != 0 {
+		t.Fatalf("inspect: code %d", code)
+	}
+
+	dst := filepath.Join(t.TempDir(), "out")
+	code, out, errOut = f.run(t, "", "pull", "--dir", dst, "acme/tiny")
+	if code != 0 || !strings.Contains(out, "2 files verified") {
+		t.Fatalf("pull: code %d\n%s\n%s", code, out, errOut)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "sub", "weights.bin"))
+	if err != nil || len(got) != 4096 {
+		t.Fatalf("pulled file wrong: %v", err)
+	}
+
+	// Mirror from the other registry, which plays the upstream hub.
+	if code, _, errOut := hub.run(t, hub.admin, "push", src, "upstream/model"); code != 0 {
+		t.Fatalf("seed upstream: %s", errOut)
+	}
+	code, out, errOut = f.run(t, f.admin, "mirror", "upstream/model")
+	if code != 0 || !strings.Contains(out, "Mirrored upstream/model at revision ") || !strings.Contains(out, "2 files verified") {
+		t.Fatalf("mirror: code %d\n%s\n%s", code, out, errOut)
+	}
+	// Same content as acme/tiny, so nothing had to be downloaded.
+	if !strings.Contains(out, "0 B downloaded") {
+		t.Errorf("mirror re-downloaded content the registry already had:\n%s", out)
+	}
+
+	code, out, _ = f.run(t, f.admin, "delete", "acme/tiny", "--yes")
+	if code != 0 || !strings.Contains(out, "Deleted acme/tiny") {
+		t.Fatalf("delete: code %d\n%s", code, out)
+	}
+	if _, err := f.reg.GetRepo(context.Background(), "acme/tiny"); err == nil {
+		t.Fatal("repository still exists after delete")
+	}
+}
+
+func TestErrorsAreActionable(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, "")
+	src := modelDir(t)
+
+	tests := []struct {
+		name     string
+		token    string
+		args     []string
+		wantCode int
+		wantErr  string
+	}{
+		{"no command", "", nil, 2, "modelctl mirror"},
+		{"unknown command", "", []string{"frobnicate"}, 2, `unknown command "frobnicate"`},
+		{"unknown flag", "", []string{"list", "--nope"}, 2, "flag provided but not defined"},
+		{"missing argument", "", []string{"pull"}, 2, "expected 1 argument"},
+		{"push without token", "", []string{"push", src, "acme/tiny"}, 1, "MODELCTL_TOKEN"},
+		{"push of a non-directory", f.admin, []string{"push", filepath.Join(src, "config.json"), "acme/tiny"}, 2, "is not a directory"},
+		{"push to a bad name", f.admin, []string{"push", src, "nonamespace"}, 2, "namespace/name"},
+		{"pull of unknown repository", "", []string{"pull", "acme/absent"}, 1, "repository not found"},
+		{"inspect unknown revision", "", []string{"inspect", "acme/absent", "--revision", "x"}, 1, "repository not found"},
+		{"delete needs confirmation", f.admin, []string{"delete", "acme/tiny"}, 2, "--yes"},
+		{"delete without admin", "", []string{"delete", "acme/tiny", "--yes"}, 1, "MODELCTL_TOKEN"},
+		{"token needs a subcommand", f.admin, []string{"token"}, 2, "create, list or revoke"},
+		{"token with a bad role", f.admin, []string{"token", "create", "x", "--role", "root"}, 1, "read, write or admin"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, errOut := f.run(t, tc.token, tc.args...)
+			if code != tc.wantCode || !strings.Contains(errOut, tc.wantErr) {
+				t.Fatalf("code %d (want %d), stderr:\n%s\nwant it to mention %q", code, tc.wantCode, errOut, tc.wantErr)
+			}
+		})
+	}
+
+	t.Run("unreachable registry", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		env := map[string]string{"MODELCTL_ENDPOINT": "http://127.0.0.1:1"}
+		code := Run(context.Background(), []string{"list"}, &stdout, &stderr, func(k string) string { return env[k] })
+		if code != 1 || !strings.Contains(stderr.String(), "cannot reach the registry at http://127.0.0.1:1") {
+			t.Fatalf("code %d: %s", code, stderr.String())
+		}
+	})
+}
+
+func TestTokenLifecycle(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, "")
+	code, out, errOut := f.run(t, f.admin, "token", "create", "ci", "--role", "write")
+	secret := strings.TrimSpace(out)
+	if code != 0 || !strings.HasPrefix(secret, "md_") {
+		t.Fatalf("token create: code %d out %q err %q", code, out, errOut)
+	}
+	// Only the secret goes to stdout, so it can be captured by a script.
+	if strings.ContainsAny(secret, " \n") {
+		t.Fatalf("stdout carries more than the token: %q", out)
+	}
+
+	if code, _, errOut := f.run(t, secret, "push", modelDir(t), "acme/tiny"); code != 0 {
+		t.Fatalf("new write token cannot push: %s", errOut)
+	}
+	code, out, _ = f.run(t, f.admin, "token", "list")
+	if code != 0 || !strings.Contains(out, "ci") || strings.Contains(out, secret) {
+		t.Fatalf("token list: code %d\n%s", code, out)
+	}
+	if code, _, errOut := f.run(t, f.admin, "token", "revoke", "ci"); code != 0 {
+		t.Fatalf("token revoke: %s", errOut)
+	}
+	if code, _, _ := f.run(t, secret, "push", modelDir(t), "acme/other"); code == 0 {
+		t.Fatal("revoked token can still push")
+	}
+}
+
+// syncBuffer lets the test read what the server logs while it runs.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestServeFirstStartAndRestart(t *testing.T) {
+	t.Parallel()
+	data := t.TempDir()
+	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
+	tokenRe := regexp.MustCompile(`md_[0-9a-f]{48}`)
+
+	serve := func(env map[string]string) (logs *syncBuffer, addr string, stop func() int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		logs = &syncBuffer{}
+		done := make(chan int, 1)
+		go func() {
+			done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
+				func(k string) string { return env[k] })
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for addr == "" {
+			if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
+				addr = m[1]
+				break
+			}
+			select {
+			case code := <-done:
+				t.Fatalf("serve exited early with code %d:\n%s", code, logs.String())
+			case <-time.After(20 * time.Millisecond):
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("serve did not start:\n%s", logs.String())
+			}
+		}
+		return logs, addr, func() int {
+			cancel()
+			return <-done
+		}
+	}
+	status := func(addr, path, token string) int {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// First start mints an admin token and prints it.
+	logs, addr, stop := serve(nil)
+	token := tokenRe.FindString(logs.String())
+	if token == "" {
+		t.Fatalf("first start printed no admin token:\n%s", logs.String())
+	}
+	if got := status(addr, "/healthz", ""); got != 200 {
+		t.Fatalf("healthz = %d", got)
+	}
+	if got := status(addr, "/api/v1/tokens", token); got != 200 {
+		t.Fatalf("printed admin token was refused: %d", got)
+	}
+	if code := stop(); code != 0 {
+		t.Fatalf("serve exit code %d:\n%s", code, logs.String())
+	}
+
+	// A restart keeps the token and prints no new one.
+	logs, addr, stop = serve(nil)
+	if tokenRe.MatchString(logs.String()) {
+		t.Fatal("restart printed a token again")
+	}
+	if got := status(addr, "/api/v1/tokens", token); got != 200 {
+		t.Fatalf("admin token did not survive a restart: %d", got)
+	}
+	stop()
+
+	// An operator-supplied admin token takes effect, and is not logged.
+	const supplied = "md_operator_supplied_admin_token"
+	logs, addr, stop = serve(map[string]string{"REGISTRY_ADMIN_TOKEN": supplied, "REGISTRY_REQUIRE_AUTH": "true"})
+	if strings.Contains(logs.String(), supplied) {
+		t.Fatal("supplied admin token was written to the log")
+	}
+	if got := status(addr, "/api/v1/tokens", supplied); got != 200 {
+		t.Fatalf("supplied admin token refused: %d", got)
+	}
+	if got := status(addr, "/api/v1/repos", ""); got != 401 {
+		t.Fatalf("REGISTRY_REQUIRE_AUTH did not close anonymous reads: %d", got)
+	}
+	stop()
+}

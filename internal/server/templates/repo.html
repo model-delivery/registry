@@ -1,0 +1,58 @@
+{{define "content"}}
+{{$host := .Host}}{{$admin := .IsAdmin}}
+{{with .Data}}
+{{$repo := .Repo.Name}}{{$sha := .Commit.SHA}}{{$names := .RefNames}}
+<h1>{{$repo}}</h1>
+<p class="meta">
+  {{if .Repo.Upstream}}Mirror of <a href="{{.Repo.Upstream}}/{{$repo}}" rel="noreferrer">{{.Repo.Upstream}}/{{$repo}}</a>{{else}}Pushed to this registry{{end}}
+  {{if .Pipeline}} · {{.Pipeline}}{{end}}{{if .Library}} · {{.Library}}{{end}}{{if .License}} · license {{.License}}{{end}}
+</p>
+
+<h2>Download</h2>
+<pre>export HF_ENDPOINT={{$host}}
+hf download {{$repo}} --revision {{$sha}}</pre>
+<p class="hint">Any tool built on <code>huggingface_hub</code> works the same way. The revision id pins exactly these files.</p>
+
+<h2>Files in <code title="{{$sha}}">{{short $sha}}</code>{{range index $names $sha}} <span class="tag">{{.}}</span>{{end}}</h2>
+<p class="meta">{{len .Files}} files · {{bytes .Total}} · {{.Commit.Source}}ed {{date .Commit.CreatedAt}}</p>
+<table>
+  <thead><tr><th>Path</th><th class="num">Size</th><th>SHA-256</th></tr></thead>
+  <tbody>
+  {{range .Files}}
+  <tr>
+    <td><a href="{{fileURL $repo $sha .Path}}">{{.Path}}</a></td>
+    <td class="num">{{bytes .Size}}</td>
+    <td><code title="{{.SHA256}}">{{short .SHA256}}</code></td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+
+<h2>Revisions</h2>
+<table>
+  <thead><tr><th>Revision</th><th>Names</th><th>Source</th><th class="num">Files</th><th class="num">Size</th><th>Stored</th></tr></thead>
+  <tbody>
+  {{range .Repo.Revisions}}
+  <tr{{if eq .SHA $sha}} class="current"{{end}}>
+    <td><a href="?rev={{.SHA}}"><code title="{{.SHA}}">{{short .SHA}}</code></a></td>
+    <td>{{range index $names .SHA}}<span class="tag">{{.}}</span> {{end}}</td>
+    <td>{{.Source}}</td>
+    <td class="num">{{.Files}}</td>
+    <td class="num">{{bytes .Bytes}}</td>
+    <td title="{{date .CreatedAt}}">{{ago .CreatedAt}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+
+{{if $admin}}
+<h2>Delete repository</h2>
+<form class="danger" method="post" action="{{repoURL $repo}}/delete">
+  <p>Removes every revision of <strong>{{$repo}}</strong> and frees files no other repository uses. This cannot be undone.</p>
+  <label for="confirm">Type the repository name to confirm</label>
+  <input id="confirm" name="confirm" autocomplete="off" required placeholder="{{$repo}}">
+  <button>Delete repository</button>
+</form>
+{{end}}
+{{end}}
+{{end}}

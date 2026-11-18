@@ -1,0 +1,21 @@
+# Single-node registry. Start with: docker compose up -d
+# Then read the admin token from the first lines of: docker compose logs registry
+services:
+  registry:
+    image: ghcr.io/model-delivery/registry:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - registry-data:/data
+    environment:
+      # Require a token for downloads and browsing too (default: only for writes).
+      REGISTRY_REQUIRE_AUTH: "false"
+      # Set your own admin token instead of reading a generated one from the log.
+      # REGISTRY_ADMIN_TOKEN: "change-me-to-a-long-random-string"
+      # Token for the upstream hub, for mirroring private or gated repositories.
+      # REGISTRY_UPSTREAM_TOKEN: "hf_..."
+
+volumes:
+  registry-data:

@@ -1,0 +1,15 @@
+# Build output
+/bin/
+/dist/
+*.exe
+
+# Local registry data
+/data/
+
+# Scratch space for reports and drafts
+/tmp/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

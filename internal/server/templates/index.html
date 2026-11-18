@@ -1,0 +1,35 @@
+{{define "content"}}
+{{with .Data}}
+<dl class="stats">
+  <div><dt>Repositories</dt><dd>{{.Stats.Repos}}</dd></div>
+  <div><dt>Revisions</dt><dd>{{.Stats.Revisions}}</dd></div>
+  <div><dt>On disk</dt><dd>{{bytes .Stats.StoredBytes}}</dd></div>
+  <div><dt>Saved by deduplication</dt><dd>{{bytes .Saved}}</dd></div>
+</dl>
+
+{{if .Repos}}
+<table>
+  <thead><tr><th>Repository</th><th>Source</th><th class="num">Revisions</th><th class="num">Size</th><th>Updated</th></tr></thead>
+  <tbody>
+  {{range .Repos}}
+  <tr>
+    <td><a href="{{repoURL .Name}}">{{.Name}}</a></td>
+    <td>{{if .Upstream}}Mirror of {{.Upstream}}{{else}}Pushed here{{end}}</td>
+    <td class="num">{{.Revisions}}</td>
+    <td class="num">{{bytes .StoredBytes}}</td>
+    <td title="{{date .UpdatedAt}}">{{ago .UpdatedAt}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<section class="empty">
+  <h1>No models yet</h1>
+  <p>Mirror one from Hugging Face, or push a directory of your own:</p>
+<pre>modelctl mirror openai-community/gpt2
+modelctl push ./my-model my-team/my-model</pre>
+  <p>Both need a token with write access. Set it once with <code>MODELCTL_TOKEN</code>.</p>
+</section>
+{{end}}
+{{end}}
+{{end}}

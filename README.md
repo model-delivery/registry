@@ -144,6 +144,8 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
+| | `REGISTRY_ADMIN_TOKEN_FILE` | | Read the admin token from this file (a mounted secret) |
+| `--require-admin-token` | `REGISTRY_REQUIRE_ADMIN_TOKEN` | `false` | Refuse to start without a supplied admin token instead of generating one and printing it. Use on Kubernetes and anywhere logs are collected |
 | | `REGISTRY_UPSTREAM_TOKEN` | | Default token for the upstream hub |
 
 **S3 storage.** Set `REGISTRY_STORAGE=s3` and:

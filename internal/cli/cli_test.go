@@ -416,3 +416,141 @@ func TestServeFirstStartAndRestart(t *testing.T) {
 	}
 	stop()
 }
+
+// runServe starts `modelctl serve` on a free port and returns its log, the
+// address it listens on ("" if it exited instead) and a function that stops
+// it and returns the exit code.
+func runServe(t *testing.T, data string, env map[string]string) (logs *syncBuffer, addr string, stop func() int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	logs = &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
+			func(k string) string { return env[k] })
+	}()
+	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
+			return logs, m[1], func() int { cancel(); return <-done }
+		}
+		select {
+		case code := <-done:
+			cancel()
+			return logs, "", func() int { return code }
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("serve neither started nor exited:\n%s", logs.String())
+		}
+	}
+}
+
+func httpStatus(t *testing.T, addr, path, token string) int {
+	t.Helper()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+// On a platform that collects logs, the admin token is supplied, usually
+// from a mounted secret, and must never be generated and printed.
+func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
+	t.Parallel()
+	generated := regexp.MustCompile(`md_[0-9a-f]{48}`)
+	const supplied = "md_token_from_a_mounted_secret_file"
+	secretFile := func(t *testing.T, content string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "admin-token")
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("token read from a file, as a mounted secret provides it", func(t *testing.T) {
+		t.Parallel()
+		// Secret files end with a newline; it is not part of the token.
+		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied+"\n")})
+		if addr == "" {
+			t.Fatalf("serve did not start:\n%s", logs.String())
+		}
+		defer stop()
+		if got := httpStatus(t, addr, "/api/v1/tokens", supplied); got != http.StatusOK {
+			t.Fatalf("token from the file was refused: %d", got)
+		}
+		if strings.Contains(logs.String(), supplied) || generated.MatchString(logs.String()) {
+			t.Fatalf("a token was written to the log:\n%s", logs.String())
+		}
+	})
+
+	t.Run("required but not supplied: refuses to start and prints no token", func(t *testing.T) {
+		t.Parallel()
+		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
+		if code := stop(); addr != "" || code == 0 {
+			t.Fatalf("serve started (addr %q, exit %d) without an admin token", addr, code)
+		}
+		if generated.MatchString(logs.String()) {
+			t.Fatalf("a token was generated and printed although one was required:\n%s", logs.String())
+		}
+		if !strings.Contains(logs.String(), "REGISTRY_ADMIN_TOKEN_FILE") {
+			t.Fatalf("the error does not say how to supply one:\n%s", logs.String())
+		}
+	})
+
+	t.Run("required and supplied: starts", func(t *testing.T) {
+		t.Parallel()
+		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{
+			"REGISTRY_REQUIRE_ADMIN_TOKEN": "true", "REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied),
+		})
+		if addr == "" {
+			t.Fatalf("serve did not start:\n%s", logs.String())
+		}
+		stop()
+	})
+
+	t.Run("required, nothing supplied, but tokens exist from an earlier run: starts", func(t *testing.T) {
+		t.Parallel()
+		data := t.TempDir()
+		_, addr, stop := runServe(t, data, map[string]string{"REGISTRY_ADMIN_TOKEN": supplied})
+		if addr == "" {
+			t.Fatal("first run did not start")
+		}
+		stop()
+		logs, addr, stop := runServe(t, data, map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
+		if addr == "" {
+			t.Fatalf("restart refused although an admin token already exists:\n%s", logs.String())
+		}
+		defer stop()
+		if got := httpStatus(t, addr, "/api/v1/tokens", supplied); got != http.StatusOK {
+			t.Fatalf("existing admin token refused after restart: %d", got)
+		}
+	})
+
+	for name, env := range map[string]map[string]string{
+		"both the variable and the file": {"REGISTRY_ADMIN_TOKEN": supplied, "REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied)},
+		"an empty file":                  {"REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, "\n")},
+		"a file that does not exist":     {"REGISTRY_ADMIN_TOKEN_FILE": filepath.Join(t.TempDir(), "absent")},
+		"a token that is too short":      {"REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, "short")},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			t.Parallel()
+			logs, addr, stop := runServe(t, t.TempDir(), env)
+			if code := stop(); addr != "" || code == 0 {
+				t.Fatalf("serve started (addr %q, exit %d)", addr, code)
+			}
+			if strings.Contains(logs.String(), supplied) || generated.MatchString(logs.String()) {
+				t.Fatalf("a token was written to the log:\n%s", logs.String())
+			}
+		})
+	}
+}

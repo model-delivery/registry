@@ -91,6 +91,41 @@ restarting rotates it.
 If you lose every admin token, start the server once with
 `REGISTRY_ADMIN_TOKEN` set.
 
+### On Kubernetes, or anywhere logs are collected
+
+Do not let the registry print a token there: the first-start message would
+put an admin credential in your log store. Supply the token and forbid
+generating one:
+
+- `REGISTRY_ADMIN_TOKEN_FILE=/path/to/file` reads the token from a file,
+  which is how a mounted secret arrives. A trailing newline is ignored.
+  `REGISTRY_ADMIN_TOKEN` does the same from an environment variable; set
+  one or the other, not both.
+- `REGISTRY_REQUIRE_ADMIN_TOKEN=true` makes the server exit with an error
+  if it has no tokens and none was supplied, instead of creating one and
+  printing it. With it set, a deployment that forgot the secret fails to
+  start rather than leaking a credential.
+
+```yaml
+env:
+  - name: REGISTRY_REQUIRE_ADMIN_TOKEN
+    value: "true"
+  - name: REGISTRY_ADMIN_TOKEN_FILE
+    value: /run/secrets/registry/admin-token
+volumeMounts:
+  - name: registry-admin
+    mountPath: /run/secrets/registry
+    readOnly: true
+```
+
+The supplied token is applied at every start, so changing the secret and
+restarting the pod rotates it. The log records that a token was applied
+and where it came from, never its value.
+
+If a registry was ever started on such a platform without these, the
+token it printed is in your logs: treat it as exposed, supply a new one
+as above and restart, which replaces it.
+
 Create narrower tokens for day-to-day use:
 
 ```bash

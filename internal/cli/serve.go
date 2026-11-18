@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -27,6 +28,7 @@ func cmdServe(e *env, args []string) error {
 	data := c.String("data", e.envOr("REGISTRY_DATA", "./data"), "directory for the database and stored files (env REGISTRY_DATA)")
 	upstream := c.String("upstream", e.envOr("REGISTRY_UPSTREAM", mirror.DefaultEndpoint), "hub to mirror from (env REGISTRY_UPSTREAM)")
 	requireAuth := c.Bool("require-auth", envBool(e, "REGISTRY_REQUIRE_AUTH"), "require a token for downloads and browsing too (env REGISTRY_REQUIRE_AUTH)")
+	requireAdmin := c.Bool("require-admin-token", envBool(e, "REGISTRY_REQUIRE_ADMIN_TOKEN"), "refuse to start without a supplied admin token instead of generating one and printing it (env REGISTRY_REQUIRE_ADMIN_TOKEN); use where logs are collected")
 	pullThrough := c.Bool("pull-through", envBool(e, "REGISTRY_PULL_THROUGH"), "fetch a model from the upstream hub the first time a client asks for one the registry does not hold (env REGISTRY_PULL_THROUGH); limit which with REGISTRY_PULL_THROUGH_ALLOW")
 	storage := c.String("storage", e.envOr("REGISTRY_STORAGE", "filesystem"), "where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with REGISTRY_S3_* variables")
 	if _, err := c.parse(args, 0, 0); err != nil {
@@ -68,7 +70,7 @@ func cmdServe(e *env, args []string) error {
 	}
 	defer func() { _ = reg.Close() }()
 
-	if err := bootstrapAdmin(e, reg, log); err != nil {
+	if err := bootstrapAdmin(e, reg, log, *requireAdmin); err != nil {
 		return err
 	}
 
@@ -131,13 +133,33 @@ func envBool(e *env, key string) bool {
 // bootstrapAdmin makes sure someone can administer the registry. A token in
 // REGISTRY_ADMIN_TOKEN is applied on every start; otherwise a fresh
 // registry mints one and prints it once.
-func bootstrapAdmin(e *env, reg *registry.Registry, log *slog.Logger) error {
+//
+// Where logs are collected (a container platform), printing a token puts a
+// credential in the log store. There, supply the token (from a mounted
+// secret with REGISTRY_ADMIN_TOKEN_FILE, or from REGISTRY_ADMIN_TOKEN) and
+// set requireSupplied, which refuses to start rather than mint and print.
+func bootstrapAdmin(e *env, reg *registry.Registry, log *slog.Logger, requireSupplied bool) error {
 	ctx := e.ctx
-	if secret := e.getenv("REGISTRY_ADMIN_TOKEN"); secret != "" {
-		if err := reg.SetToken(ctx, "admin", registry.RoleAdmin, secret, true); err != nil {
-			return fmt.Errorf("apply REGISTRY_ADMIN_TOKEN: %w", err)
+	secret, source := e.getenv("REGISTRY_ADMIN_TOKEN"), "REGISTRY_ADMIN_TOKEN"
+	if file := e.getenv("REGISTRY_ADMIN_TOKEN_FILE"); file != "" {
+		if secret != "" {
+			return usagef("set REGISTRY_ADMIN_TOKEN or REGISTRY_ADMIN_TOKEN_FILE, not both")
 		}
-		log.Info("admin token set from REGISTRY_ADMIN_TOKEN")
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("read REGISTRY_ADMIN_TOKEN_FILE: %w", err)
+		}
+		// Secret files usually end with a newline; it is not part of the token.
+		secret, source = strings.TrimSpace(string(raw)), "REGISTRY_ADMIN_TOKEN_FILE"
+		if secret == "" {
+			return fmt.Errorf("REGISTRY_ADMIN_TOKEN_FILE %s is empty", file)
+		}
+	}
+	if secret != "" {
+		if err := reg.SetToken(ctx, "admin", registry.RoleAdmin, secret, true); err != nil {
+			return fmt.Errorf("apply %s: %w", source, err)
+		}
+		log.Info("admin token set from " + source)
 		return nil
 	}
 	toks, err := reg.ListTokens(ctx)
@@ -147,7 +169,10 @@ func bootstrapAdmin(e *env, reg *registry.Registry, log *slog.Logger) error {
 	if len(toks) > 0 {
 		return nil
 	}
-	secret, err := reg.CreateToken(ctx, "admin", registry.RoleAdmin)
+	if requireSupplied {
+		return usagef("this registry has no access tokens and none was supplied: set REGISTRY_ADMIN_TOKEN_FILE or REGISTRY_ADMIN_TOKEN (REGISTRY_REQUIRE_ADMIN_TOKEN is on, so one will not be generated and printed)")
+	}
+	secret, err = reg.CreateToken(ctx, "admin", registry.RoleAdmin)
 	if err != nil {
 		return err
 	}

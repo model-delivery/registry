@@ -604,6 +604,7 @@ small, and is held to that:
 | A commit from a Hugging Face client (`hf upload`, `create_commit`) | 4 GiB for the whole request, which carries only the files of 10 MiB or less; larger files travel separately and are not counted. |
 | A JSON request to the API | 64 MiB, and the body must arrive within 30 seconds. |
 | A web UI form | 64 KiB, and the body must arrive within 30 seconds. |
+| Any other request that announces a body (one to a route that reads none, or that is refused) | The server waits at most 30 seconds for it, then answers and closes the connection. |
 
 `REGISTRY_MAX_BLOB_BYTES` applies to every way of uploading: `modelctl
 push`, `PUT /api/v1/blobs`, and both the small-file and large-file paths of

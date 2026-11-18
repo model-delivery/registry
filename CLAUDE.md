@@ -66,7 +66,25 @@ Docker; the only place multipart uploads are exercised), `task build`,
 - **Stream, never buffer.** Model files are many gigabytes. No
   `io.ReadAll` on file content, in the server or the client.
 - **The upstream host comes from server configuration only**, never from a
-  request.
+  request. What the upstream answers is trusted less than its address:
+  every upstream request goes through `Upstream.get`, which follows
+  redirects itself, sends the token only to the configured origin, and
+  refuses hops to local and private addresses (`internal/mirror/guard.go`).
+  Do not let an `http.Client` follow upstream redirects by itself, and do
+  not put an upstream response body in an error.
+- **Pull-through never adds to a repository created here.** It goes
+  upstream only for a repository that is absent or whose `upstream` field
+  is set; `Server.resolve` checks, and `CommitLazy` checks again inside
+  its transaction (`OnlyFromUpstream`). A stored blob is matched by git
+  blob id only through `FindMirroredBlob`.
+- **Small request bodies are read with `Server.readJSON` or
+  `Server.formValue`**, which bound their size and the time the client has
+  to send them. Blob and file transfers are deliberately unbounded in
+  time, and `isFileTransfer` (`limits.go`) is the list of them: every
+  other request that announces a body gets a read deadline. A new route
+  whose body is model content must be added there, or slow uploads to it
+  are cut off; `TestFileTransfersHaveNoBodyDeadline` is where to add the
+  case.
 - **Every route declares the role it needs** via `Server.need`. A new route
   without it is a bug; `TestAccessControl` is where to add the case.
 - **Compatibility claims need a real-client test.** If the README or

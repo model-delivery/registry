@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,46 @@ func (s *Server) bodyTimeout() time.Duration {
 		return s.cfg.BodyTimeout
 	}
 	return defaultBodyTimeout
+}
+
+// guardBodies gives every request that announces a body the body timeout
+// to send it, unless the request is a file transfer.
+//
+// The handlers that read a small body set this deadline themselves, and
+// lift it (smallBody). This covers the rest: a route that reads no body, a
+// request that is refused before its handler runs, a path that does not
+// exist. The HTTP server reads what is left of a request body before it
+// answers, so without a deadline a client that announces a body and never
+// sends it holds its connection for as long as it likes, on any route and
+// without a token. With one, that read gives up and the connection is
+// closed after the answer.
+//
+// A request without a body is left alone: downloads and other long
+// responses are not timed.
+func (s *Server) guardBodies(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength != 0 && !isFileTransfer(r) {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.bodyTimeout()))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isFileTransfer reports whether r is one of the requests whose body is
+// model content and may take as long as it takes: an upload of one file
+// (both upload routes are PUT, and nothing small is sent with PUT), or a
+// Hugging Face commit, which carries an upload's small files.
+func isFileTransfer(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodPut:
+		return true
+	case http.MethodPost:
+		// Parsed the way hfModels parses it: {ns}/{name}/commit/{rev}.
+		rest, under := strings.CutPrefix(r.URL.EscapedPath(), "/api/models/")
+		segs, ok := splitPath(rest)
+		return under && ok && len(segs) == 4 && segs[2] == "commit"
+	}
+	return false
 }
 
 // smallBody runs read on the request body, which may be at most limit

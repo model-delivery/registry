@@ -148,7 +148,7 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 
 	// Browsers may only make state-changing requests from our own pages.
 	// Non-browser clients (the CLI, Python libraries) are unaffected.
-	return http.NewCrossOriginProtection().Handler(mux)
+	return s.guardBodies(http.NewCrossOriginProtection().Handler(mux))
 }
 
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {

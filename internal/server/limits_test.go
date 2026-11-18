@@ -272,6 +272,124 @@ func TestSmallBodiesHaveADeadline(t *testing.T) {
 	}
 }
 
+// The same holds on routes that read no body at all, for a request that is
+// refused before its handler runs, and for a path that does not exist: the
+// server would otherwise wait for the announced body before answering.
+func TestAnnouncedBodiesHaveADeadlineOnEveryRoute(t *testing.T) {
+	t.Parallel()
+	open := start(t, server.Config{AnonymousRead: true, BodyTimeout: 200 * time.Millisecond})
+	private := start(t, server.Config{AnonymousRead: false, BodyTimeout: 200 * time.Millisecond})
+	tests := []struct {
+		name   string
+		in     *instance
+		method string
+		path   string
+		header string
+		want   int
+	}{
+		{"a page", open, http.MethodGet, "/", "", http.StatusOK},
+		{"a route that takes no body", open, http.MethodPost, "/ui/logout", "", http.StatusSeeOther},
+		{"a Hugging Face route that ignores its body", open, http.MethodPost, "/api/validate-yaml", "", http.StatusOK},
+		{"a path that does not exist", open, http.MethodPost, "/no/such/path/at/all/here", "", http.StatusNotFound},
+		{"an API route that is not implemented", open, http.MethodPost, "/api/something-else", "", http.StatusNotFound},
+		{"a request refused for lack of a token", private, http.MethodDelete, "/api/v1/repos/acme/tiny", "", http.StatusUnauthorized},
+		{"a request refused as cross-site", open, http.MethodPost, "/api/v1/gc", "Sec-Fetch-Site: cross-site\r\n", http.StatusForbidden},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn, err := net.Dial("tcp", strings.TrimPrefix(tc.in.url, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			// Announce a body and never send it.
+			fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: registry\r\n%sContent-Length: 200\r\n\r\n", tc.method, tc.path, tc.header)
+			started := time.Now()
+			_ = conn.SetReadDeadline(started.Add(20 * time.Second))
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("no answer to a request that never sent its body: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status %d, want %d", resp.StatusCode, tc.want)
+			}
+			if took := time.Since(started); took > 10*time.Second {
+				t.Fatalf("answered after %s; the deadline is 200ms", took)
+			}
+		})
+	}
+}
+
+// slowly sends content in two halves with a pause between them that is
+// several body deadlines long, and hides its length.
+type slowly struct {
+	content string
+	pause   time.Duration
+	sent    int
+}
+
+func (s *slowly) Read(p []byte) (int, error) {
+	half := len(s.content) / 2
+	switch {
+	case s.sent >= len(s.content):
+		return 0, io.EOF
+	case s.sent == half:
+		time.Sleep(s.pause)
+		n := copy(p, s.content[half:])
+		s.sent += n
+		return n, nil
+	default:
+		n := copy(p, s.content[s.sent:half])
+		s.sent += n
+		return n, nil
+	}
+}
+
+// File transfers are not timed, however slow: an upload of a large file
+// over a slow link takes as long as it takes.
+func TestFileTransfersHaveNoBodyDeadline(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in := start(t, server.Config{AnonymousRead: true, BodyTimeout: 100 * time.Millisecond})
+	const pause = 600 * time.Millisecond
+	stored := func(c string) bool {
+		_, ok, _ := in.reg.StatBlob(ctx, sha(c))
+		return ok
+	}
+
+	t.Run("an upload through the registry API", func(t *testing.T) {
+		t.Parallel()
+		content := strings.Repeat("slow push ", 1000)
+		resp := do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(content), in.write, &slowly{content: content, pause: pause}, nil)
+		if resp.StatusCode != http.StatusCreated || !stored(content) {
+			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
+		}
+	})
+	t.Run("a large-file upload from a Hugging Face client", func(t *testing.T) {
+		t.Parallel()
+		content := strings.Repeat("slow large file ", 1000)
+		href := batch(t, in, "acme/slow", content)[sha(content)]
+		resp := do(t, http.MethodPut, href, "", &slowly{content: content, pause: pause}, nil)
+		if resp.StatusCode != http.StatusOK || !stored(content) {
+			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
+		}
+	})
+	t.Run("a commit carrying files, to a branch with a slash in its name", func(t *testing.T) {
+		t.Parallel()
+		lines := commitBody(t, header("slow", ""), inlineFile("a.txt", strings.Repeat("a", 5000)), inlineFile("b.txt", strings.Repeat("b", 5000)))
+		raw, _ := io.ReadAll(lines)
+		for _, branch := range []string{"main", "refs%2Fpr%2F1"} {
+			resp := do(t, http.MethodPost, in.url+"/api/models/acme/slow-commit/commit/"+branch, in.write,
+				&slowly{content: string(raw), pause: pause}, map[string]string{"Content-Type": "application/x-ndjson"})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s: status %d (%s)", branch, resp.StatusCode, body(t, resp))
+			}
+		}
+	})
+}
+
 // The deadline is for the request body only. A response that takes longer
 // than it, such as a mirror's progress stream, is not cut short.
 func TestBodyDeadlineDoesNotCutALongResponse(t *testing.T) {

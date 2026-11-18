@@ -20,6 +20,9 @@ RUN mkdir /out/data
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/modelctl /modelctl
 COPY --from=build --chown=65532:65532 /out/data /data
+LABEL org.opencontainers.image.vendor="Spectrum Labs LLC"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.source="https://github.com/model-delivery/registry"
 ENV REGISTRY_DATA=/data
 VOLUME /data
 USER nonroot:nonroot

@@ -1,3 +1,4 @@
+// Copyright 2026 Spectrum Labs LLC
 // SPDX-License-Identifier: Apache-2.0
 
 // Package blobtest provides an in-memory S3 service for tests, so the S3

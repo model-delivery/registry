@@ -259,7 +259,8 @@ Bug reports and pull requests are welcome. See
 
 ## License
 
-[Apache License 2.0](LICENSE).
+Copyright 2026 [Spectrum Labs LLC](https://spectrumlabs.tech). Licensed under the
+[Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
 
-Model Delivery is an independent project. It is not affiliated with or
+Model Delivery is a Spectrum Labs project. It is not affiliated with or
 endorsed by Hugging Face. "Hugging Face" is a trademark of Hugging Face, Inc.

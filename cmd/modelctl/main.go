@@ -1,3 +1,4 @@
+// Copyright 2026 Spectrum Labs LLC
 // SPDX-License-Identifier: Apache-2.0
 
 // Command modelctl is the Model Delivery registry: one binary that runs

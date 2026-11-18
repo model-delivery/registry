@@ -66,6 +66,12 @@ Docker; the only place multipart uploads are exercised), `task build`,
   must exercise it.
 - `go test ./...` must pass with no network, no Python and no Docker.
 
+## Ownership
+
+A Spectrum Labs LLC project; the LLC holds the copyright (`NOTICE`). Every Go file starts with
+`// Copyright 2026 Spectrum Labs LLC` then `// SPDX-License-Identifier: Apache-2.0`; `task headers`
+checks it and CI runs it. Keep the year a file was first written; do not bump it.
+
 ## Style
 
 Standard library first. Runtime dependencies are the pure-Go SQLite driver

@@ -30,6 +30,15 @@ tasks:
     desc: Run go vet, including integration-tagged files
     cmd: go vet -tags=integration ./...
 
+  headers:
+    desc: Check that every Go file carries the copyright and licence header
+    cmd: |
+      missing="$(git ls-files '*.go' | while read -r f; do
+        head -n 1 "$f" | grep -q '^// Copyright [0-9][0-9][0-9][0-9] Spectrum Labs LLC' &&
+          sed -n 2p "$f" | grep -q '^// SPDX-License-Identifier: Apache-2.0' || echo "$f"
+      done)"
+      test -z "$missing" || (echo "missing the copyright and licence header:"; echo "$missing"; exit 1)
+
   lint:
     desc: Run golangci-lint (install v2.14.0, the version CI pins)
     cmd: golangci-lint run ./...
@@ -76,6 +85,7 @@ tasks:
     cmds:
       - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - task: vet
+      - task: headers
       - task: lint
       - task: test
       - go mod tidy -diff

@@ -39,6 +39,13 @@ jobs:
           go mod tidy -diff
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (echo "unformatted Go files:" && gofmt -l . && exit 1)
+      - name: Copyright and licence headers
+        run: |
+          missing="$(git ls-files '*.go' | while read -r f; do
+            head -n 1 "$f" | grep -q '^// Copyright [0-9][0-9][0-9][0-9] Spectrum Labs LLC' &&
+              sed -n 2p "$f" | grep -q '^// SPDX-License-Identifier: Apache-2.0' || echo "$f"
+          done)"
+          test -z "$missing" || (echo "missing the copyright and licence header:"; echo "$missing"; exit 1)
       - name: go vet
         run: go vet -tags=integration ./...
       - name: golangci-lint

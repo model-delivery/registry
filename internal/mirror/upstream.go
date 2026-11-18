@@ -1,3 +1,4 @@
+// Copyright 2026 Spectrum Labs LLC
 // SPDX-License-Identifier: Apache-2.0
 
 // Package mirror imports repositories from a Hugging Face compatible hub

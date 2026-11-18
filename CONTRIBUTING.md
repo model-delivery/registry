@@ -91,7 +91,20 @@ container image. `task check`, `task test:e2e`, `task test:s3` and
 Pushing a tag by hand (`git tag v0.2.0 && git push origin v0.2.0`) starts
 the same release.
 
-## Licence
+## Licence and copyright
+
+Model Delivery is a [Spectrum Labs LLC](https://spectrumlabs.tech) project, and Spectrum Labs LLC
+holds the copyright in it (see [NOTICE](NOTICE)).
 
 By contributing you agree that your contribution is licensed under the
-[Apache License 2.0](LICENSE), the same licence as the project.
+[Apache License 2.0](LICENSE), the same licence as the project. You keep the
+copyright in what you write; the licence is what lets the project and
+everyone else use it.
+
+Every Go file starts with these two lines, and the checks fail if one is
+missing:
+
+```go
+// Copyright 2026 Spectrum Labs LLC
+// SPDX-License-Identifier: Apache-2.0
+```

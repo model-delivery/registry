@@ -499,7 +499,7 @@ func TestWebUI(t *testing.T) {
 	t.Run("home lists repositories", func(t *testing.T) {
 		resp := do(t, http.MethodGet, open.url+"/", "", nil, nil)
 		page := body(t, resp)
-		if resp.StatusCode != 200 || !strings.Contains(page, "acme/tiny") || !strings.Contains(page, "On disk") {
+		if resp.StatusCode != http.StatusOK || !strings.Contains(page, "acme/tiny") || !strings.Contains(page, "On disk") {
 			t.Fatalf("status %d, page missing repository or storage usage", resp.StatusCode)
 		}
 	})
@@ -535,7 +535,7 @@ func TestWebUI(t *testing.T) {
 			}
 		}
 		resp := do(t, http.MethodGet, private.url+"/", "", nil, cookie(private, private.read))
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("signed-in visitor got %d", resp.StatusCode)
 		}
 	})
@@ -599,7 +599,7 @@ func TestStaticAssetsAndHealth(t *testing.T) {
 	t.Parallel()
 	in := start(t, server.Config{AnonymousRead: false, Version: "1.2.3"})
 	resp := do(t, http.MethodGet, in.url+"/static/app.css", "", nil, nil)
-	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/css") {
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/css") {
 		t.Fatalf("css: %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
 	resp = do(t, http.MethodGet, in.url+"/healthz", "", nil, nil)

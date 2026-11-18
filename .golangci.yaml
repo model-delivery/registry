@@ -1,0 +1,32 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration]
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # every HTTP response body is closed
+    - copyloopvar
+    - errorlint # errors are compared with errors.Is / errors.As
+    - gosec
+    - misspell
+    - nilerr
+    - noctx # outgoing requests carry a context, so they can be cancelled
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - usestdlibvars
+  settings:
+    errcheck:
+      exclude-functions:
+        # Writes to the terminal and to in-memory hashers. There is nothing
+        # useful to do when printing a message fails, and a hash never does.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose]

@@ -170,21 +170,22 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 func (r *Registry) Close() error { return r.db.Close() }
 
 func (r *Registry) migrate() error {
+	ctx := context.Background()
 	var v int
-	if err := r.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+	if err := r.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
 	switch v {
 	case 0:
-		tx, err := r.db.Begin()
+		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.Exec(schema); err != nil {
+		if _, err := tx.ExecContext(ctx, schema); err != nil {
 			return fmt.Errorf("create schema: %w", err)
 		}
-		if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
 			return err
 		}
 		return tx.Commit()

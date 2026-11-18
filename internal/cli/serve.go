@@ -77,7 +77,7 @@ func cmdServe(e *env, args []string) error {
 		Version:           Version,
 		Logger:            log,
 	})
-	ln, err := net.Listen("tcp", *addr)
+	ln, err := (&net.ListenConfig{}).Listen(e.ctx, "tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}

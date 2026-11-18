@@ -234,17 +234,25 @@ func (s *Server) uiLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: secret, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode,
-		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
-		MaxAge: 30 * 24 * 3600,
-	})
+	http.SetCookie(w, s.sessionCookie(r, secret, 30*24*3600))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) uiLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	http.SetCookie(w, s.sessionCookie(r, "", -1))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// sessionCookie builds the sign-in cookie. It is never readable by scripts
+// and never sent on requests from other sites. It is marked Secure whenever
+// the request arrived over HTTPS; a registry on a home network is often
+// plain HTTP, where a Secure cookie would make signing in impossible.
+func (s *Server) sessionCookie(r *http.Request, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{ //nolint:gosec // Secure is set for HTTPS requests; see the comment above.
+		Name: cookieName, Value: value, Path: "/", MaxAge: maxAge,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+	}
 }
 
 func (s *Server) uiError(w http.ResponseWriter, r *http.Request, err error) {

@@ -145,6 +145,14 @@ type CommitInput struct {
 	// Merge overlays Files on the branch's current revision instead of
 	// replacing its file list.
 	Merge bool
+	// Delete removes paths from the branch's current file list before Files
+	// are applied. It only has an effect with Merge. An entry ending in "/"
+	// removes everything under that directory.
+	Delete []string
+	// ExpectParent, when set, is the revision the caller believes the branch
+	// points at. If the branch has moved, the commit is refused, so two
+	// writers cannot silently overwrite each other.
+	ExpectParent string
 }
 
 // Commit records a revision atomically: either the revision, its files and
@@ -205,6 +213,14 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 		}
 	}
 
+	if in.ExpectParent != "" && in.ExpectParent != parent {
+		at := parent
+		if at == "" {
+			at = "no revision yet"
+		}
+		return Commit{}, fmt.Errorf("%w: %s moved; expected %s, it is at %s", ErrConflict, in.Branch, in.ExpectParent, at)
+	}
+
 	files := map[string]File{}
 	if in.Merge && parentID != 0 {
 		prev, err := queryFiles(ctx, tx, parentID)
@@ -213,6 +229,17 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 		}
 		for _, f := range prev {
 			files[f.Path] = f
+		}
+		for _, d := range in.Delete {
+			if strings.HasSuffix(d, "/") {
+				for p := range files {
+					if strings.HasPrefix(p, d) {
+						delete(files, p)
+					}
+				}
+				continue
+			}
+			delete(files, d)
 		}
 	}
 	seen := map[string]bool{}
@@ -564,4 +591,38 @@ func (r *Registry) DeleteRepo(ctx context.Context, name string) (GCResult, error
 	// The repository is gone. Free what it alone was holding; blobs another
 	// repository uses are still referenced and are skipped.
 	return r.dropUnreferenced(ctx, digests, r.stamp())
+}
+
+// CreateRepo records an empty repository, so it exists before its first
+// revision. It reports whether the repository was created by this call.
+func (r *Registry) CreateRepo(ctx context.Context, name string) (bool, error) {
+	if err := ValidateRepoName(name); err != nil {
+		return false, err
+	}
+	res, err := r.db.ExecContext(ctx,
+		"INSERT INTO repos (name, upstream, created_at) VALUES (?, '', ?) ON CONFLICT (name) DO NOTHING", name, r.stamp())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// CreateBranch points a new branch at an existing revision of the
+// repository. from is a branch, tag or revision id.
+func (r *Registry) CreateBranch(ctx context.Context, repoName, branch, from string) error {
+	if err := ValidateRefName(branch); err != nil {
+		return err
+	}
+	c, err := r.Resolve(ctx, repoName, from)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx,
+		"INSERT INTO refs (repo_id, name, kind, sha, updated_at) VALUES (?, ?, ?, ?, ?)",
+		c.RepoID, branch, KindBranch, c.SHA, r.stamp())
+	if err != nil {
+		return fmt.Errorf("%w: %q already exists in %s", ErrConflict, branch, repoName)
+	}
+	return nil
 }

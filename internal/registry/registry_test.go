@@ -327,3 +327,90 @@ func TestReopenKeepsData(t *testing.T) {
 	}
 	_ = rc.Close()
 }
+
+func TestDeleteAndParentCheckInMergeCommits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := open(t)
+	base, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Files: []File{
+		file(t, r, "keep.txt", "keep"), file(t, r, "drop.txt", "drop"),
+		file(t, r, "dir/a.bin", "a"), file(t, r, "dir/sub/b.bin", "b"), file(t, r, "dirx/c.bin", "c"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, err := r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true, ExpectParent: base.SHA,
+		Delete: []string{"drop.txt", "dir/", "never-existed.txt"},
+		Files:  []File{file(t, r, "new.txt", "new")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _ := r.Files(ctx, next)
+	var paths []string
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	// "dir/" removes the directory and everything under it, and nothing
+	// that merely starts with the same letters.
+	if got := strings.Join(paths, ","); got != "dirx/c.bin,keep.txt,new.txt" {
+		t.Fatalf("files after delete = %s", got)
+	}
+
+	// The branch moved, so a commit made against the old revision is refused.
+	_, err = r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true, ExpectParent: base.SHA,
+		Files: []File{file(t, r, "late.txt", "late")}})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale parent: got %v, want ErrConflict", err)
+	}
+	if c, _ := r.Resolve(ctx, "acme/model", "main"); c.SHA != next.SHA {
+		t.Fatal("a refused commit moved the branch")
+	}
+	// Deleting every file leaves nothing to record.
+	_, err = r.Commit(ctx, CommitInput{Repo: "acme/model", Branch: "main", Merge: true,
+		Delete: []string{"dirx/", "keep.txt", "new.txt"}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty result: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestCreateRepoAndBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := open(t)
+
+	created, err := r.CreateRepo(ctx, "acme/empty")
+	if err != nil || !created {
+		t.Fatalf("create = %v, %v", created, err)
+	}
+	if created, err := r.CreateRepo(ctx, "acme/empty"); err != nil || created {
+		t.Fatalf("second create = %v, %v; want it to report the repository already existed", created, err)
+	}
+	if _, err := r.CreateRepo(ctx, "no-namespace"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bad name: %v", err)
+	}
+	// An empty repository exists but has no revision to resolve.
+	if _, err := r.Resolve(ctx, "acme/empty", "main"); !errors.Is(err, ErrRevisionNotFound) {
+		t.Fatalf("resolve on an empty repository: %v, want ErrRevisionNotFound", err)
+	}
+	if err := r.CreateBranch(ctx, "acme/empty", "dev", "main"); !errors.Is(err, ErrRevisionNotFound) {
+		t.Fatalf("branch from nothing: %v", err)
+	}
+
+	c, err := r.Commit(ctx, CommitInput{Repo: "acme/empty", Branch: "main", Files: []File{file(t, r, "a.txt", "a")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CreateBranch(ctx, "acme/empty", "dev", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := r.Resolve(ctx, "acme/empty", "dev"); err != nil || got.SHA != c.SHA {
+		t.Fatalf("dev = %s (%v), want %s", got.SHA, err, c.SHA)
+	}
+	if err := r.CreateBranch(ctx, "acme/empty", "dev", "main"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate branch: %v", err)
+	}
+	if err := r.CreateBranch(ctx, "acme/empty", strings.Repeat("a", 40), "main"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("branch named like a revision id: %v", err)
+	}
+}

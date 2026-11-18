@@ -180,4 +180,36 @@ All `admin`. See [operations.md](operations.md#backup-and-restore).
 |---|---|
 | `GET /api/v1/stats` (read) | `repos`, `revisions`, `blobs`, `stored_bytes` (on disk), `logical_bytes` (sum over every file of every revision). |
 | `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed. |
+| `POST /api/v1/verify` (admin) | Re-read every stored file and check it against its digest. See below. |
 | `GET /healthz` | `{"status": "ok", "version": "..."}`. No authentication. |
+
+### Check stored files
+
+`POST /api/v1/verify` (admin)
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $T" $R/api/v1/verify
+```
+
+The response is `200` with a stream of JSON lines, one per stored file as
+it is checked, so it works on a store of any size:
+
+```json
+{"event":"start","blobs":3,"bytes":28183891}
+{"event":"blob","sha256":"1f0c...","size":548,"status":"ok"}
+{"event":"blob","sha256":"9f2c...","size":27663679,"status":"damaged","detail":"blob verification failed: its content now has sha256 77ab...","repos":["acme/tiny"]}
+{"event":"blob","sha256":"c41d...","size":519664,"status":"missing","detail":"storage holds nothing under this name","repos":["acme/tiny"]}
+{"event":"done","blobs":3,"bytes":28183891,"failed":2}
+```
+
+`status` is `ok`, `missing`, `damaged` (wrong size, or content that no
+longer hashes to the digest) or `unreadable` (the file could not be read).
+For anything but `ok`, `detail` says what was found and `repos` names up
+to ten repositories with a revision that uses the file. `failed` counts
+the files that were not `ok`.
+
+If the run cannot finish, the last line is `{"event":"error","error":"..."}`
+instead of `done`. Always check the last line. Closing the connection
+stops the run. Nothing is changed by it, and the registry serves as usual
+while it runs; [operations.md](operations.md#checking-stored-files) covers
+cost and repair.

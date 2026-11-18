@@ -23,13 +23,19 @@ Knowing the design helps you deploy it safely.
 **It does:**
 
 - Verify every stored file against a SHA-256 digest when it is written, and
-  mirrored files against the digests the upstream hub publishes.
+  mirrored files against the digests the upstream hub publishes: a SHA-256
+  for files tracked with LFS, and a git blob id (a SHA-1, the only digest a
+  hub offers for them) for the small files it keeps in git.
 - Store access tokens only as SHA-256 hashes. A token is shown once, when
   created.
 - Require a token for every write, and optionally for every read.
 - Refuse state-changing browser requests that come from another site.
 - Fetch only from the upstream hub the operator configured. API callers
-  cannot point it at other hosts.
+  cannot point it at other hosts, the upstream token is sent to that hub
+  and nowhere else, and a redirect from the hub to a loopback or private
+  address is refused.
+- Keep pull-through caching out of repositories that were created in the
+  registry: a repository you pushed is never added to from the upstream.
 
 **It does not:**
 
@@ -40,6 +46,11 @@ Knowing the design helps you deploy it safely.
   loaded (Python pickle files are the common case). The registry stores and
   serves bytes faithfully; it does not judge whether they are safe. Mirror
   and load only models you trust, and prefer formats such as safetensors.
+- Re-check stored files each time they are served. Whoever can write to
+  the bucket or the data directory can change what is served under a
+  file's name. `modelctl verify` re-reads everything and reports files
+  that no longer match their digest; `modelctl pull` checks what it
+  downloads, and Hugging Face clients mostly do not.
 - Limit request rates or lock out repeated bad tokens. Use your reverse
   proxy for that if the registry is reachable from the internet.
 - Encrypt data at rest. Use an encrypted volume if you need that.

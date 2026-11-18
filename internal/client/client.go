@@ -252,6 +252,58 @@ func (c *Client) Mirror(ctx context.Context, repo, revision, upstreamToken strin
 	return MirrorEvent{}, errors.New("registry closed the connection before the mirror finished")
 }
 
+// VerifyEvent is one line of a verify run: "start", then a "blob" per
+// stored file, then "done".
+type VerifyEvent struct {
+	Event string `json:"event"`
+	// For "blob": the file checked and what was found. Status is "ok",
+	// "missing", "damaged" or "unreadable"; Repos names repositories that
+	// use a file something is wrong with.
+	SHA256 string   `json:"sha256,omitempty"`
+	Size   int64    `json:"size,omitempty"`
+	Status string   `json:"status,omitempty"`
+	Detail string   `json:"detail,omitempty"`
+	Repos  []string `json:"repos,omitempty"`
+	// For "start": what is about to be checked. For "done": what was.
+	Blobs  int    `json:"blobs"`
+	Bytes  int64  `json:"bytes"`
+	Failed int    `json:"failed"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Verify asks the registry to re-read every stored file and check it
+// against its digest, reporting each file as it is checked. It returns the
+// final "done" event. Files that fail the check are reported through
+// progress and counted in the result; they are not an error.
+func (c *Client) Verify(ctx context.Context, progress func(VerifyEvent)) (VerifyEvent, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/api/v1/verify", nil, -1, nil)
+	if err != nil {
+		return VerifyEvent{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		var e VerifyEvent
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			return VerifyEvent{}, fmt.Errorf("unreadable progress line from registry: %w", err)
+		}
+		switch e.Event {
+		case "error":
+			return VerifyEvent{}, errors.New(e.Error)
+		case "done":
+			return e, nil
+		}
+		if progress != nil {
+			progress(e)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return VerifyEvent{}, fmt.Errorf("connection to registry lost during the check: %w", err)
+	}
+	return VerifyEvent{}, errors.New("registry closed the connection before the check finished; run it again")
+}
+
 // PushOptions controls Push.
 type PushOptions struct {
 	Branch  string

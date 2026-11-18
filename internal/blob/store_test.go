@@ -380,6 +380,118 @@ func TestDelete(t *testing.T) {
 	})
 }
 
+// damageable is a backend together with the means to change what it has
+// stored without going through it, which is what Check exists to notice.
+type damageable struct {
+	name string
+	open func(t *testing.T) (store blob.Store, overwrite func(digest string, data []byte), remove func(digest string))
+}
+
+var damageables = []damageable{
+	{"filesystem", func(t *testing.T) (blob.Store, func(string, []byte), func(string)) {
+		root := t.TempDir()
+		s, err := blob.NewFS(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := func(d string) string { return filepath.Join(root, "blobs", "sha256", d[:2], d) }
+		return s, func(d string, data []byte) {
+				if err := os.WriteFile(path(d), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}, func(d string) {
+				if err := os.Remove(path(d)); err != nil {
+					t.Fatal(err)
+				}
+			}
+	}},
+	{"s3", func(t *testing.T) (blob.Store, func(string, []byte), func(string)) {
+		fake := blobtest.NewFakeS3(t)
+		key := func(d string) string { return "registry/sha256/" + d[:2] + "/" + d }
+		return fake.Store(t), func(d string, data []byte) { fake.Overwrite(t, key(d), data) }, func(d string) { fake.Remove(t, key(d)) }
+	}},
+}
+
+// TestCheck is the read-side half of the contract: whatever a backend
+// stores, a blob that no longer matches its name is found out.
+func TestCheck(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	data := []byte(strings.Repeat("model weights ", 20000)) // larger than one read
+	d := digest(data)
+	size := int64(len(data))
+
+	for _, b := range damageables {
+		t.Run(b.name, func(t *testing.T) {
+			t.Parallel()
+			store, overwrite, remove := b.open(t)
+			put := func(content []byte) {
+				t.Helper()
+				st, err := store.Stage(ctx, bytes.NewReader(content), blob.Expect{Size: -1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := st.Publish(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := blob.Check(ctx, store, d, size); !errors.Is(err, blob.ErrNotFound) {
+				t.Fatalf("a blob that was never stored: %v, want ErrNotFound", err)
+			}
+			put(data)
+			if err := blob.Check(ctx, store, d, size); err != nil {
+				t.Fatalf("an intact blob: %v", err)
+			}
+			if err := blob.Check(ctx, store, d, -1); err != nil {
+				t.Fatalf("an intact blob, size not given: %v", err)
+			}
+			// The record says another size than the one stored.
+			if err := blob.Check(ctx, store, d, size+1); !errors.Is(err, blob.ErrMismatch) {
+				t.Fatalf("a blob of the wrong size: %v, want ErrMismatch", err)
+			}
+
+			// One byte changed, same length: only reading it all shows this.
+			flipped := bytes.Clone(data)
+			flipped[len(flipped)/2] ^= 0x01
+			overwrite(d, flipped)
+			err := blob.Check(ctx, store, d, size)
+			if !errors.Is(err, blob.ErrMismatch) || !strings.Contains(err.Error(), digest(flipped)) {
+				t.Fatalf("a blob with one byte changed: %v, want ErrMismatch naming what it hashes to now", err)
+			}
+			// Cut short.
+			overwrite(d, data[:len(data)/2])
+			if err := blob.Check(ctx, store, d, size); !errors.Is(err, blob.ErrMismatch) {
+				t.Fatalf("a truncated blob: %v, want ErrMismatch", err)
+			}
+			if err := blob.Check(ctx, store, d, -1); !errors.Is(err, blob.ErrMismatch) {
+				t.Fatalf("a truncated blob, size not given: %v, want ErrMismatch", err)
+			}
+			// Put right again.
+			overwrite(d, data)
+			if err := blob.Check(ctx, store, d, size); err != nil {
+				t.Fatalf("a restored blob: %v", err)
+			}
+			// Gone.
+			remove(d)
+			if err := blob.Check(ctx, store, d, size); !errors.Is(err, blob.ErrNotFound) {
+				t.Fatalf("a removed blob: %v, want ErrNotFound", err)
+			}
+
+			// A check that is cancelled says so; it does not call the blob damaged.
+			put(data)
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			if err := blob.Check(cancelled, store, d, size); err == nil || errors.Is(err, blob.ErrMismatch) || errors.Is(err, blob.ErrNotFound) {
+				t.Fatalf("a cancelled check: %v, want a plain error", err)
+			}
+			if err := blob.Check(ctx, store, "not-a-digest", -1); !errors.Is(err, blob.ErrNotFound) {
+				t.Fatalf("a malformed digest: %v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
 func TestFilesystemStoresBlobsByDigest(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

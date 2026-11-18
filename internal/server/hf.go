@@ -318,13 +318,13 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 	content, size, err := s.reg.OpenBlob(r.Context(), f.SHA256)
 	if err != nil {
 		s.log.Error("stored file is missing its blob", "repo", repo, "path", filePath, "sha256", f.SHA256, "error", err)
-		writeError(w, http.StatusInternalServerError, "the stored content for this file is missing; run a registry check")
+		writeError(w, http.StatusInternalServerError, "the stored content for this file is missing; the registry's administrator can find every such file with `modelctl verify`")
 		return
 	}
 	defer func() { _ = content.Close() }()
 	if size != f.Size {
 		s.log.Error("stored blob has the wrong size", "repo", repo, "path", filePath, "sha256", f.SHA256, "want", f.Size, "got", size)
-		writeError(w, http.StatusInternalServerError, "the stored content for this file is damaged")
+		writeError(w, http.StatusInternalServerError, "the stored content for this file is damaged; the registry's administrator can find every such file with `modelctl verify`")
 		return
 	}
 

@@ -39,6 +39,7 @@ Client:
   modelctl delete <repo>              delete a repository and free its storage
   modelctl token create|list|revoke   manage access tokens
   modelctl gc                         remove stored files nothing references
+  modelctl verify                     re-read every stored file and check it against its digest
   modelctl backup now|list|download   back up the registry's metadata
 
 Recovery (registry stopped):
@@ -69,7 +70,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 	commands := map[string]func(*env, []string) error{
 		"serve": cmdServe, "mirror": cmdMirror, "push": cmdPush, "pull": cmdPull, "list": cmdList,
 		"inspect": cmdInspect, "delete": cmdDelete, "token": cmdToken, "gc": cmdGC,
-		"backup": cmdBackup, "restore": cmdRestore,
+		"backup": cmdBackup, "restore": cmdRestore, "verify": cmdVerify,
 	}
 	switch args[0] {
 	case "help", "-h", "--help":

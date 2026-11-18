@@ -365,6 +365,9 @@ func TestAccessControl(t *testing.T) {
 		{"open: write token lists tokens", open, http.MethodGet, "/api/v1/tokens", write, "", 403},
 		{"open: write token creates token", open, http.MethodPost, "/api/v1/tokens", write, `{"name":"x","role":"admin"}`, 403},
 		{"open: write token gc", open, http.MethodPost, "/api/v1/gc", write, "", 403},
+		{"open: anonymous verify", open, http.MethodPost, "/api/v1/verify", none, "", 401},
+		{"open: write token verify", open, http.MethodPost, "/api/v1/verify", write, "", 403},
+		{"open: admin verify", open, http.MethodPost, "/api/v1/verify", admin, "", 200},
 		{"open: admin lists tokens", open, http.MethodGet, "/api/v1/tokens", admin, "", 200},
 
 		// The routes below do not go through Server.need: each checks access

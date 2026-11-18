@@ -265,6 +265,53 @@ func (s *Server) apiGC(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// apiVerify re-reads every stored blob and streams what it finds as JSON
+// lines: a "start" line, one "blob" line per blob as it is checked, and a
+// final "done" line with the totals, or an "error" line if the run could
+// not finish. Nothing is collected in memory, and nothing is locked: files
+// are served as usual while it runs. Stopping the request stops the run.
+func (s *Server) apiVerify(w http.ResponseWriter, r *http.Request) {
+	blobs, bytes, err := s.reg.BlobTotals(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	enc := json.NewEncoder(w)
+	emit := func(v any) {
+		_ = enc.Encode(v)
+		_ = rc.Flush()
+	}
+	emit(map[string]any{"event": "start", "blobs": blobs, "bytes": bytes})
+	started := time.Now()
+	res, err := s.reg.Verify(r.Context(), func(c registry.BlobCheck) {
+		if c.Status != registry.BlobOK {
+			s.log.Warn("stored file failed verification", "sha256", c.SHA256, "status", c.Status, "detail", c.Detail, "repos", c.Repos)
+		}
+		emit(struct {
+			Event string `json:"event"`
+			registry.BlobCheck
+		}{"blob", c})
+	})
+	if err != nil {
+		s.log.Warn("verify did not finish", "checked", res.Blobs, "error", err)
+		msg := "the check did not finish: " + err.Error()
+		if status, _ := statusFor(err); status == http.StatusInternalServerError {
+			msg = "the check did not finish; the server's log has the reason"
+		}
+		emit(map[string]any{"event": "error", "error": msg})
+		return
+	}
+	s.log.Info("verify complete", "blobs", res.Blobs, "bytes", res.Bytes, "failed", res.Failed, "took", time.Since(started).Round(time.Millisecond))
+	emit(struct {
+		Event string `json:"event"`
+		registry.VerifyResult
+	}{"done", res})
+}
+
 func (s *Server) apiListTokens(w http.ResponseWriter, r *http.Request) {
 	toks, err := s.reg.ListTokens(r.Context())
 	if err != nil {

@@ -501,6 +501,76 @@ modelctl gc                            # removes files nothing references (faile
 `gc` leaves files newer than one hour alone, in case a push is still in
 progress.
 
+## Checking stored files
+
+Every file is checked against its digest when it is stored. After that the
+registry trusts its storage: a download compares the stored size with the
+recorded one and nothing more. `modelctl verify` asks the question again
+of everything the registry holds:
+
+```bash
+modelctl verify
+```
+
+```
+Checking 1204 stored files, 86.3 GiB. This reads every one of them in full.
+damaged     9f2c...e41a  4.2 GiB
+            blob verification failed: its content now has sha256 77ab...
+            used by meta-llama/Llama-3.2-1B
+modelctl verify: 1 of 1204 stored files failed the check. ...
+```
+
+It needs an admin token. It exits `0` when every file is present and
+matches its digest and `1` otherwise, so it can run from a scheduled job
+that alerts on failure; `--json` gives the totals and the list of problems.
+
+Each file is reported as one of:
+
+| | |
+|---|---|
+| `missing` | The registry has a record of the file and storage holds nothing under its name. |
+| `damaged` | The stored bytes are the wrong size, or no longer hash to the file's digest: a failing disk, an interrupted copy, or something other than the registry writing to the bucket or to `blobs/`. |
+| `unreadable` | The file could not be read, so nothing is known about its content. An unreachable bucket looks like this. Fix the storage and run the check again. |
+
+What to expect:
+
+- **It reads everything.** On local disk that is I/O for the whole store.
+  With S3 storage every object is downloaded through the registry, which
+  your provider may charge for. Run it when the cost is acceptable, not on
+  every deploy.
+- **The registry keeps serving.** The check takes no lock, reads one file
+  at a time, and uses a fixed amount of memory whatever the file sizes.
+- **Stopping the command stops the check.** It can simply be run again.
+- **It changes nothing.** Damaged files are reported and left in place.
+- **It checks what the registry has a record of.** Objects in the bucket
+  that the registry does not know are not looked at, and files that
+  pull-through has listed but never fetched have nothing stored to check.
+
+To put a file right you need its correct content again, from wherever it
+came from.
+
+1. If the file is `damaged`, remove the stored copy by hand:
+   `data/blobs/sha256/<first two characters>/<digest>` on disk, or the
+   object `<prefix>/sha256/<first two characters>/<digest>` in the bucket.
+   The registry never replaces what is stored under a digest, because the
+   same name means the same content, so a damaged copy has to go first. A
+   `missing` file needs nothing removed.
+2. Upload the correct content under the same digest. It is accepted only
+   if it hashes to that digest:
+
+   ```bash
+   curl -X PUT -H "Authorization: Bearer $MODELCTL_TOKEN" --data-binary @model.safetensors \
+     http://localhost:8080/api/v1/blobs/<digest>
+   ```
+
+3. Run `modelctl verify` again.
+
+`modelctl push` and `modelctl mirror` do not repair a file: both skip
+content the registry already has a record of. For a file that belongs to
+mirrored repositories only, the other way is to `modelctl delete` each
+repository that uses it, which removes the stored copy, and mirror them
+again.
+
 ## Upgrading
 
 Replace the binary or the image and restart. The database schema is

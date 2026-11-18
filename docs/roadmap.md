@@ -13,8 +13,6 @@ of dates. Issues and pull requests that move an item forward are welcome.
 - **Xet uploads.** Uploads from Hugging Face clients work today, but a
   stock client needs `HF_HUB_DISABLE_XET=1` for large files. Speaking the
   Xet protocol would remove that step.
-- **Integrity check.** `modelctl verify` to re-hash stored files against
-  their names and report any damage.
 - **Datasets.** The same registry for dataset repositories.
 
 ## After that

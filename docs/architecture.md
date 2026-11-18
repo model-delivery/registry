@@ -52,7 +52,8 @@ revision does not contain files; it lists `path -> SHA-256`. So:
 - Two revisions that share a 5 GB weights file store it once.
 - Two repositories that contain the same file store it once.
 - Re-mirroring or re-pushing unchanged content transfers nothing.
-- A stored file can always be re-checked against its own name.
+- A stored file can always be re-checked against its own name, which is
+  what `modelctl verify` does for everything in storage.
 
 Writing a blob (`internal/blob`):
 
@@ -226,6 +227,15 @@ file's digest, opens the blob and hands it to Go's `http.ServeContent`,
 which streams it and implements `Range`, `If-Range` and `If-None-Match`.
 The `ETag` is the file's digest and `X-Repo-Commit` is the revision id,
 which is what Hugging Face clients use to name files in their cache.
+
+Content is verified when it is stored, not each time it is served: a
+download compares the stored size with the recorded one and streams.
+Hashing a multi-gigabyte file before every download would make serving
+cost what storing does. The check on demand is `blob.Check`, which re-reads
+a blob through `blob.Store.Open` and so works the same on every backend;
+`Registry.Verify` runs it over every recorded blob, a page of the listing
+at a time and holding no lock, and `POST /api/v1/verify` streams the
+results.
 
 ## Deleting and garbage collection
 

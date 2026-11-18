@@ -6,6 +6,7 @@
 package blobtest
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -62,6 +63,23 @@ func (f *FakeS3) Store(t *testing.T) *blob.S3 {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// Overwrite replaces the object at key with data, behind the store's back:
+// what bit rot, or someone with access to the bucket, would do.
+func (f *FakeS3) Overwrite(t *testing.T, key string, data []byte) {
+	t.Helper()
+	if _, err := f.backend.PutObject("models", key, map[string]string{}, bytes.NewReader(data), int64(len(data)), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Remove deletes the object at key, behind the store's back.
+func (f *FakeS3) Remove(t *testing.T, key string) {
+	t.Helper()
+	if _, err := f.backend.DeleteObject("models", key); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Keys lists every object key in the bucket.

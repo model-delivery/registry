@@ -110,6 +110,7 @@ func New(reg *registry.Registry, cfg Config) http.Handler {
 	mux.Handle("POST /api/v1/mirror", s.need(roleWrite, s.apiMirror))
 	mux.Handle("GET /api/v1/stats", s.need(roleRead, s.apiStats))
 	mux.Handle("POST /api/v1/gc", s.need(roleAdmin, s.apiGC))
+	mux.Handle("POST /api/v1/verify", s.need(roleAdmin, s.apiVerify))
 	mux.Handle("GET /api/v1/backups", s.need(roleAdmin, s.apiListBackups))
 	mux.Handle("POST /api/v1/backups", s.need(roleAdmin, s.apiBackupNow))
 	mux.Handle("GET /api/v1/backup/snapshot", s.need(roleAdmin, s.apiSnapshot))

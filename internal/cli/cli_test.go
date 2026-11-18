@@ -26,11 +26,13 @@ type fixture struct {
 	url   string
 	admin string
 	reg   *registry.Registry
+	data  string // the registry's data directory
 }
 
 func newFixture(t *testing.T, upstream string) *fixture {
 	t.Helper()
-	reg, err := registry.Open(t.TempDir(), nil)
+	data := t.TempDir()
+	reg, err := registry.Open(data, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +45,7 @@ func newFixture(t *testing.T, upstream string) *fixture {
 		srv.Close()
 		_ = reg.Close()
 	})
-	return &fixture{url: srv.URL, admin: admin, reg: reg}
+	return &fixture{url: srv.URL, admin: admin, reg: reg, data: data}
 }
 
 // run executes modelctl against the fixture and returns exit code, stdout

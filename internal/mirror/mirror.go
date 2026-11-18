@@ -13,22 +13,73 @@ import (
 	"github.com/model-delivery/registry/internal/registry"
 )
 
+// EventKind says what a line of mirror progress reports.
+type EventKind string
+
+// The lines of a mirror's progress, in the order they are sent: one start,
+// a file for each file, then done or error.
+const (
+	EventStart EventKind = "start"
+	EventFile  EventKind = "file"
+	EventDone  EventKind = "done"
+	EventError EventKind = "error"
+)
+
+// FileStatus says how a file's content came to be stored.
+type FileStatus string
+
+// How a mirrored file was obtained.
+const (
+	// StatusDownloaded: fetched from the upstream and verified.
+	StatusDownloaded FileStatus = "downloaded"
+	// StatusReused: its bytes were already stored.
+	StatusReused FileStatus = "reused"
+)
+
 // Event is one line of mirror progress.
 type Event struct {
-	Event string `json:"event"` // start | file | done | error
-	Repo  string `json:"repo,omitempty"`
-	SHA   string `json:"sha,omitempty"`
-	Ref   string `json:"ref,omitempty"`
-	Path  string `json:"path,omitempty"`
-	// Status of a file: "downloaded" or "reused" (bytes already stored).
-	Status          string `json:"status,omitempty"`
-	Size            int64  `json:"size,omitempty"`
-	Files           int    `json:"files,omitempty"`
-	Bytes           int64  `json:"bytes,omitempty"`
-	DownloadedBytes int64  `json:"downloaded_bytes,omitempty"`
-	ReusedBytes     int64  `json:"reused_bytes,omitempty"`
-	Error           string `json:"error,omitempty"`
+	Event EventKind `json:"event"`
+	Repo  string    `json:"repo,omitempty"`
+	SHA   string    `json:"sha,omitempty"`
+	Ref   string    `json:"ref,omitempty"`
+	Path  string    `json:"path,omitempty"`
+	// Status of a file event.
+	Status          FileStatus `json:"status,omitempty"`
+	Size            int64      `json:"size,omitempty"`
+	Files           int        `json:"files,omitempty"`
+	Bytes           int64      `json:"bytes,omitempty"`
+	DownloadedBytes int64      `json:"downloaded_bytes,omitempty"`
+	ReusedBytes     int64      `json:"reused_bytes,omitempty"`
+	Error           string     `json:"error,omitempty"`
 }
+
+// Result is what a finished mirror did.
+type Result struct {
+	Repo string
+	SHA  string
+	// Ref is the branch that now points at the revision; empty when the
+	// revision was asked for by id.
+	Ref   string
+	Files int
+	// Bytes is the size of the revision: DownloadedBytes that were fetched
+	// plus ReusedBytes that were already stored.
+	Bytes           int64
+	DownloadedBytes int64
+	ReusedBytes     int64
+}
+
+// doneEvent is the last line of a successful mirror's progress.
+func (r Result) doneEvent() Event {
+	return Event{Event: EventDone, Repo: r.Repo, SHA: r.SHA, Ref: r.Ref, Files: r.Files,
+		Bytes: r.Bytes, DownloadedBytes: r.DownloadedBytes, ReusedBytes: r.ReusedBytes}
+}
+
+// DefaultConcurrency is how many files a mirror fetches at once unless
+// told otherwise.
+const DefaultConcurrency = 4
+
+// defaultRevision is what a mirror copies when no revision is named.
+const defaultRevision = "main"
 
 // maxStoredInfo is the largest upstream model description kept with a
 // revision. It is provenance, shown back by the model info route; a larger
@@ -52,7 +103,7 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 		return nil, err
 	}
 	if revision == "" {
-		revision = "main"
+		revision = defaultRevision
 	}
 	info, err := up.Info(ctx, repo, revision)
 	if err != nil {
@@ -102,15 +153,21 @@ func (p *Plan) Bytes() int64 {
 // Execute copies the plan into reg and records the revision under its
 // upstream id. Files whose bytes are already stored are not fetched again.
 // The revision only becomes visible once every file is stored and verified.
-func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency int, progress func(Event)) (Event, error) {
+//
+// concurrency is how many files are fetched at once; below 1 means
+// DefaultConcurrency. progress, when not nil, is called from several
+// goroutines with a start event, one event per file, and a done event once
+// the revision is recorded. A failure is the returned error, never an
+// event: reporting it is the caller's business.
+func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency int, progress func(Event)) (Result, error) {
 	if progress == nil {
 		progress = func(Event) {}
 	}
 	if concurrency < 1 {
-		concurrency = 4
+		concurrency = DefaultConcurrency
 	}
 	repo, sha := p.Info.ID, p.Info.SHA
-	progress(Event{Event: "start", Repo: repo, SHA: sha, Files: len(p.Entries), Bytes: p.Bytes()})
+	progress(Event{Event: EventStart, Repo: repo, SHA: sha, Files: len(p.Entries), Bytes: p.Bytes()})
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -141,15 +198,15 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 					continue
 				}
 				files[i] = f
-				status := "reused"
+				status := StatusReused
 				if fetched {
-					status = "downloaded"
+					status = StatusDownloaded
 					downloaded += f.Size
 				} else {
 					reused += f.Size
 				}
 				mu.Unlock()
-				progress(Event{Event: "file", Path: e.Path, Size: f.Size, Status: status})
+				progress(Event{Event: EventFile, Path: e.Path, Size: f.Size, Status: status})
 			}
 		}()
 	}
@@ -164,10 +221,10 @@ feed:
 	close(jobs)
 	wg.Wait()
 	if firstErr != nil {
-		return Event{}, firstErr
+		return Result{}, firstErr
 	}
 	if err := ctx.Err(); err != nil {
-		return Event{}, err
+		return Result{}, err
 	}
 
 	in := registry.CommitInput{
@@ -196,10 +253,12 @@ feed:
 		_, err = reg.Commit(ctx, in)
 	}
 	if err != nil {
-		return Event{}, err
+		return Result{}, err
 	}
-	return Event{Event: "done", Repo: repo, SHA: sha, Ref: in.Branch, Files: len(files),
-		Bytes: downloaded + reused, DownloadedBytes: downloaded, ReusedBytes: reused}, nil
+	res := Result{Repo: repo, SHA: sha, Ref: in.Branch, Files: len(files),
+		Bytes: downloaded + reused, DownloadedBytes: downloaded, ReusedBytes: reused}
+	progress(res.doneEvent())
+	return res, nil
 }
 
 func (p *Plan) lazyInput(branch string) registry.LazyInput {

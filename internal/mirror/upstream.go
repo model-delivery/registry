@@ -82,8 +82,25 @@ type Entry struct {
 	LFSSHA256 string
 }
 
-// maxRedirects is how many redirects one request follows, as net/http does.
-const maxRedirects = 10
+// Bounds on what one upstream is allowed to make the registry do or hold.
+const (
+	// maxRedirects is how many redirects one request follows, as net/http does.
+	maxRedirects = 10
+	// maxListingPages is how many pages of a file listing are followed
+	// before the listing is taken not to end.
+	maxListingPages = 10000
+	// maxInfoBytes is the most that is read of a model description.
+	maxInfoBytes = 32 << 20
+	// maxLoggedErrorBody is how much of an error answer's body is logged.
+	maxLoggedErrorBody = 512
+	// maxErrorDetail is how much of the hub's one-line reason is passed on.
+	maxErrorDetail = 200
+	// maxResumes is how many times one download reconnects after its
+	// connection drops, and resumeDelay is the wait before the first of
+	// them; each later one waits that much longer.
+	maxResumes  = 5
+	resumeDelay = 500 * time.Millisecond
+)
 
 // get fetches rawURL, following redirects itself, one hop at a time, so
 // that each hop is checked before it is contacted:
@@ -164,7 +181,7 @@ func (u *Upstream) checked(ctx context.Context, resp *http.Response, trusted boo
 		return resp, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxLoggedErrorBody))
 	if u.Log != nil {
 		level := slog.LevelWarn
 		if resp.StatusCode == http.StatusNotFound {
@@ -179,8 +196,8 @@ func (u *Upstream) checked(ctx context.Context, resp *http.Response, trusted boo
 	detail := ""
 	if trusted {
 		detail = strings.TrimSpace(resp.Header.Get("X-Error-Message"))
-		if len(detail) > 200 {
-			detail = detail[:200]
+		if len(detail) > maxErrorDetail {
+			detail = detail[:maxErrorDetail]
 		}
 	}
 	if detail != "" {
@@ -207,7 +224,7 @@ func (u *Upstream) Info(ctx context.Context, repo, revision string) (Info, error
 		return Info{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxInfoBytes))
 	if err != nil {
 		return Info{}, fmt.Errorf("read upstream model info: %w", err)
 	}
@@ -235,7 +252,7 @@ func (u *Upstream) Tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 	next := u.endpoint() + "/api/models/" + repo + "/tree/" + url.PathEscape(sha) + "?recursive=true&expand=false"
 	var out []Entry
 	for pages := 0; next != ""; pages++ {
-		if pages > 10000 {
+		if pages > maxListingPages {
 			return nil, errors.New("upstream file listing does not end")
 		}
 		resp, err := u.get(ctx, next, nil)
@@ -314,14 +331,14 @@ func (u *Upstream) Open(ctx context.Context, repo, sha, path string) io.ReadClos
 	}}
 }
 
-const maxResumes = 5
-
 type resumeReader struct {
 	ctx     context.Context
 	open    func(offset int64) (io.ReadCloser, error)
 	cur     io.ReadCloser
 	offset  int64
 	resumes int
+	// backoff, when set, replaces the growing wait between reconnections.
+	// Only tests set it, to not spend seconds waiting.
 	backoff time.Duration
 }
 
@@ -362,7 +379,7 @@ func (r *resumeReader) retryable(err error) bool {
 	r.resumes++
 	wait := r.backoff
 	if wait == 0 {
-		wait = time.Duration(r.resumes) * 500 * time.Millisecond
+		wait = time.Duration(r.resumes) * resumeDelay
 	}
 	select {
 	case <-r.ctx.Done():

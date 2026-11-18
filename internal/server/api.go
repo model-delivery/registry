@@ -228,7 +228,8 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 			emit(e)
 		}
 	}()
-	final, err := plan.Execute(r.Context(), s.reg, 4, func(e mirror.Event) { events <- e })
+	// The last event Execute sends on success is the "done" line.
+	res, err := plan.Execute(r.Context(), s.reg, mirror.DefaultConcurrency, func(e mirror.Event) { events <- e })
 	close(events)
 	<-done
 	if err != nil {
@@ -237,12 +238,11 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 		if status, _ := statusFor(err); status == http.StatusInternalServerError && !errors.Is(err, blob.ErrMismatch) {
 			msg = "mirror failed: " + msg
 		}
-		emit(mirror.Event{Event: "error", Error: msg})
+		emit(mirror.Event{Event: mirror.EventError, Error: msg})
 		return
 	}
-	s.log.Info("mirror complete", "repo", final.Repo, "sha", final.SHA, "files", final.Files,
-		"downloaded_bytes", final.DownloadedBytes, "reused_bytes", final.ReusedBytes, "took", time.Since(started).Round(time.Millisecond))
-	emit(final)
+	s.log.Info("mirror complete", "repo", res.Repo, "sha", res.SHA, "files", res.Files,
+		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", time.Since(started).Round(time.Millisecond))
 }
 
 func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {

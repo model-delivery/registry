@@ -26,6 +26,10 @@ export REGISTRY_S3_SECRET_KEY=...
 modelctl serve
 ```
 
+For Cloudflare R2, the endpoint is `https://<account id>.r2.cloudflarestorage.com` and the region
+is `auto`. R2 does not charge for downloads, which makes it a good fit for redirected downloads
+(below).
+
 The bucket must exist; the registry does not create it. It checks the
 bucket at start and exits with a clear message if it cannot reach it.
 

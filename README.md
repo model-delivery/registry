@@ -98,7 +98,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
 | **Version** | Every revision is immutable and addressed by id. Branches move, tags never do. |
 | **Verify** | Files are stored under the SHA-256 of their content and verified on the way in. Identical files are stored once, across revisions and repositories. |
-| **Store** | Local disk, or an S3-compatible object store. It uses the standard S3 API, so AWS S3, Cloudflare R2, Backblaze B2, Ceph and MinIO are expected to work; CI tests against SeaweedFS. With S3, downloads can be redirected to signed bucket URLs so the bytes never pass through the registry. |
+| **Store** | Local disk, or an S3-compatible object store. Verified against Cloudflare R2 and SeaweedFS (which CI runs on every change). It uses the standard S3 API, so AWS S3, Backblaze B2, Ceph and MinIO are expected to work but have not been tested. With S3, downloads can be redirected to signed bucket URLs so the bytes never pass through the registry. |
 | **Control access** | Access tokens with read, write and admin roles. Downloads can be open or require a token. |
 | **Browse** | A small web UI lists repositories, revisions, files and storage use. |
 

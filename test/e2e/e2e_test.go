@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,7 +149,7 @@ func runDownload(t *testing.T, endpoint, token, repo, revision, oneFile string) 
 		"HF_TOKEN="+token,
 		"HTTP_PROXY=http://127.0.0.1:9", "HTTPS_PROXY=http://127.0.0.1:9",
 		"http_proxy=http://127.0.0.1:9", "https_proxy=http://127.0.0.1:9",
-		"NO_PROXY=127.0.0.1,localhost", "no_proxy=127.0.0.1,localhost",
+		"NO_PROXY="+reachable(), "no_proxy="+reachable(),
 	)
 	if runtime.GOOS == "windows" {
 		// Creating symlinks on Windows needs a privilege most accounts lack,
@@ -168,6 +169,17 @@ func runDownload(t *testing.T, endpoint, token, repo, revision, oneFile string) 
 		t.Fatalf("unreadable script output %q: %v", stdout.String(), err)
 	}
 	return res, stderr.String(), nil
+}
+
+// reachable lists the hosts the Python client may contact directly. Every
+// other host goes to the dead proxy. A real S3 service is included when
+// one is configured, because a redirected download fetches from it.
+func reachable() string {
+	hosts := "127.0.0.1,localhost"
+	if u, err := url.Parse(os.Getenv("REGISTRY_TEST_S3_ENDPOINT")); err == nil && u.Hostname() != "" {
+		hosts += "," + u.Hostname()
+	}
+	return hosts
 }
 
 func fileSHA256(t *testing.T, p string) string {

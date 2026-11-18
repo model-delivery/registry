@@ -192,6 +192,13 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	p.mu.Unlock()
 
 	job, err := p.share(ctx, key, func(ctx context.Context, job *pullJob) {
+		// A request that missed locally just before another job recorded
+		// this revision arrives here after that job has gone. Look again
+		// before asking the upstream a second time.
+		if c, err := p.reg.Resolve(ctx, repo, rev); err == nil {
+			job.repo = c.Repo
+			return
+		}
 		plan, err := mirror.Prepare(ctx, p.upstream(), repo, rev)
 		if err != nil {
 			job.err = err

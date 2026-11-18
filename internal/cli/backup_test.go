@@ -270,8 +270,10 @@ func TestScheduledBackupsRunAndPrune(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(list) > 2 {
-			t.Fatalf("%d backups kept, limit is 2", len(list))
+		// A new backup is stored before the oldest is removed, so one more
+		// than the limit can be seen for a moment.
+		if len(list) > 3 {
+			t.Fatalf("%d backups present, limit is 2", len(list))
 		}
 		for _, b := range list {
 			seen[b.Name] = true
@@ -286,6 +288,14 @@ func TestScheduledBackupsRunAndPrune(t *testing.T) {
 	case <-finished:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the schedule did not stop when the server did")
+	}
+	// With the schedule stopped nothing is in flight: the limit holds exactly.
+	list, err := reg.Backups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) > 2 {
+		t.Fatalf("%d backups kept, limit is 2", len(list))
 	}
 }
 

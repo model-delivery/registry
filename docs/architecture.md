@@ -247,6 +247,12 @@ Deleting a repository removes its revisions and then removes the blobs that
 no other repository references. `modelctl gc` removes blobs that nothing
 references at all, skipping any younger than an hour, since those may
 belong to a push that has uploaded files but not yet recorded its revision.
+Deleting a repository makes the same allowance more narrowly: it leaves a
+blob alone if, within the last hour, a push or mirror stored it again or
+was told it is already stored and has not yet recorded a revision naming
+it. Such a blob goes at a later `gc` if nothing came to use it. Everything
+else the repository alone held is removed at once, which is what makes
+"delete and mirror again" a repair for a damaged file.
 
 Publishing a blob and removing it take turns on a lock held per digest, so
 a blob cannot be deleted between being written and being recorded, and a

@@ -135,7 +135,11 @@ func (r *Registry) Fulfil(ctx context.Context, c Commit, path, sha256 string) er
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.awaited.arrived(sha256)
+	return nil
 }
 
 // fulfil moves one pending file of a revision to its stored files, and
@@ -274,6 +278,7 @@ func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Comm
 	if err := tx.Commit(); err != nil {
 		return Commit{}, err
 	}
+	r.recorded(in.Files)
 	return c, nil
 }
 

@@ -154,6 +154,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 	if err := tx.Commit(); err != nil {
 		return Commit{}, err
 	}
+	r.recorded(in.Files)
 	return c, nil
 }
 

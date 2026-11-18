@@ -255,9 +255,7 @@ func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiGC(w http.ResponseWriter, r *http.Request) {
-	// Unreferenced blobs younger than this may belong to a push that has
-	// uploaded its files but not yet recorded its revision.
-	res, err := s.reg.GC(r.Context(), time.Hour)
+	res, err := s.reg.GC(r.Context(), registry.BlobGrace)
 	if err != nil && res.Blobs == 0 {
 		s.fail(w, r, err)
 		return

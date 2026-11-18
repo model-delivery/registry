@@ -364,6 +364,12 @@ func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
 
 // DeleteRepo removes a repository, all its revisions, and every blob that
 // no other repository still references.
+//
+// One kind of blob is spared: one that a writer stored again, or was told
+// is "already stored", within BlobGrace and has not yet recorded a revision
+// for. That writer's revision is on its way, and until it lands the blob
+// looks unreferenced the moment this repository is gone. A blob spared
+// here is removed by a later garbage collection if nothing came to use it.
 func (r *Registry) DeleteRepo(ctx context.Context, name string) (GCResult, error) {
 	repo, err := r.GetRepo(ctx, name)
 	if err != nil {
@@ -390,8 +396,9 @@ func (r *Registry) DeleteRepo(ctx context.Context, name string) (GCResult, error
 		return GCResult{}, err
 	}
 	// The repository is gone. Free what it alone was holding; blobs another
-	// repository uses are still referenced and are skipped.
-	return r.dropUnreferenced(ctx, digests, r.stamp())
+	// repository uses are still referenced and are skipped, and so are
+	// those a writer is about to reference.
+	return r.dropUnreferenced(ctx, digests, r.stamp(), true)
 }
 
 // CreateRepo records an empty repository, so it exists before its first

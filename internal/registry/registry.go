@@ -114,6 +114,9 @@ type Registry struct {
 	// time, so a blob can never be deleted between being written and being
 	// recorded. Work on different digests never waits on each other.
 	locks keyLock
+	// awaited is the blobs a writer has stored, or been told are stored,
+	// and has not yet recorded a revision for (see awaiting).
+	awaited awaiting
 	// backupMu lets one backup be taken at a time (see Backup).
 	backupMu sync.Mutex
 	now      func() time.Time
@@ -283,24 +286,118 @@ func (r *Registry) PutBlob(ctx context.Context, rd io.Reader, want blob.Expect) 
 	}
 	// Re-sending a blob refreshes its age, so garbage collection keeps its
 	// hands off content a push is about to reference.
+	at, now := r.clock()
 	_, err = r.db.ExecContext(ctx,
 		`INSERT INTO blobs (sha256, size, git_oid, created_at) VALUES (?, ?, ?, ?)
 		 ON CONFLICT (sha256) DO UPDATE SET created_at = excluded.created_at`,
-		info.SHA256, info.Size, info.GitOID, r.stamp())
+		info.SHA256, info.Size, info.GitOID, now)
 	if err != nil {
 		return blob.Info{}, fmt.Errorf("record blob: %w", err)
 	}
+	r.awaited.expect(info.SHA256, at.Add(BlobGrace))
 	return info, nil
 }
 
 // TouchBlob marks a stored blob as just used. A pusher that finds a file
 // already stored calls this instead of uploading, which protects the blob
-// from garbage collection until the push records its revision.
+// from garbage collection, and from the deletion of the repository that
+// holds it, until the push records its revision.
+//
+// It does not take the digest's lock, which an upload of the same content
+// can hold for as long as the upload lasts; asking must stay quick.
 func (r *Registry) TouchBlob(ctx context.Context, digest string) (blob.Info, bool, error) {
-	if _, err := r.db.ExecContext(ctx, "UPDATE blobs SET created_at = ? WHERE sha256 = ?", r.stamp(), digest); err != nil {
+	// Against DeleteRepo deciding about this blob: "it is stored" is
+	// answered either before that looks, and is seen, or after the blob is
+	// gone, and is then "no".
+	r.awaited.asking.Lock()
+	defer r.awaited.asking.Unlock()
+	at, now := r.clock()
+	if _, err := r.db.ExecContext(ctx, "UPDATE blobs SET created_at = ? WHERE sha256 = ?", now, digest); err != nil {
 		return blob.Info{}, false, err
 	}
-	return r.StatBlob(ctx, digest)
+	info, ok, err := r.StatBlob(ctx, digest)
+	if ok {
+		r.awaited.expect(digest, at.Add(BlobGrace))
+	}
+	return info, ok, err
+}
+
+// awaiting is the set of blobs a writer is about to reference. A writer
+// stores its files, or is told they are already stored, and only then
+// records the revision that uses them. In between, a blob can be
+// referenced by nothing, or only by a repository that is being deleted.
+//
+// Garbage collection covers that gap with the blob's age, which every
+// write and every "is it stored?" refreshes. Deleting a repository cannot
+// use age alone: the content of a repository that was just mirrored or
+// pushed is young by definition, and "delete it and mirror it again" is
+// how a damaged file is repaired, so those blobs must go at once. What
+// separates the two cases is whether the writer finished. So a blob is
+// awaited from the moment it is stored or asked about until a revision
+// naming it is recorded, or BlobGrace passes, whichever is first, and
+// DeleteRepo leaves an awaited blob to garbage collection.
+//
+// It is kept in memory: one process owns a data directory, and after a
+// restart the worst outcome is the one before this existed, a push that
+// fails cleanly with "blob has not been uploaded".
+type awaiting struct {
+	// asking is held while a writer is told whether a blob is stored, and
+	// while DeleteRepo checks for a wait and removes the blob's record, so
+	// the two never interleave. Both are a couple of quick statements.
+	asking sync.Mutex
+
+	mu    sync.Mutex
+	until map[string]time.Time
+}
+
+// awaitedSweep is how many entries the set may hold before expired ones
+// are looked for on the next addition.
+const awaitedSweep = 1024
+
+// expect marks digest as awaited until the given time.
+func (a *awaiting) expect(digest string, until time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.until == nil {
+		a.until = map[string]time.Time{}
+	}
+	if len(a.until) >= awaitedSweep {
+		// Dropped by the time being marked from, which is no later than now.
+		now := until.Add(-BlobGrace)
+		for d, t := range a.until {
+			if !t.After(now) {
+				delete(a.until, d)
+			}
+		}
+	}
+	a.until[digest] = until
+}
+
+// arrived ends the wait for each digest: a revision naming it is recorded.
+func (a *awaiting) arrived(digests ...string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, d := range digests {
+		delete(a.until, d)
+	}
+}
+
+// has reports whether digest is still awaited at now.
+func (a *awaiting) has(digest string, now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	until, ok := a.until[digest]
+	return ok && until.After(now)
+}
+
+// recorded ends the wait for the content of each file: a revision that
+// names it has been recorded.
+func (r *Registry) recorded(files []File) {
+	digests := make([]string, len(files))
+	for i, f := range files {
+		digests[i] = f.SHA256
+	}
+	r.awaited.arrived(digests...)
 }
 
 // PresignBlob returns a direct download URL for a blob when the storage
@@ -358,11 +455,27 @@ type GCResult struct {
 	Bytes int64 `json:"bytes"`
 }
 
+// BlobGrace is how long a blob is left alone after it was last written or
+// asked about, when nothing references it. A push stores its files, or is
+// told they are already stored, before it records the revision that
+// references them, and this is what keeps them from being removed in
+// between. Garbage collection applies it to a blob's age; deleting a
+// repository applies it to the blobs a writer has not finished with (see
+// awaiting).
+const BlobGrace = time.Hour
+
+// cutoff is the stored form of the time minAge ago: a blob last written
+// or touched after it is too young to remove.
+func (r *Registry) cutoff(minAge time.Duration) string {
+	return r.now().Add(-minAge).UTC().Format(timeLayout)
+}
+
 // GC removes blobs that no revision references and that were last written
 // or touched more than minAge ago. The age guard protects uploads whose
-// revision has not been recorded yet.
+// revision has not been recorded yet; BlobGrace is the age to pass unless
+// nothing else is writing.
 func (r *Registry) GC(ctx context.Context, minAge time.Duration) (GCResult, error) {
-	cutoff := r.now().Add(-minAge).UTC().Format(timeLayout)
+	cutoff := r.cutoff(minAge)
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT sha256 FROM blobs b
 		 WHERE b.created_at <= ? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = b.sha256)`, cutoff)
@@ -373,7 +486,7 @@ func (r *Registry) GC(ctx context.Context, minAge time.Duration) (GCResult, erro
 	if err != nil {
 		return GCResult{}, err
 	}
-	return r.dropUnreferenced(ctx, digests, cutoff)
+	return r.dropUnreferenced(ctx, digests, cutoff, false)
 }
 
 func scanStrings(rows *sql.Rows) ([]string, error) {
@@ -392,18 +505,20 @@ func scanStrings(rows *sql.Rows) ([]string, error) {
 // dropUnreferenced removes each candidate blob that is still unreferenced
 // and not newer than cutoff. The check and the removal of the record are
 // one statement, made while holding the blob's lock, so a blob that gained
-// a reference or was re-uploaded since it was picked is left alone.
-func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutoff string) (GCResult, error) {
+// a reference or was re-uploaded since it was picked is left alone. With
+// spareAwaited, so is one a writer has stored or asked about and not yet
+// recorded a revision for.
+//
+// Every candidate is tried. The result counts what was removed, and the
+// error is the first failure, so both can be set: some blobs freed and one
+// that could not be.
+func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutoff string, spareAwaited bool) (GCResult, error) {
 	var res GCResult
 	var firstErr error
 	for _, d := range digests {
 		err := func() error {
 			defer r.locks.lock(d)()
-			var size int64
-			err := r.db.QueryRowContext(ctx,
-				`DELETE FROM blobs WHERE sha256 = ? AND created_at <= ?
-				 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = blobs.sha256)
-				 RETURNING size`, d, cutoff).Scan(&size)
+			size, err := r.forget(ctx, d, cutoff, spareAwaited)
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil // referenced or refreshed in the meantime
 			}
@@ -425,6 +540,27 @@ func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutof
 		}
 	}
 	return res, firstErr
+}
+
+// forget removes the record of a blob that is unreferenced and not newer
+// than cutoff, and returns its size. The check is part of the statement
+// that deletes. It returns sql.ErrNoRows when the blob is to be kept:
+// referenced, refreshed since it was picked, or, with spareAwaited, one a
+// writer is about to reference. The caller holds the digest's lock.
+func (r *Registry) forget(ctx context.Context, digest, cutoff string, spareAwaited bool) (int64, error) {
+	if spareAwaited {
+		r.awaited.asking.Lock()
+		defer r.awaited.asking.Unlock()
+		if r.awaited.has(digest, r.now()) {
+			return 0, sql.ErrNoRows
+		}
+	}
+	var size int64
+	err := r.db.QueryRowContext(ctx,
+		`DELETE FROM blobs WHERE sha256 = ? AND created_at <= ?
+		 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = blobs.sha256)
+		 RETURNING size`, digest, cutoff).Scan(&size)
+	return size, err
 }
 
 // ---- tokens ----

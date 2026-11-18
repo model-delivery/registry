@@ -2,7 +2,7 @@
 
 **A self-hosted registry for AI models that existing Hugging Face tools can download from.**
 
-Your models. Your infrastructure. Your rules.
+Your models. Your infrastructure. Your rules. Website: <https://model.delivery>
 
 Think of a Docker registry or Artifactory, built for model files. Mirror
 repositories from Hugging Face, or push your own, and serve them from a
@@ -194,6 +194,14 @@ export HF_TOKEN=md_...
 **TLS.** The registry speaks plain HTTP. Put it behind a reverse proxy
 (Caddy, nginx, Traefik) for HTTPS, and do that before exposing it beyond a
 network you trust. See [docs/operations.md](docs/operations.md).
+
+**Offline and air-gapped networks.** The server contacts the upstream hub
+only when you run `modelctl mirror` or turn on pull-through, and its
+storage bucket if you configured one. It makes no other outbound
+connection: no telemetry and no update check, and the web interface loads
+nothing from elsewhere. To serve models where there is no route to
+Hugging Face, mirror them on a connected machine and carry the data
+directory across, or `modelctl pull` there and `modelctl push` inside.
 
 **Backups.** Set `REGISTRY_BACKUP_INTERVAL=1h` and the registry stores a
 verified snapshot of its metadata next to the model files on that

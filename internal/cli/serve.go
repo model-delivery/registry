@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -198,12 +197,16 @@ func runBackups(ctx context.Context, reg *registry.Registry, every time.Duration
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b, info, err := reg.Backup(ctx, keep)
+			res, err := reg.Backup(ctx, keep)
 			if err != nil {
 				log.Error("scheduled metadata backup failed", "error", err)
 				continue
 			}
-			log.Info("metadata backup stored", "name", b.Name, "bytes", b.Size, "repos", info.Repos, "revisions", info.Revisions)
+			log.Info("metadata backup stored", "name", res.Backup.Name, "bytes", res.Backup.Size,
+				"repos", res.Contents.Repos, "revisions", res.Contents.Revisions)
+			if res.PruneErr != nil {
+				log.Warn("the backup was stored, but old backups beyond the number to keep could not be removed", "keep", keep, "error", res.PruneErr)
+			}
 		}
 	}
 }
@@ -213,28 +216,19 @@ func runBackups(ctx context.Context, reg *registry.Registry, every time.Duration
 // replacement starts from the last backup instead of from nothing. A data
 // directory that already has a database is never touched.
 func restoreIfEmpty(e *env, data string, store blob.Store, log *slog.Logger) error {
-	if _, err := os.Stat(filepath.Join(data, "registry.db")); err == nil {
+	if _, err := os.Stat(datadir.Dir(data).Database()); err == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Join(data, "tmp"), 0o750); err != nil {
-		return err
-	}
-	snapshot := filepath.Join(data, "tmp", "restore-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".db")
-	defer func() { _ = os.Remove(snapshot) }()
-	name, err := registry.FetchBackup(e.ctx, store, "", snapshot)
+	res, err := registry.RestoreBackup(e.ctx, data, store, "", false)
 	switch {
 	case errors.Is(err, blob.ErrArchiveNotFound):
 		log.Info("no database and no stored backup: starting as a new registry")
 		return nil
 	case err != nil:
-		return fmt.Errorf("REGISTRY_RESTORE_IF_EMPTY: fetch the newest backup: %w", err)
+		return fmt.Errorf("REGISTRY_RESTORE_IF_EMPTY: restore the newest backup: %w", err)
 	}
-	info, _, err := registry.Restore(e.ctx, data, snapshot, false)
-	if err != nil {
-		return fmt.Errorf("REGISTRY_RESTORE_IF_EMPTY: %w", err)
-	}
-	log.Info("restored the metadata database from the newest stored backup", "backup", name,
-		"repos", info.Repos, "revisions", info.Revisions)
+	log.Info("restored the metadata database from the newest stored backup", "backup", res.Backup,
+		"repos", res.Contents.Repos, "revisions", res.Contents.Revisions)
 	return nil
 }
 

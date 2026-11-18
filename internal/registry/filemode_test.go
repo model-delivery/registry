@@ -61,7 +61,7 @@ func TestDatabaseFilesAreOwnerOnly(t *testing.T) {
 	checkDatabase("after writing", dir)
 
 	snapshot := filepath.Join(t.TempDir(), "snapshot.db")
-	if _, err := r.Snapshot(ctx, snapshot); err != nil {
+	if _, err := r.snapshot(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	if got := mode(snapshot); got != 0o600 {

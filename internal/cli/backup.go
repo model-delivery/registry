@@ -9,8 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -46,10 +44,16 @@ func cmdBackup(e *env, args []string) error {
 				Repos     int `json:"repos"`
 				Revisions int `json:"revisions"`
 			} `json:"contents"`
+			// Warning is set when the backup was stored and something
+			// after that went wrong, such as removing old backups.
+			Warning string `json:"warning"`
 		}
 		_ = json.Unmarshal(raw, &out)
 		fmt.Fprintf(e.stdout, "Stored backup %s (%s): %d repositories, %d revisions\n",
 			out.Backup.Name, humanBytes(out.Backup.Size), out.Contents.Repos, out.Contents.Revisions)
+		if out.Warning != "" {
+			fmt.Fprintf(e.stderr, "Warning: %s\n", out.Warning)
+		}
 		return nil
 
 	case "list":
@@ -126,34 +130,28 @@ func cmdRestore(e *env, args []string) error {
 		return usagef("give a snapshot file, or --latest, or --name: exactly one")
 	}
 
-	snapshot := ""
-	source := ""
+	var res registry.Restored
 	if fromStorage {
-		// The storage backend, quietly: its start-up line is not this command's output.
+		// The storage backend, quietly: its start-up line is not this
+		// command's output. Opening it removes nothing, so this is safe
+		// beside a registry that is running on the same data directory.
 		store, _, err := openStore(e, *data, *storage, slog.New(slog.DiscardHandler))
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Join(*data, "tmp"), 0o750); err != nil {
-			return err
-		}
-		snapshot = filepath.Join(*data, "tmp", "restore-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".db")
-		defer func() { _ = os.Remove(snapshot) }()
-		source, err = registry.FetchBackup(e.ctx, store, *name, snapshot)
-		if err != nil {
+		if res, err = registry.RestoreBackup(e.ctx, *data, store, *name, *replace); err != nil {
 			return err
 		}
 	} else {
-		snapshot, source = pos[0], pos[0]
+		info, previous, err := registry.Restore(e.ctx, *data, pos[0], *replace)
+		if err != nil {
+			return err
+		}
+		res = registry.Restored{Backup: pos[0], Contents: info, Previous: previous}
 	}
-
-	info, previous, err := registry.Restore(e.ctx, *data, snapshot, *replace)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(e.stdout, "Restored %s into %s: %d repositories, %d revisions\n", source, *data, info.Repos, info.Revisions)
-	if previous != "" {
-		fmt.Fprintf(e.stdout, "The database that was there is kept at %s\n", previous)
+	fmt.Fprintf(e.stdout, "Restored %s into %s: %d repositories, %d revisions\n", res.Backup, *data, res.Contents.Repos, res.Contents.Revisions)
+	if res.Previous != "" {
+		fmt.Fprintf(e.stdout, "The database that was there is kept at %s\n", res.Previous)
 	}
 	fmt.Fprintln(e.stdout, "Start the registry with: modelctl serve")
 	return nil

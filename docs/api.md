@@ -171,7 +171,7 @@ All `admin`. See [operations.md](operations.md#backup-and-restore).
 | | |
 |---|---|
 | `GET /api/v1/backups` | List stored backups, oldest first: `name`, `size`, `created_at`. |
-| `POST /api/v1/backups` | Take a backup and store it next to the model files. Returns `backup` and `contents` (`schema_version`, `repos`, `revisions`, `size`). |
+| `POST /api/v1/backups` | Take a backup and store it next to the model files. Returns `backup` and `contents` (`schema_version`, `repos`, `revisions`, `size`), and a `warning` string when the backup was stored but old backups beyond the number to keep could not be removed. |
 | `GET /api/v1/backup/snapshot` | Download a fresh, verified snapshot of the metadata database (`application/vnd.sqlite3`). |
 
 ## Maintenance

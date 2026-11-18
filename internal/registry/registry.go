@@ -114,7 +114,9 @@ type Registry struct {
 	// time, so a blob can never be deleted between being written and being
 	// recorded. Work on different digests never waits on each other.
 	locks keyLock
-	now   func() time.Time
+	// backupMu lets one backup be taken at a time (see Backup).
+	backupMu sync.Mutex
+	now      func() time.Time
 	// dir holds the database and scratch space.
 	dir datadir.Dir
 }

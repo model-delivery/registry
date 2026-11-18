@@ -398,8 +398,13 @@ model files:
   elsewhere, or use `modelctl backup download` from another machine.
 
 Backups are named by time, `registry-20261118T140000Z.db`, and the oldest
-beyond the keep count are removed. A failed backup is logged as an error
-and the schedule carries on; alert on `scheduled metadata backup failed`.
+beyond the keep count are removed. A second backup taken in the same
+second is named `registry-20261118T140000Z_2.db`; it does not replace the
+first. A failed backup is logged as an error and the schedule carries on;
+alert on `scheduled metadata backup failed`. A backup that was stored but
+could not be followed by the removal of old ones is not a failure: it is
+logged as a warning (`old backups beyond the number to keep could not be
+removed`), and `modelctl backup now` prints the warning.
 
 A stored backup contains token hashes (not the tokens) and the full
 catalogue. Anyone who can read the bucket can read it.
@@ -430,7 +435,10 @@ modelctl restore snap.db                # a downloaded snapshot
 verifies the snapshot first, and refuses a file that is damaged, is not a
 registry database, or was written by a newer version. It will not
 overwrite an existing database unless you pass `--replace`, and then the
-old one is kept beside it as `registry.db.before-restore-<time>`.
+old one is kept beside it as `registry.db.before-restore-<time>`, together
+with its write-ahead log (`...-wal`, `...-shm`) if the registry did not
+stop cleanly, so nothing it had committed is lost from the kept copy. If
+the restore fails, the old database is put back where it was.
 
 ### A server whose disk does not outlive it
 

@@ -205,7 +205,7 @@ func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	notice := noticeDeleted
 	switch {
 	case errors.Is(err, registry.ErrBlobsNotFreed):
-		s.log.Warn("stored files could not be removed", "repo", name, "error", err)
+		s.logNotFreed(err, "repo", name)
 		notice = noticeDeletedPartly
 	case err != nil:
 		s.uiError(w, r, err)

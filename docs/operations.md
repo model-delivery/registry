@@ -624,11 +624,20 @@ if nothing came to use it.
 If storage refuses to remove some of the files, the command has still done
 what it was asked (the repository is deleted, the rest is freed): it exits
 `0` and prints a warning on standard error, and the server's log has the
-reason. What was left behind is wasted space and nothing more: the
-registry has already dropped its record of those files, so no revision can
-refer to them, and a later `gc` does not look for them. The log names the
-first file that could not be removed, by its digest; once the storage is
-put right, remove what is left by hand.
+reason, one line for each file that could not be removed, naming it by
+its digest. The counts the command prints are the files that were really
+removed. What was left behind is wasted space and nothing more, and the
+registry still has its record of those files: once the storage is put
+right, run `modelctl gc` and it removes them. Nothing has to be removed
+by hand. (Before v0.4.0 the registry dropped its record of such a file
+even though the file stayed, counted it as freed, and no later `gc` found
+it; files left behind by an earlier version still have to be removed from
+storage by hand.)
+
+Two rare cases are different. If storage reported a failure and the file
+turns out to be gone, it is counted as removed. If the record itself
+cannot be put back, because the database fails at that moment, the log
+line says so, and that one file is not found by a later `gc`.
 
 ## Checking stored files
 

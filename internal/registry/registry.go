@@ -516,64 +516,129 @@ func scanStrings(rows *sql.Rows) ([]string, error) {
 // spareAwaited, so is one a writer has stored or asked about and not yet
 // recorded a revision for.
 //
-// Every candidate is tried. The result counts what was removed, and the
-// error is the first failure, so both can be set: some blobs freed and one
-// that could not be.
+// Every candidate is tried. The result counts the blobs that were removed
+// from storage, and only those. The error, a *NotFreedError, carries every
+// failure, so both can be set: some blobs freed and some that could not be.
 func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutoff string, spareAwaited bool) (GCResult, error) {
 	var res GCResult
-	var firstErr error
+	var notFreed NotFreedError
 	for _, d := range digests {
-		err := func() error {
-			defer r.locks.lock(d)()
-			size, err := r.forget(ctx, d, cutoff, spareAwaited)
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil // referenced or refreshed in the meantime
-			}
-			if err != nil {
-				return fmt.Errorf("forget blob %s: %w", d, err)
-			}
+		freed, size, err := r.dropBlob(ctx, d, cutoff, spareAwaited, &notFreed)
+		if err != nil {
+			notFreed.Failures = append(notFreed.Failures, err)
+		}
+		if freed {
 			res.Blobs++
 			res.Bytes += size
-			// The record is gone, so nothing can reference these bytes any
-			// more. If removing them fails they are wasted space, never a
-			// dangling reference.
-			if err := r.blobs.Delete(ctx, d); err != nil {
-				return fmt.Errorf("remove blob %s: %w", d, err)
-			}
-			return nil
-		}()
-		if err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("%w: %w", ErrBlobsNotFreed, err)
 		}
 	}
-	return res, firstErr
+	if len(notFreed.Failures) > 0 {
+		return res, &notFreed
+	}
+	return res, nil
+}
+
+// dropBlob removes one candidate blob, holding its lock throughout, and
+// reports whether its bytes are gone from storage.
+//
+// The record goes first, in the statement that checks the blob is still
+// unreferenced: from then on nothing can come to reference the bytes, so
+// removing them cannot leave a revision pointing at nothing. If storage
+// then refuses to remove them, the record is put back as it was, still
+// under the lock. The blob is then what it was before the attempt, stored
+// and unreferenced, and the next garbage collection picks it up again;
+// without the record nothing would ever look for those bytes.
+func (r *Registry) dropBlob(ctx context.Context, digest, cutoff string, spareAwaited bool, notFreed *NotFreedError) (freed bool, size int64, err error) {
+	defer r.locks.lock(digest)()
+	was, err := r.forget(ctx, digest, cutoff, spareAwaited)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0, nil // referenced or refreshed in the meantime
+	}
+	if err != nil {
+		return false, 0, fmt.Errorf("forget blob %s: %w", digest, err)
+	}
+	removeErr := r.blobs.Delete(ctx, digest)
+	if removeErr == nil {
+		return true, was.size, nil
+	}
+	// What follows must happen even if the caller has gone away, which may
+	// be the very reason the removal failed.
+	settle := context.WithoutCancel(ctx)
+	// A removal can fail after it took effect (the answer was lost on the
+	// way back). A record must not be put back for bytes that are gone: a
+	// push would be told they are stored. So look. If storage cannot say,
+	// the record is put back: storage that cannot be reached has most
+	// likely removed nothing.
+	if rc, _, openErr := r.blobs.Open(settle, digest); openErr == nil {
+		_ = rc.Close()
+	} else if errors.Is(openErr, blob.ErrNotFound) {
+		return true, was.size, nil
+	}
+	notFreed.Stuck++
+	if _, err := r.db.ExecContext(settle,
+		`INSERT INTO blobs (sha256, size, git_oid, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (sha256) DO NOTHING`,
+		digest, was.size, was.gitOID, was.createdAt); err != nil {
+		return false, 0, fmt.Errorf("remove blob %s: %w; and its record could not be restored, so no later garbage collection will find it "+
+			"and it has to be removed from storage by hand: %w", digest, removeErr, err)
+	}
+	return false, 0, fmt.Errorf("remove blob %s: %w", digest, removeErr)
 }
 
 // ErrBlobsNotFreed reports that an operation was carried out and that
 // some of the blobs it left unreferenced could not then be removed. The
 // result returned with it stands: for DeleteRepo, the repository is
-// deleted. What is left behind is wasted space, never a dangling reference.
+// deleted. What is left behind is wasted space, never a dangling
+// reference, and the registry still has a record of it, so a later garbage
+// collection tries again. It arrives as a *NotFreedError.
 var ErrBlobsNotFreed = errors.New("some stored files could not be removed")
 
+// NotFreedError is every failure of one run of removing unreferenced blobs.
+// errors.Is finds ErrBlobsNotFreed in it, and each failure's own cause.
+type NotFreedError struct {
+	// Failures has one error per blob that could not be removed, naming it
+	// by its digest.
+	Failures []error
+	// Stuck is how many of those storage refused to remove, as opposed to
+	// blobs the database could not be asked about.
+	Stuck int
+}
+
+func (e *NotFreedError) Error() string {
+	return ErrBlobsNotFreed.Error() + ": " + errors.Join(e.Failures...).Error()
+}
+
+// Is makes errors.Is(err, ErrBlobsNotFreed) hold.
+func (e *NotFreedError) Is(target error) bool { return target == ErrBlobsNotFreed }
+
+// Unwrap returns the failures, so errors.Is and errors.As see their causes.
+func (e *NotFreedError) Unwrap() []error { return e.Failures }
+
+// forgotten is the record forget removed, kept so that it can be put back.
+type forgotten struct {
+	size      int64
+	gitOID    string
+	createdAt string
+}
+
 // forget removes the record of a blob that is unreferenced and not newer
-// than cutoff, and returns its size. The check is part of the statement
+// than cutoff, and returns what it held. The check is part of the statement
 // that deletes. It returns sql.ErrNoRows when the blob is to be kept:
 // referenced, refreshed since it was picked, or, with spareAwaited, one a
 // writer is about to reference. The caller holds the digest's lock.
-func (r *Registry) forget(ctx context.Context, digest, cutoff string, spareAwaited bool) (int64, error) {
+func (r *Registry) forget(ctx context.Context, digest, cutoff string, spareAwaited bool) (forgotten, error) {
 	if spareAwaited {
 		r.awaited.asking.Lock()
 		defer r.awaited.asking.Unlock()
 		if r.awaited.has(digest, r.now()) {
-			return 0, sql.ErrNoRows
+			return forgotten{}, sql.ErrNoRows
 		}
 	}
-	var size int64
+	var was forgotten
 	err := r.db.QueryRowContext(ctx,
 		`DELETE FROM blobs WHERE sha256 = ? AND created_at <= ?
 		 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.sha256 = blobs.sha256)
-		 RETURNING size`, digest, cutoff).Scan(&size)
-	return size, err
+		 RETURNING size, git_oid, created_at`, digest, cutoff).Scan(&was.size, &was.gitOID, &was.createdAt)
+	return was, err
 }
 
 // ---- tokens ----

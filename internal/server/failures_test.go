@@ -214,6 +214,18 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 		if got := logs.String(); !strings.Contains(got, "permission denied") || !strings.Contains(got, "level=WARN") {
 			t.Fatalf("the reason was not logged:\n%s", got)
 		}
+		// Nothing was removed, so nothing is counted as freed, each file has
+		// its own line in the log, and the registry still knows every one of
+		// them: a later garbage collection finds them again.
+		if *out.Blobs != 0 || *out.Bytes != 0 {
+			t.Fatalf("the answer counts files that were not removed: %s", raw)
+		}
+		if n := strings.Count(logs.String(), "stored files could not be removed"); n != len(modelFiles) {
+			t.Fatalf("%d of the %d files that could not be removed were logged:\n%s", n, len(modelFiles), logs.String())
+		}
+		if st, err := in.Reg.Stats(context.Background()); err != nil || st.Blobs != len(modelFiles) {
+			t.Fatalf("stats = %+v, %v; want the %d files still recorded", st, err, len(modelFiles))
+		}
 		if resp := do(t, http.MethodGet, in.URL+"/api/v1/repos/acme/tiny", "", nil, nil); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("the repository is still there: %d", resp.StatusCode)
 		}

@@ -82,7 +82,10 @@ are exercised), `task build`, `task docker`.
 - **Publishing and removing a blob hold that digest's lock**
   (`Registry.locks`). Removal re-checks "unreferenced" in the same
   statement that deletes the record. Do not split that check from the
-  delete.
+  delete. The record goes before the bytes; if storage then refuses to
+  remove them, `dropBlob` puts the record back before it releases the
+  lock, so that a later `gc` finds the blob again. Only what storage
+  removed is counted as freed.
 - **All SQL stays in `internal/registry`.** That is what keeps a second
   metadata backend a contained change.
 - **Revisions are immutable.** A revision's id and what it lists (each

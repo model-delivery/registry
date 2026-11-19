@@ -125,7 +125,9 @@ uses. Returns `{"blobs": 3, "bytes": 28183891}`: what was freed.
 If the repository was deleted and some of its files could not then be
 removed from storage, the answer is still `200`, with a `warning` beside
 the counts. The repository is gone either way; the files left behind take
-up space and are referenced by nothing.
+up space, are referenced by nothing, and are not in the counts. The
+registry keeps its record of them, so a later garbage collection removes
+them once storage allows it.
 
 ## Pushing
 
@@ -244,7 +246,7 @@ address still works and answers the same; new clients should use
 | | |
 |---|---|
 | `GET /api/v1/stats` (read) | `repos`, `revisions`, `blobs`, `stored_bytes` (on disk), `logical_bytes` (sum over every file of every revision). |
-| `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed, as `{"blobs": 3, "bytes": 28183891}`, with a `warning` string when some of them could not be removed from storage. |
+| `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed, as `{"blobs": 3, "bytes": 28183891}`, with a `warning` string when some files could not be removed from storage. Those are not counted, and the next run tries them again. |
 | `POST /api/v1/verify` (admin) | Re-read every stored file and check it against its digest. See below. |
 | `GET /healthz` | `{"status": "ok", "version": "..."}`. No authentication. |
 

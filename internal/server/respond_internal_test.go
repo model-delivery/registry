@@ -202,6 +202,48 @@ func TestAnswerFreedWarnsWithoutTheReason(t *testing.T) {
 	}
 }
 
+// Every file that could not be removed gets a log line of its own, and a
+// garbage collection that removed nothing because storage refused is still
+// one that took place: it answers with the warning, as it did when the
+// count included the files it had only forgotten.
+func TestFilesThatCouldNotBeRemovedAreEachLogged(t *testing.T) {
+	t.Parallel()
+	logs := &strings.Builder{}
+	s := &Server{log: slog.New(slog.NewTextHandler(logs, nil))}
+	stuck := &registry.NotFreedError{Stuck: 2, Failures: []error{
+		errors.New("remove blob aaaa: permission denied"),
+		errors.New("remove blob bbbb: permission denied"),
+	}}
+	rec := httptest.NewRecorder()
+	s.answerFreed(rec, registry.GCResult{}, stuck, gcWarning)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"blobs":0`) || !strings.Contains(rec.Body.String(), `"warning"`) {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	got := logs.String()
+	if strings.Count(got, "level=WARN") != 2 || !strings.Contains(got, "aaaa") || !strings.Contains(got, "bbbb") {
+		t.Fatalf("want one warning for each file:\n%s", got)
+	}
+
+	dbOnly := &registry.NotFreedError{Failures: []error{errors.New("forget blob aaaa: database is locked")}}
+	cases := []struct {
+		name string
+		res  registry.GCResult
+		err  error
+		want bool
+	}{
+		{"some removed, some stuck", registry.GCResult{Blobs: 1, Bytes: 10}, stuck, true},
+		{"none removed, some stuck", registry.GCResult{}, stuck, true},
+		{"some removed, the database failed for others", registry.GCResult{Blobs: 1, Bytes: 10}, dbOnly, true},
+		{"none removed, and only the database failed", registry.GCResult{}, dbOnly, false},
+		{"the candidates could not be listed", registry.GCResult{}, errors.New("database is locked"), false},
+	}
+	for _, tc := range cases {
+		if got := collected(tc.res, tc.err); got != tc.want {
+			t.Errorf("%s: collected = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // waitFor polls until ok, which looks at the coordinator under its lock.
 func waitFor(t *testing.T, p *puller, what string, ok func() bool) {
 	t.Helper()

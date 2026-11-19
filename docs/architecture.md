@@ -463,6 +463,11 @@ a blob cannot be deleted between being written and being recorded, and a
 long upload of one file never holds up work on another. Removal re-checks,
 in the same statement that deletes the record, that the blob is still
 unreferenced and has not been re-sent or asked about since it was picked.
+The record goes before the bytes, so that nothing can come to reference
+bytes that are about to go. If storage then refuses to remove them, the
+record is put back as it was, still under the lock: the blob is again
+what it was, stored and unreferenced, and the next garbage collection
+tries it again. Only what storage really removed is counted as freed.
 
 ## Access control
 

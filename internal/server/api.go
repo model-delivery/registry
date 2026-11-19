@@ -157,10 +157,24 @@ const (
 func (s *Server) answerFreed(w http.ResponseWriter, res registry.GCResult, notFreed error, warning string) {
 	out := freed{GCResult: res}
 	if notFreed != nil {
-		s.log.Warn("stored files could not be removed", "error", notFreed)
+		s.logNotFreed(notFreed)
 		out.Warning = warning
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// logNotFreed logs why stored files could not be removed: one line for
+// each file, naming it by its digest, so that none is hidden behind the
+// first. attrs are added to every line.
+func (s *Server) logNotFreed(notFreed error, attrs ...any) {
+	var each *registry.NotFreedError
+	if !errors.As(notFreed, &each) {
+		s.log.Warn("stored files could not be removed", append(attrs, "error", notFreed)...)
+		return
+	}
+	for _, failure := range each.Failures {
+		s.log.Warn("stored files could not be removed", append(attrs[:len(attrs):len(attrs)], "error", failure)...)
+	}
 }
 
 func (s *Server) apiDeleteRepo(w http.ResponseWriter, r *http.Request) {
@@ -329,11 +343,19 @@ func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+// collected reports whether a garbage collection that ended with err took
+// place all the same. An error with nothing removed, and nothing that
+// storage refused to remove, is a collection that did not happen. Otherwise
+// it happened, with something left over: files storage would not let go
+// of, which stay recorded and are tried again by a later collection.
+func collected(res registry.GCResult, err error) bool {
+	var notFreed *registry.NotFreedError
+	return res.Blobs > 0 || (errors.As(err, &notFreed) && notFreed.Stuck > 0)
+}
+
 func (s *Server) apiGC(w http.ResponseWriter, r *http.Request) {
 	res, err := s.reg.GC(r.Context(), registry.BlobGrace)
-	// Nothing freed and an error is a collection that did not happen. Some
-	// freed and an error is one that did, with something left over.
-	if err != nil && res.Blobs == 0 {
+	if err != nil && !collected(res, err) {
 		s.fail(w, r, err)
 		return
 	}

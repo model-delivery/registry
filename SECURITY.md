@@ -4,9 +4,13 @@
 
 Please do not open a public issue for a security problem.
 
-Report it privately through GitHub: on the repository page, open the
-**Security** tab and choose **Report a vulnerability**. Include what you
-found, how to reproduce it, and the version affected.
+Report it privately, either way:
+
+- **Through GitHub:** on the repository page, open the **Security** tab and
+  choose **Report a vulnerability**.
+- **By email:** <security@model.delivery>.
+
+Include what you found, how to reproduce it, and the version affected.
 
 You should get a reply within a few days. Fixes for confirmed problems are
 released as soon as they are ready, and you will be credited unless you

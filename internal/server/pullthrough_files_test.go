@@ -190,6 +190,8 @@ func TestPullThroughConcurrentDownloadsOfOneFileShareOneFetch(t *testing.T) {
 		handler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(func() {
+		// The server's own work first, then the listener, then the registry.
+		_ = handler.Shutdown(context.Background())
 		local.Close()
 		_ = reg.Close()
 	})

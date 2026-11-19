@@ -91,10 +91,11 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 					http.Error(w, "gone away", http.StatusBadGateway)
 					return true
 				}
-				// Reconnecting is cut short so the test does not wait for it.
-				short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-				defer cancel()
-				_, err := plan.Execute(short, openRegistry(t), 1, nil)
+				// Every reconnection is refused too. They are made without
+				// waiting, so the test neither sleeps nor depends on a deadline
+				// landing at the right moment.
+				plan.up.retryWait = time.Nanosecond
+				_, err := plan.Execute(ctx, openRegistry(t), 1, nil)
 				return err
 			},
 		}

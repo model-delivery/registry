@@ -91,6 +91,10 @@ type Upstream struct {
 	// Log receives what the upstream sent with an error answer, which is
 	// kept out of the errors returned to callers. Nil discards it.
 	Log *slog.Logger
+	// retryWait, when set, replaces the growing wait between the
+	// reconnections of one download. Tests set it so that running out of
+	// reconnections takes no time.
+	retryWait time.Duration
 }
 
 func (u *Upstream) endpoint() string {
@@ -363,7 +367,7 @@ func (u *Upstream) tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 // from where it stopped.
 func (u *Upstream) open(ctx context.Context, repo, sha, path string) io.ReadCloser {
 	fileURL := u.endpoint() + "/" + repo + "/resolve/" + sha + "/" + kit.EscapePath(path)
-	return &resumeReader{ctx: ctx, open: func(offset int64) (io.ReadCloser, error) {
+	return &resumeReader{ctx: ctx, backoff: u.retryWait, open: func(offset int64) (io.ReadCloser, error) {
 		h := http.Header{"Accept-Encoding": {"identity"}}
 		if offset > 0 {
 			h.Set("Range", fmt.Sprintf("bytes=%d-", offset))

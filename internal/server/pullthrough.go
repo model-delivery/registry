@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
@@ -37,8 +38,12 @@ import (
 //     same thing joins it instead of starting another. What does end a fetch
 //     is the server stopping: Server.Shutdown cancels every job and waits
 //     for it, so none is still writing when the registry is closed.
-//   - Nothing is served unverified. A file is only handed to a client once
-//     all of it is stored and has matched its digest.
+//   - Nothing unverified is stored, and no client is handed a whole file
+//     that was not verified. A stored file is served only after all of it
+//     matched its digest. A file still being fetched is sent to the clients
+//     waiting for it as it arrives, all but its end, which is held back
+//     until the digest has been checked (stream.go has the rule and what
+//     follows from it).
 //   - What the registry already holds is served as is. Pull-through fills
 //     gaps; it never refreshes a branch that has moved upstream.
 //     `modelctl mirror` does that, and also fetches a whole revision at
@@ -99,6 +104,9 @@ const (
 	// miss. Valid names are shorter; this bounds what a request can make the
 	// registry keep.
 	maxPullKey = 512
+	// How many files may be distrusted one by one (puller.distrust) before
+	// all are. It bounds memory; an entry is one failed fetch.
+	maxDistrusted = 10_000
 )
 
 type puller struct {
@@ -107,7 +115,10 @@ type puller struct {
 	allow    []string
 	// maxFileBytes is the largest file fetched on demand; 0 means no limit.
 	maxFileBytes int64
-	log          *slog.Logger
+	// stream sends a file to the clients waiting for it while it is being
+	// fetched (stream.go). Off, a file is only served once it is stored.
+	stream bool
+	log    *slog.Logger
 	// ctx is the lifetime every job runs on: the server's, which ends at
 	// Server.Shutdown. It is never a request's.
 	ctx context.Context
@@ -122,6 +133,11 @@ type puller struct {
 	running     int // jobs of either kind that have not finished
 	waiting     int // of those, the ones that do not hold a slot yet
 	misses      map[string]time.Time
+	// distrusted is the files, by ETag, of which bytes were sent to a client
+	// and then never verified; distrustAll stands in for the set once it is
+	// full. See puller.distrust.
+	distrusted  map[string]struct{}
+	distrustAll bool
 	// closed is set when the server stops: no job starts after it.
 	closed bool
 	// drained is closed once closed is set and no job is left.
@@ -138,6 +154,28 @@ type pullJob[T any] struct {
 	done   chan struct{}
 	result T
 	err    error
+	// tail follows a file fetch's download, for the requests that are sent
+	// the file while it arrives. It is nil for a listing and when streaming
+	// is off.
+	tail *blob.Tail
+	// ended, when set, is called with the job's error once its work is
+	// over, before anyone waiting on done is released.
+	ended func(err error)
+}
+
+// newJob returns a job that has not started.
+func newJob[T any]() *pullJob[T] { return &pullJob[T]{done: make(chan struct{})} }
+
+// wait returns the job's result once it has finished, or ctx's error if ctx
+// ends first; the job carries on either way.
+func (j *pullJob[T]) wait(ctx context.Context) (T, error) {
+	select {
+	case <-j.done:
+		return j.result, j.err
+	case <-ctx.Done():
+		var none T
+		return none, ctx.Err()
+	}
 }
 
 // newPuller builds a coordinator whose jobs run until they finish. The
@@ -147,7 +185,7 @@ func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow [
 		reg: reg, upstream: upstream, allow: allow, maxFileBytes: maxFileBytes, log: log,
 		ctx: context.Background(), now: time.Now,
 		fileJobs: map[string]*pullJob[struct{}]{}, listingJobs: map[string]*pullJob[string]{},
-		misses:   map[string]time.Time{},
+		misses: map[string]time.Time{}, distrusted: map[string]struct{}{},
 		drained:  make(chan struct{}),
 		slots:    make(chan struct{}, maxConcurrentPulls),
 		listings: make(chan struct{}, maxConcurrentListings),
@@ -191,43 +229,49 @@ func (p *puller) shareListing(ctx context.Context, key string, work func(ctx con
 // for key among jobs, or starts one that takes its slot from pool, and
 // waits for the result as long as ctx lives.
 func shareJob[T any](ctx context.Context, p *puller, jobs map[string]*pullJob[T], pool chan struct{}, key string, work func(ctx context.Context) (T, error)) (T, error) {
-	var none T
-	p.mu.Lock()
-	job := jobs[key]
-	if job == nil {
-		switch {
-		case p.closed:
-			p.mu.Unlock()
-			return none, errShuttingDown
-		case p.waiting >= maxWaitingPulls:
-			p.mu.Unlock()
-			return none, errPullBusy
-		}
-		p.waiting++
-		p.running++
-		job = &pullJob[T]{done: make(chan struct{})}
-		jobs[key] = job
-		// Deliberately not the request's context: the fetch must outlive the
-		// request that started it (see the note at the top of this file).
-		go func() {
-			job.err = p.do(pool, func(ctx context.Context) (err error) {
-				job.result, err = work(ctx)
-				return err
-			})
-			p.finish(func() {
-				delete(jobs, key)
-				close(job.done)
-			})
-		}()
+	job, err := joinJob(p, jobs, pool, key, newJob[T](), work)
+	if err != nil {
+		var none T
+		return none, err
 	}
-	p.mu.Unlock()
+	return job.wait(ctx)
+}
 
-	select {
-	case <-job.done:
-		return job.result, job.err
-	case <-ctx.Done():
-		return none, ctx.Err()
+// joinJob returns the job for key among jobs without waiting for it. If
+// there is none it starts fresh as that job, running work with a slot from
+// pool; otherwise fresh and work are not used.
+func joinJob[T any](p *puller, jobs map[string]*pullJob[T], pool chan struct{}, key string, fresh *pullJob[T], work func(ctx context.Context) (T, error)) (*pullJob[T], error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if job := jobs[key]; job != nil {
+		return job, nil
 	}
+	switch {
+	case p.closed:
+		return nil, errShuttingDown
+	case p.waiting >= maxWaitingPulls:
+		return nil, errPullBusy
+	}
+	p.waiting++
+	p.running++
+	job := fresh
+	jobs[key] = job
+	// Deliberately not the request's context: the fetch must outlive the
+	// request that started it (see the note at the top of this file).
+	go func() {
+		job.err = p.do(pool, func(ctx context.Context) (err error) {
+			job.result, err = work(ctx)
+			return err
+		})
+		if job.ended != nil {
+			job.ended(job.err)
+		}
+		p.finish(func() {
+			delete(jobs, key)
+			close(job.done)
+		})
+	}()
+	return job, nil
 }
 
 // do is the body of a job's goroutine: wait for a slot in pool, then run
@@ -349,28 +393,92 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	})
 }
 
-// ensureFile fetches the content of one pending file of revision c.
+// ensureFile fetches the content of one pending file of revision c, and
+// returns once it is stored or the fetch has failed.
 func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.File) error {
-	repo, err := p.reg.GetRepo(ctx, c.Repo)
+	job, err := p.fetchFile(ctx, c, f)
 	if err != nil {
 		return err
 	}
+	_, err = job.wait(ctx)
+	return err
+}
+
+// fetchFile starts the fetch of one pending file of revision c, or joins
+// the one in progress, and returns its job without waiting for it. With
+// streaming on, the job has a tail that requests can follow.
+func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.File) (*pullJob[struct{}], error) {
+	repo, err := p.reg.GetRepo(ctx, c.Repo)
+	if err != nil {
+		return nil, err
+	}
 	if repo.Upstream == "" {
-		return errNotFromUpstream
+		return nil, errNotFromUpstream
 	}
 	if p.maxFileBytes > 0 && f.Size > p.maxFileBytes {
-		return errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
+		return nil, errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
 	}
-	return p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context) error {
+	job := newJob[struct{}]()
+	if p.stream {
+		job.tail = blob.NewTail()
+		job.ended = func(err error) {
+			// The tail ends first, so no unverified byte is handed out after
+			// this; then the file is distrusted, before anyone waiting on the
+			// job, or a request that comes after it, is answered.
+			if job.tail.End() && err != nil {
+				p.distrust(c, f, err)
+			}
+		}
+	}
+	return joinJob(p, p.fileJobs, p.slots, c.Repo+"@"+c.SHA+":"+f.Path, job, func(ctx context.Context) (struct{}, error) {
 		started := p.now()
-		if err := mirror.FetchFile(ctx, p.upstream(), p.reg, c, f); err != nil {
+		if err := mirror.FetchFileFollowed(ctx, p.upstream(), p.reg, c, f, job.tail); err != nil {
 			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
-			return err
+			return struct{}{}, err
 		}
 		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
 			"took", p.now().Sub(started).Round(time.Millisecond))
-		return nil
+		return struct{}{}, nil
 	})
+}
+
+// distrust records that bytes of f were sent to a client while it was being
+// fetched and were then never verified, because the fetch failed with err.
+// Some client may be holding those bytes as the start of the file, and the
+// registry cannot tell which. So from here until the server stops, f's
+// content (named by its ETag, wherever it is listed) is treated two ways
+// differently (stream.go):
+//
+//   - it is not sent while being fetched again: the next fetch is verified
+//     and stored first, and a failure is answered with a status;
+//   - a request for part of it is answered with all of it, so that a client
+//     resuming a download replaces what it has and does not add to it.
+//
+// The set is bounded. If it ever fills, every file is treated that way,
+// which costs resumed downloads their saving and never their correctness.
+func (p *puller) distrust(c registry.Commit, f registry.File, err error) {
+	p.mu.Lock()
+	full := len(p.distrusted) >= maxDistrusted
+	if full {
+		p.distrustAll = true
+	} else {
+		p.distrusted[f.ETag()] = struct{}{}
+	}
+	p.mu.Unlock()
+	p.log.Warn("pull-through sent part of a file to clients before its fetch failed; until the registry restarts this file is verified before it is sent, and a request for part of it is answered with the whole",
+		"repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
+	if full {
+		p.log.Error("so many streamed fetches have failed that the registry now answers every request for part of a file with the whole file, until it restarts", "limit", maxDistrusted)
+	}
+}
+
+// distrusts reports whether bytes of the file with this ETag were sent
+// unverified and never vouched for (see distrust).
+func (p *puller) distrusts(etag string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, listed := p.distrusted[etag]
+	return listed || p.distrustAll
 }
 
 // pullFailure says whose failure a pull-through job's error is, for the

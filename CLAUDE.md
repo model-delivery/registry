@@ -18,8 +18,9 @@ Read `docs/architecture.md` before changing anything structural, and
 - `internal/blob` — content-addressed store. Files are named by SHA-256.
   Two backends, `FS` (`store.go`) and `S3` (`s3.go`), behind one interface.
   `store_test.go` runs the same contract against both; a new backend joins
-  that list. `archive.go` keeps metadata backups beside the blobs, and
-  `check.go` re-reads a blob against its digest. `blobtest` is an in-memory
+  that list. `archive.go` keeps metadata backups beside the blobs,
+  `check.go` re-reads a blob against its digest, and `tail.go` lets
+  readers follow a blob while it is staged. `blobtest` is an in-memory
   S3 for tests.
 - `internal/datadir` — the names of the files and directories in the data
   directory, and clearing `tmp/` at server start. Nothing else joins those
@@ -35,7 +36,8 @@ Read `docs/architecture.md` before changing anything structural, and
 - `internal/server` — HTTP. `server.go` has the route table, the access
   gate and the error writers. Then one file per surface: `hf.go` (Hugging
   Face download routes), `hfupload.go` (Hugging Face upload routes),
-  `pullthrough.go` (fetching from upstream on demand), `api.go` and
+  `pullthrough.go` (fetching from upstream on demand), `stream.go`
+  (sending a file to clients while it is fetched), `api.go` and
   `backup.go` (`/api/v1`), `ui.go` plus `templates/` and `static/` (web
   UI), `limits.go` (bounds on request bodies).
 - `internal/client` — the Go client for `/api/v1`. It shares only the HTTP
@@ -68,7 +70,10 @@ are exercised), `task build`, `task docker`.
 
 ## Rules that are easy to break
 
-- **Nothing is stored or served unverified.** Every write goes through
+- **Nothing is stored unverified, and nothing is served from the store
+  unverified.** (The one case of bytes sent before they are verified is a
+  file still being fetched; see the rule on pending files below.) Every
+  write goes through
   `blob.Store.Stage`, which hashes while streaming and rejects mismatches.
   Do not add a path that writes under `blobs/` or to the bucket any other
   way; the S3 backend stages locally for exactly this reason. The one
@@ -97,8 +102,33 @@ are exercised), `task build`, `task docker`.
   moves to `files` only through `fulfil` (`Registry.Fulfil` for one file,
   `Registry.CompleteRevision` for the rest of a revision in one
   transaction), after its content matched its digest. Never insert into
-  `files` for content that is not stored, and never serve a pending file's
-  content.
+  `files` for content that is not stored.
+- **A pending file's content leaves the registry in one way only, and
+  never whole.** While pull-through is fetching it, `stream.go` may send
+  it to the requests waiting for it, under these rules; do not add another
+  path that serves a pending file, and do not loosen one of these:
+  - *What may be sent:* bytes of the fetch in flight, read through its
+    `blob.Tail`, to a `GET` that runs to the end of the file (the whole
+    file or `Range: bytes=N-`, no conditional header), for a file larger
+    than `streamHoldBack`.
+  - *What is held back:* the last `streamHoldBack` bytes (1 MiB), until
+    `Stage` has matched the digest and the size. If that fails, or the
+    fetch fails any other way after a byte was sent, the response is
+    aborted (`panic(http.ErrAbortHandler)`), never ended cleanly, and the
+    reason is logged.
+  - *What is never stored:* anything unverified. Nothing changes in how
+    a blob is staged, published or recorded; a failed fetch leaves no
+    blob, no `files` row and no staging file.
+  - *What follows a failure:* the file is distrusted (`puller.distrust`,
+    by ETag, until restart). It is then verified and stored before any
+    of it is sent, and a request for part of it is answered with all of
+    it (`200`), including where a redirect to the object store would
+    otherwise be sent. That is what stops a client from completing
+    unverified bytes with verified ones; `TestStreamAbortsWhenVerificationFails`
+    and the wrong-bytes test in `test/e2e` are where a change to it is
+    checked.
+  - With `PullThroughNoStream` (`--pull-through-stream=false`) none of
+    this applies and a pending file's content is never served.
 - **Stream, never buffer.** Model files are many gigabytes. No
   `io.ReadAll` on file content, in the server or the client. The few
   `io.ReadAll` calls there are read metadata through an `io.LimitReader`.

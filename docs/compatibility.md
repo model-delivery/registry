@@ -167,13 +167,30 @@ saying so; it does not pretend to succeed.
 - **A mirror is a snapshot.** `main` in the registry points at the revision
   that was current when you last ran `modelctl mirror`, or when
   pull-through first fetched it.
-- **The first download of a large file through pull-through can time
-  out.** The registry hands over a file only once it has fetched and
-  verified all of it, and `huggingface_hub` waits about ten seconds between
-  bytes. The fetch carries on after the client gives up; run the download
-  again when it has finished, or fetch everything ahead of time with
-  `modelctl mirror`. Listings and file metadata answer immediately, and
-  small files (tested in `test/e2e`, including against huggingface.co)
-  arrive within the timeout.
+- **The first download of a file through pull-through is sent while the
+  registry fetches it.** `hf_hub_download` of a file the registry has
+  never fetched succeeds on the first attempt even when the fetch takes
+  longer than the client's download timeout, because bytes reach the
+  client as they arrive from the upstream (tested in `test/e2e` with a
+  slow upstream). The last mebibyte is held back until the file has
+  matched its digest. If it does not match, the download fails and the
+  client keeps nothing, and a client that had already kept part of the
+  file does not complete it from a later, sound fetch: its request for
+  the rest is answered with the whole file, which `huggingface_hub`
+  takes in place of what it had (also in `test/e2e`). Details and limits
+  are in [operations.md](operations.md#the-first-download-of-a-file).
+- **A stalled upstream stalls the client.** The registry sends no filler,
+  so if the upstream sends nothing for longer than the client's timeout
+  (ten seconds between bytes for `huggingface_hub`), that request times
+  out. The fetch carries on; download again, or fetch everything ahead of
+  time with `modelctl mirror`.
+- **With `--pull-through-stream=false` the first download of a large file
+  can time out.** The registry then hands over a file only once it has
+  fetched and verified all of it, and `huggingface_hub` raises a read
+  timeout (tested in `test/e2e`). The fetch carries on after the client
+  gives up; run the download again when it has finished. Listings and
+  file metadata answer immediately, and small files (tested in
+  `test/e2e`, including against huggingface.co) arrive within the
+  timeout.
 - **Model cards are not rendered.** `README.md` is stored and served like
   any other file.

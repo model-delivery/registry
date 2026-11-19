@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/mirror"
+	"github.com/model-delivery/registry/internal/registry"
 )
 
 // These tests reach inside the pull-through coordinator, because filling
@@ -75,6 +76,37 @@ func TestPullQueueIsBounded(t *testing.T) {
 	defer p.mu.Unlock()
 	if p.waiting != 0 {
 		t.Fatalf("%d jobs still counted as waiting", p.waiting)
+	}
+}
+
+// The files distrusted after a failed streamed fetch are remembered one by
+// one up to a bound. Past it nothing is forgotten: every file is
+// distrusted instead, which costs resumed downloads and never correctness.
+func TestDistrustIsBoundedAndFailsSafe(t *testing.T) {
+	t.Parallel()
+	p := newPuller(nil, nil, nil, 0, slog.New(slog.DiscardHandler))
+	failed := errors.New("blob verification failed")
+	lfs := func(i int) registry.File {
+		return registry.File{Path: "weights.bin", LFS: true, SHA256: fmt.Sprintf("%064d", i)}
+	}
+
+	p.distrust(registry.Commit{Repo: "acme/tiny"}, lfs(0), failed)
+	if !p.distrusts(lfs(0).ETag()) || p.distrusts(lfs(1).ETag()) {
+		t.Fatal("one failed file: it should be distrusted, and no other")
+	}
+	for i := 1; i <= maxDistrusted; i++ {
+		p.distrust(registry.Commit{Repo: "acme/tiny"}, lfs(i), failed)
+	}
+	p.mu.Lock()
+	kept := len(p.distrusted)
+	p.mu.Unlock()
+	if kept > maxDistrusted {
+		t.Fatalf("%d files remembered, more than the bound of %d", kept, maxDistrusted)
+	}
+	for _, i := range []int{0, maxDistrusted, maxDistrusted + 500} {
+		if !p.distrusts(lfs(i).ETag()) {
+			t.Fatalf("with the set full, file %d is trusted", i)
+		}
 	}
 }
 

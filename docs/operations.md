@@ -288,15 +288,15 @@ which files of a revision have been fetched.
 
 What to expect:
 
-- **The first download of a large file waits.** The registry hands a file
-  to a client only once all of it is stored and verified, so the first
-  download of a 20 GB file takes as long as fetching 20 GB. Clients with
-  short timeouts give up and report an error. The fetch carries on
-  regardless, and a retry once it finishes is served at once. Files that
-  fetch within the client's timeout, which covers most configuration and
-  tokenizer files, need no retry.
+- **The first download of a file takes as long as fetching it, and starts
+  at once.** The registry sends a file to the client while it is still
+  arriving from the upstream, so the first download of a 20 GB file takes
+  about as long as fetching 20 GB and the client sees bytes from the
+  start. See [the first download](#the-first-download-of-a-file) below
+  for what that changes and how to turn it off.
 - **Downloads of the same file share one fetch.** Twenty workers starting
-  at once cause one download from upstream, not twenty.
+  at once cause one download from upstream, not twenty, and each is sent
+  the file from that one fetch as it arrives.
 - **It fills gaps; it does not refresh.** A branch the registry already
   holds is served as recorded, even if it has moved upstream. Clients that
   pin a revision id always get exactly that revision. To pick up a newer
@@ -314,6 +314,83 @@ What to expect:
 - **A partly fetched revision cannot be uploaded onto.** An upload adds to
   the branch's current files, and the registry will not build a revision on
   content it has not verified. Run `modelctl mirror <repo>` first.
+
+### The first download of a file
+
+A file the registry already stores was verified before it was stored, and
+is served as it is. The first download of a file is different, because
+the file is not there yet.
+
+**What the first client gets.** The registry starts fetching the file and
+passes it on as it arrives. The client receives the first bytes as soon as
+the upstream sends them, and the download finishes when the fetch does.
+Clients that arrive while the fetch is running get the file from the same
+fetch, from its beginning. Clients that arrive after it are served from
+storage.
+
+**What is guaranteed, in plain words.** For every other download, no byte
+leaves the registry that has not been checked against its digest. For
+this first one, bytes are sent before the check, because the check needs
+the whole file. What still holds:
+
+- The last mebibyte of the file is not sent until the whole file has
+  arrived and matched its digest and size. A client can therefore never
+  receive a complete file that failed the check.
+- If the check fails, the registry cuts the connection. The client sees a
+  download that ended short of the length it was told, which every HTTP
+  client reports as an error. The server logs `aborted a download` with
+  the reason. The same happens if the upstream fails part-way, or the
+  registry is stopped.
+- Nothing that failed the check is stored, recorded or served again.
+- A client that was cut off holds the start of a file that was never
+  verified, and will usually ask for the rest. The registry does not send
+  it the rest: until it restarts, it answers a request for part of that
+  file with the whole file, and it fetches and verifies the file
+  completely before sending any of it. `huggingface_hub` then discards
+  what it had and takes the whole file; while the upstream's content is
+  still wrong it gets an error (`502`) and keeps nothing.
+- Files of a mebibyte or less (configuration, tokenizer files) are never
+  sent before they are verified.
+
+**What is not guaranteed.** Two cases remain, both needing the upstream to
+send bytes that do not match its own listing:
+
+- *A client that is not `huggingface_hub`.* The rule above relies on the
+  client replacing its partial file when a request for a range is
+  answered with the whole file (`200`). `huggingface_hub` does, and
+  `test/e2e` runs it. A download tool that appends the answer to what it
+  has regardless would end up with a damaged file. A tool that ignores
+  the announced length and keeps a cut-off download as if it were whole
+  has a file missing its last mebibyte, of unverified content.
+- *A restart in between.* Which files are distrusted is kept in memory.
+  If the registry restarts after cutting a download and before the client
+  asks for the rest, and the upstream then sends correct content, the
+  client is sent the rest and ends with a file whose start is unverified.
+  `huggingface_hub` asks about a second after being cut off and fails if
+  the registry is down then, so the registry would have to be back within
+  that second.
+
+If either matters to you more than the first download's speed, turn it
+off.
+
+**A slow or stalled upstream.** The registry passes on what it has and
+sends nothing else, so a client waits exactly as long as the upstream
+makes the registry wait. If the upstream sends nothing for longer than the
+client's timeout (ten seconds for `huggingface_hub`), the client gives up
+on that request; the fetch carries on. The same applies at the end of
+the file: the last mebibyte is sent once the file is complete and checked,
+so an upstream slower than about 100 kB/s keeps the client waiting more
+than ten seconds for it. A client that then asks for the rest is served
+it, from the same fetch or from storage.
+
+**Turning it off.** `--pull-through-stream=false` (or
+`REGISTRY_PULL_THROUGH_STREAM=false`) restores the strict behaviour: the
+registry hands a file to a client only once all of it is stored and
+verified, without exception. The first download of a large file then
+sends nothing until the fetch is complete, clients with short timeouts
+give up and report an error (`huggingface_hub` raises a read timeout),
+the fetch carries on regardless, and a retry once it has finished is
+served at once.
 
 **Your own repositories are never filled from upstream.** Pull-through
 looks upstream for two kinds of repository only: one the registry does not
@@ -627,7 +704,10 @@ requests, cancels the pull-through fetches in progress and a scheduled
 backup if one is running, and waits up to 30 seconds for those and for
 transfers in flight before it exits. A client that was waiting on a fetch
 is answered `503` with `Retry-After`; the fetch starts again on its next
-request. A backup that was cut short stores nothing.
+request. A client that was being sent a file while it was fetched has its
+download cut short, as it would be by a failed fetch (see
+[the first download](#the-first-download-of-a-file)). A backup that was
+cut short stores nothing.
 
 A transfer still running after 30 seconds is cut off. Uploads cut off this
 way leave nothing visible: the part received is cleared from `tmp/` at the

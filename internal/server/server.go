@@ -49,6 +49,11 @@ type Config struct {
 	// demand. A larger one is refused with an error naming `modelctl
 	// mirror`. 0 means no limit.
 	PullThroughMaxFileBytes int64
+	// PullThroughNoStream turns off sending a file to clients while
+	// pull-through is still fetching it (stream.go). With it set, nothing
+	// of a file is sent until all of it is stored and verified, and the
+	// first download of a large file waits for the whole fetch.
+	PullThroughNoStream bool
 	// MaxBlobBytes is the largest single file an upload may store, through
 	// the registry API or the Hugging Face upload routes. 0 means no limit.
 	// It does not apply to files mirrored or pulled through from upstream.
@@ -113,6 +118,7 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	if cfg.PullThrough {
 		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.PullThroughMaxFileBytes, cfg.Logger)
 		s.puller.ctx, s.puller.now = lifetime, s.now
+		s.puller.stream = !cfg.PullThroughNoStream
 	}
 
 	// Every route is registered with the access it needs: gate, with a role

@@ -76,6 +76,7 @@ func cmdServe(e *env, args []string) error {
 	pullThrough := c.Bool("pull-through", c.envBool("REGISTRY_PULL_THROUGH"), "fetch a model from the upstream hub the first time a client asks for one the registry does not hold (env REGISTRY_PULL_THROUGH); limit which with --pull-through-allow")
 	allowList := c.String("pull-through-allow", e.getenv("REGISTRY_PULL_THROUGH_ALLOW"), "repositories pull-through may fetch: comma-separated patterns over namespace/name, such as \"meta-llama/*,*/*-GGUF\"; empty allows all (env REGISTRY_PULL_THROUGH_ALLOW)")
 	pullMaxFile := c.Int64("pull-through-max-file-bytes", c.envBytes("REGISTRY_PULL_THROUGH_MAX_FILE_BYTES"), "largest file pull-through fetches on demand, in bytes; 0 for no limit (env REGISTRY_PULL_THROUGH_MAX_FILE_BYTES)")
+	pullStream := c.Bool("pull-through-stream", c.envBoolOr("REGISTRY_PULL_THROUGH_STREAM", true), "send a file pull-through is fetching to the clients waiting for it while it arrives, holding back its end until it is verified; =false sends nothing until the file is stored (env REGISTRY_PULL_THROUGH_STREAM)")
 	maxBlob := c.Int64("max-blob-bytes", c.envBytes("REGISTRY_MAX_BLOB_BYTES"), "largest single file an upload may store, in bytes; 0 for no limit (env REGISTRY_MAX_BLOB_BYTES)")
 	envEvery, envKeep, err := backupSettings(e)
 	c.noteEnv(err)
@@ -148,6 +149,7 @@ func cmdServe(e *env, args []string) error {
 		Logger:            log,
 
 		PullThroughMaxFileBytes: *pullMaxFile,
+		PullThroughNoStream:     !*pullStream,
 		MaxBlobBytes:            *maxBlob,
 	})
 	ln, err := (&net.ListenConfig{}).Listen(e.ctx, "tcp", *addr)
@@ -159,7 +161,7 @@ func cmdServe(e *env, args []string) error {
 	// small JSON and form routes set a deadline for their own bodies.
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout}
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
-		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)
+		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "pull_through_stream", *pullThrough && *pullStream, "version", Version)
 
 	var backups func(context.Context)
 	if *backupEvery > 0 {
@@ -385,7 +387,12 @@ func (c *command) noteEnv(err error) {
 // envBool reads an on/off variable to use as its flag's default. A value
 // that cannot be read is noted, and reported once the flags are parsed.
 func (c *command) envBool(key string) bool {
-	b, err := envBool(c.e, key)
+	return c.envBoolOr(key, false)
+}
+
+// envBoolOr is envBool for a setting that is unset when the variable is.
+func (c *command) envBoolOr(key string, unset bool) bool {
+	b, err := envBoolOr(c.e, key, unset)
 	c.noteEnv(err)
 	return b
 }
@@ -416,9 +423,16 @@ func envBytes(e *env, key string) (int64, error) {
 // such as REGISTRY_REQUIRE_AUTH must not be quietly off because it was
 // written in a way this does not know.
 func envBool(e *env, key string) (bool, error) {
+	return envBoolOr(e, key, false)
+}
+
+// envBoolOr reads an on/off setting as envBool does, for one that is on
+// unless turned off: unset is the value the setting has when the variable
+// is not set or is empty.
+func envBoolOr(e *env, key string, unset bool) (bool, error) {
 	v := strings.TrimSpace(e.getenv(key))
 	if v == "" {
-		return false, nil
+		return unset, nil
 	}
 	if b, err := strconv.ParseBool(v); err == nil {
 		return b, nil

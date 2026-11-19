@@ -19,7 +19,71 @@ import (
 // The server's on/off settings that come from the environment.
 var booleanSettings = []string{
 	"REGISTRY_REQUIRE_AUTH", "REGISTRY_REQUIRE_ADMIN_TOKEN", "REGISTRY_PULL_THROUGH",
-	"REGISTRY_S3_REDIRECT", "REGISTRY_RESTORE_IF_EMPTY",
+	"REGISTRY_S3_REDIRECT", "REGISTRY_RESTORE_IF_EMPTY", "REGISTRY_PULL_THROUGH_STREAM",
+}
+
+// A setting that is on unless turned off reads the same spellings, and is
+// on when its variable is unset or empty.
+func TestEnvBoolOr(t *testing.T) {
+	t.Parallel()
+	const key = "REGISTRY_PULL_THROUGH_STREAM"
+	tests := []struct {
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{"", true, false}, {"   ", true, false},
+		{"true", true, false}, {"1", true, false}, {"on", true, false}, {"yes", true, false},
+		{"false", false, false}, {"0", false, false}, {"off", false, false}, {"No", false, false},
+		// Not read as on, and not as off: refused.
+		{"disabled", false, true}, {"none", false, true},
+	}
+	for _, tc := range tests {
+		e := &env{getenv: func(string) string { return tc.value }}
+		got, err := envBoolOr(e, key, true)
+		if (err != nil) != tc.wantErr || (err == nil && got != tc.want) {
+			t.Errorf("%q: got %v, %v; want %v, error %v", tc.value, got, err, tc.want, tc.wantErr)
+		}
+		if err != nil && (!errors.As(err, new(usageError)) || !strings.Contains(err.Error(), key)) {
+			t.Errorf("%q: %v is not a usage error naming %s", tc.value, err, key)
+		}
+	}
+}
+
+// Sending a file while pull-through fetches it is on unless it is turned
+// off, by the flag or by the variable, and the flag wins. The server says
+// which at start.
+func TestServePullThroughStreamSetting(t *testing.T) {
+	t.Parallel()
+	const admin = "md_admin_token_for_the_stream_test"
+	tests := []struct {
+		name  string
+		env   map[string]string
+		flags []string
+		want  string
+	}{
+		{"on by default", nil, []string{"--pull-through"}, "pull_through_stream=true"},
+		{"off by the flag", nil, []string{"--pull-through", "--pull-through-stream=false"}, "pull_through_stream=false"},
+		{"off by the variable", map[string]string{"REGISTRY_PULL_THROUGH_STREAM": "off"}, []string{"--pull-through"}, "pull_through_stream=false"},
+		{"the flag wins over the variable", map[string]string{"REGISTRY_PULL_THROUGH_STREAM": "false"}, []string{"--pull-through", "--pull-through-stream"}, "pull_through_stream=true"},
+		{"nothing to stream without pull-through", nil, nil, "pull_through_stream=false"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := map[string]string{"REGISTRY_ADMIN_TOKEN": admin, "REGISTRY_REQUIRE_AUTH": "true"}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			logs, addr, _ := regtest.RunServe(t, Run, t.TempDir(), env, tc.flags...)
+			if addr == "" {
+				t.Fatalf("serve did not start:\n%s", logs.String())
+			}
+			if !strings.Contains(logs.String(), tc.want) {
+				t.Fatalf("the server did not start with %s:\n%s", tc.want, logs.String())
+			}
+		})
+	}
 }
 
 func TestEnvBool(t *testing.T) {
@@ -169,6 +233,7 @@ func TestServeHelpListsEverySetting(t *testing.T) {
 		"pull-through":                "REGISTRY_PULL_THROUGH",
 		"pull-through-allow":          "REGISTRY_PULL_THROUGH_ALLOW",
 		"pull-through-max-file-bytes": "REGISTRY_PULL_THROUGH_MAX_FILE_BYTES",
+		"pull-through-stream":         "REGISTRY_PULL_THROUGH_STREAM",
 		"max-blob-bytes":              "REGISTRY_MAX_BLOB_BYTES",
 		"backup-interval":             "REGISTRY_BACKUP_INTERVAL",
 		"backup-keep":                 "REGISTRY_BACKUP_KEEP",

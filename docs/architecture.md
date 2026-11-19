@@ -15,6 +15,7 @@ be kept in an S3-compatible bucket instead of on local disk.
         |    hf.go           Hugging Face downloads    /api/models/...  /.../resolve   |
         |    hfupload.go     Hugging Face uploads      preupload, lfs batch, commit    |
         |    pullthrough.go  fetching from upstream what a client asks for             |
+        |    stream.go       sending a file to clients while it is fetched             |
         |    api.go          registry REST API         /api/v1/...                     |
         |    backup.go       metadata backups          /api/v1/backups...              |
         |    ui.go           web UI                    /  /ui/...                      |
@@ -89,6 +90,12 @@ Writing a blob (`internal/blob`):
 3. Rename the temporary file to its digest path. A rename is atomic, so a
    blob is either fully present under its name or absent; a reader can
    never see a partial file.
+
+Staging can be followed while it runs: a caller that hands `Stage` a
+`blob.Tail` gets readers over the temporary file that see the bytes
+received so far, and are told when step 2 has passed or that it never
+will. Pull-through uses it to send a file while fetching it; it changes
+nothing about what is published.
 
 `blob.Store` is a small interface (stage, open, delete, plus the four
 methods of `blob.Archive` that keep metadata backups beside the blobs)
@@ -251,13 +258,15 @@ verified content. A request for a pending file's metadata (`HEAD`) is
 answered from the listing. A request for its content fetches it from the
 upstream, verifies it against the listed digest (a SHA-256 for LFS files,
 a git blob id for the rest) while storing it, and then moves the row from
-`pending_files` to `files` in one transaction. When the last pending file
+`pending_files` to `files` in one transaction. While it is being fetched
+it is sent to the clients waiting for it, all but its end (see
+[Serve while fetching](#serve-while-fetching)). When the last pending file
 of a revision arrives, the revision is complete and indistinguishable from
 a mirrored one.
 
 A small coordinator keeps one job per thing being fetched, whether a
 revision's listing or one file. A request for something already being
-fetched waits on the existing job. Jobs run on the server's lifetime, not
+fetched joins the existing job. Jobs run on the server's lifetime, not
 on the request's, so a client that disconnects does not stop one. What
 does stop them is the server stopping: `Server.Shutdown` cancels every job
 and returns once the last has ended, and `modelctl serve` waits for that,
@@ -286,14 +295,81 @@ name the upstream answered with, so neither a rename upstream nor a push
 that lands in between gets around it. For names not held at all, the
 operator's allow list is the control.
 
-Two rules follow from "nothing unverified is served":
+A revision cannot be built on (by an upload that merges into its branch)
+while it has pending files, because that would record a new revision
+referring to content the registry has never seen.
 
-- A file is handed to a client only after all of it is stored and has
-  matched its digest. The first download of a file therefore waits for the
-  whole file.
-- A revision cannot be built on (by an upload that merges into its branch)
-  while it has pending files, because that would record a new revision
-  referring to content the registry has never seen.
+### Serve while fetching
+
+Fetching a large file takes minutes, and download clients give up after
+seconds without a byte (`huggingface_hub` after ten). So a file that is
+being fetched is sent to the clients waiting for it while it arrives
+(`stream.go`), and the first download takes about as long as the fetch.
+
+The fetch itself is unchanged. The download is staged like any other
+write: `blob.Store.Stage` streams it to a file in `tmp/` and hashes it as
+it goes. Staging announces its progress on a `blob.Tail`, and each waiting
+request follows that: it reads the staging file at its own position, sends
+what is there, flushes, and waits for more. One fetch feeds the request
+that started it and every request that joins while it runs. A request
+that arrives after the file is stored is served from the store.
+
+This is the one place where bytes leave the registry before they are
+verified. The rules that keep an unverified file from ever being complete,
+on the registry or on a client:
+
+- **The end is held back.** Every response sent from a fetch runs to the
+  end of the file, and the last mebibyte is sent only after the digest and
+  the size have been checked. If the check fails, or the fetch fails for
+  any other reason after bytes were sent, the connection is aborted, not
+  closed cleanly: the client was given a `Content-Length` and received
+  less. The reason is logged. The amount is `streamHoldBack`; the comment
+  there says why it is a mebibyte and not a byte.
+- **Small files are not streamed.** A file of a mebibyte or less is all
+  end, so nothing of it is sent before it is stored, as before.
+- **Storing is untouched.** Nothing is published, recorded in `files` or
+  served from the store that did not match its digest. The staging file
+  of a failed fetch is deleted.
+- **Only what runs to the end of the file is streamed:** a `GET` for the
+  whole file, or for the rest of it from some byte (`Range: bytes=N-`),
+  with no conditional header. A bounded range, a suffix or a conditional
+  request waits for the stored file and is answered by `ServeContent`.
+  `HEAD` is answered from the listing and starts no fetch.
+- **A failure before the first byte is still a status.** The response
+  begins when there is a byte to send. A fetch that fails before that is
+  answered `502` or `500` as described above; so is a file over the size
+  limit, and a full queue.
+- **A file whose streamed fetch failed is distrusted.** A client keeps
+  what it received and may ask for the rest. While the same fetch is in
+  flight that is safe, and is served from it. After the fetch has failed
+  it is not: the rest, from a later and sound fetch, would complete a file
+  whose start was never verified, and `huggingface_hub` does not check
+  digests. So the registry remembers the file by its ETag, and from then
+  until it restarts (a) fetches, verifies and stores that file before
+  sending any of it, so a second failure is a status, and (b) answers any
+  request for part of it with the whole file, `200` and not `206`, also
+  when it would otherwise redirect to the object store. A client resuming
+  a download then replaces what it has; `huggingface_hub` truncates its
+  temporary file when a ranged request is answered `200`, and `test/e2e`
+  runs that case. The memory is bounded; if it ever fills, every ranged
+  request is answered with the whole file.
+
+The response headers are those of a stored file (`ETag`, `Content-Length`,
+`X-Repo-Commit`, `Accept-Ranges`, and the rest), because the client
+decides what to do from them. With redirected downloads the first request
+cannot be redirected, since nothing is in the bucket yet: it is streamed
+from the registry with the `X-Linked-*` headers, and later requests are
+redirected.
+
+What remains open is in
+[operations.md](operations.md#pull-through-caching): a client other than
+`huggingface_hub` that mishandles a `200` to a ranged request, and a
+registry restarted between the failure and the client's retry, since the
+distrust is kept in memory.
+
+`--pull-through-stream=false` (`REGISTRY_PULL_THROUGH_STREAM`) turns all
+of this off: a file is then handed to a client only after all of it is
+stored and verified, and the first download waits for the whole fetch.
 
 A lookup that hits is never sent upstream, so pull-through cannot change
 what a recorded branch points at. `modelctl mirror` on a partly fetched
@@ -350,7 +426,8 @@ overwritten, and a failed restore puts it back.
 Two things in the server process are not requests: pull-through fetches,
 which outlive the request that started them, and the scheduled-backup
 loop. Each has an owner that stops it. `Server.Shutdown` cancels every
-fetch and returns when the last has ended; the backup loop runs on a
+fetch and returns when the last has ended, which also ends, by an abort,
+any response that was being sent from one; the backup loop runs on a
 context that `modelctl serve` cancels. On a signal, `serve` stops taking
 requests, cancels both, and waits for requests in flight, the fetches and
 a backup in progress, up to thirty seconds, before it closes the
@@ -364,7 +441,9 @@ request body is small and is held to that: `limits.go` bounds the size of
 JSON bodies and forms and gives the client thirty seconds to send them,
 and a request that announces a body to a route that reads none is not
 waited on for longer than that. The list of routes that count as file
-transfers is one function, `isFileTransfer`.
+transfers is one function, `isFileTransfer`. A download carries no body,
+so no deadline is set for it, whether it is served from the store or sent
+while the file is fetched.
 
 ## Deleting and garbage collection
 

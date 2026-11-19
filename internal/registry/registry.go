@@ -411,6 +411,13 @@ func (r *Registry) PresignBlob(ctx context.Context, digest string, ttl time.Dura
 	return u, err == nil, err
 }
 
+// Presigns reports whether the storage backend can hand out direct
+// download URLs at all, which is when PresignBlob can succeed.
+func (r *Registry) Presigns() bool {
+	_, can := r.blobs.(blob.Presigner)
+	return can
+}
+
 // StatBlob reports whether a blob is stored, and its details if so.
 func (r *Registry) StatBlob(ctx context.Context, digest string) (blob.Info, bool, error) {
 	info := blob.Info{SHA256: digest}

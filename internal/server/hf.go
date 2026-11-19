@@ -294,7 +294,24 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 				"%s is listed in this revision but was never fetched from upstream, and pull-through is off: run `modelctl mirror %s` or turn pull-through on", filePath, repo), nil)
 			return
 		}
-		if err := s.puller.ensureFile(r.Context(), c, f); err != nil {
+		// The file is fetched, by this request or by the fetch already in
+		// flight for it. Where the rules allow (stream.go), it is sent while
+		// it arrives; otherwise, and whenever the fetch ends before a byte
+		// could be sent, the request waits for the fetch and is answered
+		// from its result.
+		var err error
+		if start, streamed := s.streamFrom(r, f); streamed {
+			var job *pullJob[struct{}]
+			if job, err = s.puller.fetchFile(r.Context(), c, f); err == nil {
+				if s.serveWhileFetching(w, r, job, c, f, start) {
+					return
+				}
+				_, err = job.wait(r.Context())
+			}
+		} else {
+			err = s.puller.ensureFile(r.Context(), c, f)
+		}
+		if err != nil {
 			switch {
 			case errors.As(err, new(errFileTooLarge)):
 				hfError(w, http.StatusForbidden, err.Error())
@@ -314,7 +331,18 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		}
 	}
 
-	if s.cfg.RedirectDownloads {
+	// A request for part of a file is answered with all of it when bytes of
+	// that file once left the registry unverified (puller.distrust): what
+	// the client wants to add to may be those bytes. A 200 makes it start
+	// again. The object store would honour the range, so no redirect either.
+	whole := false
+	if s.puller != nil && r.Header.Get("Range") != "" && s.puller.distrusts(f.ETag()) {
+		r.Header.Del("Range")
+		r.Header.Del("If-Range")
+		whole = true
+	}
+
+	if s.cfg.RedirectDownloads && !whole {
 		// Send the client to the object store for the bytes. The headers
 		// below are how the Hugging Face Hub describes a file that lives
 		// behind a redirect, so clients learn its identity and size from

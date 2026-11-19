@@ -23,13 +23,15 @@ import (
 
 	"github.com/model-delivery/registry/internal/client"
 	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
 // What the real client does with a file that pull-through is still
-// fetching from a slow upstream. The upstream is a local registry behind a
-// handler that decides how one file is sent; nothing leaves this machine.
+// fetching: with a slow upstream, and with an upstream whose content does
+// not match its digest. The upstream is a local registry behind a handler
+// that decides how one file is sent; nothing leaves this machine.
 
 const mib = 1 << 20
 
@@ -98,6 +100,10 @@ type oneFileHub struct {
 
 	mu       sync.Mutex
 	requests int
+	// sent is closed when the registry under test has written a client all
+	// of the file but the end it holds back.
+	sent     chan struct{}
+	sentOnce sync.Once
 }
 
 const (
@@ -117,7 +123,7 @@ func newOneFileHub(t *testing.T, content string, send func(h *oneFileHub, n int,
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &oneFileHub{pushed: pushed, content: content}
+	h := &oneFileHub{pushed: pushed, content: content, sent: make(chan struct{})}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/resolve/") || !strings.HasSuffix(r.URL.Path, "/"+hubFile) {
@@ -141,6 +147,36 @@ func (h *oneFileHub) fetches() int {
 	return h.requests
 }
 
+// clientHasAllButTheEnd is called by the registry under test (startWatched)
+// when one of its responses has been written everything of the file that
+// may be sent before it is verified.
+func (h *oneFileHub) clientHasAllButTheEnd() { h.sentOnce.Do(func() { close(h.sent) }) }
+
+// sendAll writes body as the whole answer.
+func sendAll(w http.ResponseWriter, body string) {
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	_, _ = io.WriteString(w, body)
+}
+
+// sendAndHoldTheEnd writes body, but its last bytes only once the registry
+// has passed its client everything it may before the file is verified. A
+// local fetch is otherwise over, and judged, before the registry has sent
+// its client more than a part of that, and how much would be chance.
+func (h *oneFileHub) sendAndHoldTheEnd(w http.ResponseWriter, r *http.Request, body string) {
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	end := len(body) - 100
+	if _, err := io.WriteString(w, body[:end]); err != nil {
+		return
+	}
+	_ = http.NewResponseController(w).Flush()
+	select {
+	case <-h.sent:
+	case <-r.Context().Done():
+		return
+	}
+	_, _ = io.WriteString(w, body[end:])
+}
+
 // sendPaced writes body a piece at a time, with a pause after each.
 func sendPaced(w http.ResponseWriter, r *http.Request, body string, piece int, pause time.Duration) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -158,19 +194,130 @@ func sendPaced(w http.ResponseWriter, r *http.Request, body string, piece int, p
 	}
 }
 
-// isStored reports whether the hub's large file has been fetched and
-// recorded by in.
-func isStored(in *regtest.Instance) bool {
-	c, err := in.Reg.Resolve(context.Background(), hubRepo, "main")
+// seen is one request for the large file as the registry answered it.
+type seen struct {
+	Range  string
+	Status int
+}
+
+func (s seen) String() string {
+	if s.Range == "" {
+		return strconv.Itoa(s.Status)
+	}
+	return fmt.Sprintf("%d to Range %s", s.Status, s.Range)
+}
+
+// watched is a registry with pull-through from hub, which notes how each
+// GET for the large file was answered.
+type watched struct {
+	url string
+	reg *registry.Registry
+
+	mu   sync.Mutex
+	gets []seen
+}
+
+type statusNoter struct {
+	http.ResponseWriter
+	note func(status int)
+	once sync.Once
+	// wrote is told how many bytes of the body have been written so far.
+	wrote   func(total int)
+	written int
+}
+
+func (w *statusNoter) WriteHeader(status int) {
+	w.once.Do(func() { w.note(status) })
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusNoter) Write(p []byte) (int, error) {
+	w.once.Do(func() { w.note(http.StatusOK) })
+	n, err := w.ResponseWriter.Write(p)
+	w.written += n
+	w.wrote(w.written)
+	return n, err
+}
+
+// Unwrap lets the handler flush through this wrapper.
+func (w *statusNoter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func startWatched(t *testing.T, hub *oneFileHub, cfg server.Config) *watched {
+	t.Helper()
+	reg, err := registry.Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AnonymousRead, cfg.Upstream, cfg.PullThrough = true, hub.url, true
+	handler := server.New(reg, cfg)
+	in := &watched{reg: reg}
+	// Everything of the file that may be sent before it is verified: all
+	// but the mebibyte the registry holds back.
+	sendable := len(hub.content) - mib
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/"+hubFile) {
+			asked := r.Header.Get("Range") // as the client sent it
+			w = &statusNoter{ResponseWriter: w,
+				note: func(status int) {
+					in.mu.Lock()
+					defer in.mu.Unlock()
+					in.gets = append(in.gets, seen{Range: asked, Status: status})
+				},
+				wrote: func(total int) {
+					if total >= sendable {
+						hub.clientHasAllButTheEnd()
+					}
+				}}
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		// The server's own work first, then the listener, then the registry.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = handler.Shutdown(ctx)
+		srv.Close()
+		_ = reg.Close()
+	})
+	in.url = srv.URL
+	return in
+}
+
+// answers is how the GETs for the large file were answered, in order.
+func (in *watched) answers() string {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	out := make([]string, len(in.gets))
+	for i, g := range in.gets {
+		out[i] = g.String()
+	}
+	return strings.Join(out, "; ")
+}
+
+// isStored reports whether the large file has been fetched and recorded.
+func (in *watched) isStored() bool {
+	c, err := in.reg.Resolve(context.Background(), hubRepo, "main")
 	if err != nil {
 		return false
 	}
-	f, err := in.Reg.File(context.Background(), c, hubFile)
+	f, err := in.reg.File(context.Background(), c, hubFile)
 	return err == nil && !f.Pending
 }
 
+func (in *watched) waitStored(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !in.isStored() {
+		if time.Now().After(deadline) {
+			t.Fatal("the fetch never finished")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // cached lists the files in a client's cache that could pass for the large
-// file: anything under blobs/ or snapshots/, with its size.
+// file: anything under blobs/ or snapshots/ that is not a download in
+// progress, with its size.
 func cached(t *testing.T, home string) map[string]int64 {
 	t.Helper()
 	out := map[string]int64{}
@@ -195,56 +342,179 @@ func cached(t *testing.T, home string) map[string]int64 {
 	return out
 }
 
-// TestHubClientAgainstASlowUpstream reproduces what the first download of
-// a large file through pull-through does to a real client. The upstream
-// takes about three seconds to send a file, and the client's download
-// timeout (ten seconds by default) is set to one, which stands for a file
-// of many gigabytes against the real timeout.
+// TestHubClientAgainstASlowUpstream is the reason serve-while-fetching
+// exists. The upstream takes about three seconds to send a file, and the
+// client's download timeout (ten seconds by default) is set to one, which
+// stands for a file of many gigabytes against the real timeout.
 //
-// The registry sends nothing until the file is stored, so the client's
-// first attempt times out; only a retry after the fetch has finished
-// succeeds.
+// With streaming off the registry sends nothing until the file is stored,
+// and the client's first attempt times out; only a retry after the fetch
+// has finished succeeds. With streaming on the same download succeeds the
+// first time, in one request.
 func TestHubClientAgainstASlowUpstream(t *testing.T) {
 	python(t)
 	content := numbered(8 * mib)
 	// A quarter of a mebibyte every tenth of a second: about three seconds
-	// in all.
-	hub := newOneFileHub(t, content, func(_ *oneFileHub, _ int, w http.ResponseWriter, r *http.Request) {
+	// in all, and the mebibyte held back at the end takes well under one.
+	slow := func(_ *oneFileHub, _ int, w http.ResponseWriter, r *http.Request) {
 		sendPaced(w, r, content, mib/4, 100*time.Millisecond)
-	})
-	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-	home := t.TempDir()
+	}
 	const timeout = "HF_HUB_DOWNLOAD_TIMEOUT=1"
 
-	first := hfFetch(t, local.URL, home, hubRepo, hubFile, timeout)
-	if first.OK {
-		t.Fatalf("the download succeeded although nothing could be sent for three seconds: %+v", first)
-	}
-	// What huggingface_hub 1.24.0 does: the read timeout of the GET, about
-	// a second in, and no retry of its own.
-	if first.Error != "httpx.ReadTimeout" {
-		t.Errorf("the client failed with %s (%s), not a read timeout", first.Error, first.Message)
-	}
-	if first.Seconds > 2.5 {
-		t.Errorf("the client took %.1fs to give up with a one-second timeout", first.Seconds)
-	}
-	if files := cached(t, home); len(files) != 0 {
-		t.Errorf("the failed download left files in the cache: %v", files)
-	}
-	// The fetch carried on without the client, and a retry once it has
-	// finished is served from the registry.
-	deadline := time.Now().Add(30 * time.Second)
-	for !isStored(local) {
-		if time.Now().After(deadline) {
-			t.Fatal("the fetch never finished")
+	t.Run("streaming off: the first attempt times out", func(t *testing.T) {
+		t.Parallel()
+		hub := newOneFileHub(t, content, slow)
+		local := startWatched(t, hub, server.Config{PullThroughNoStream: true})
+		home := t.TempDir()
+
+		first := hfFetch(t, local.url, home, hubRepo, hubFile, timeout)
+		if first.OK {
+			t.Fatalf("the download succeeded although nothing could be sent for three seconds: %+v", first)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	second := hfFetch(t, local.URL, home, hubRepo, hubFile, timeout)
-	if !second.OK || second.SHA256 != kit.SHA256Hex(content) {
-		t.Fatalf("the retry after the fetch finished: %+v", second)
-	}
-	if hub.fetches() != 1 {
-		t.Errorf("the upstream was asked for the file %d times, want once", hub.fetches())
-	}
+		// What huggingface_hub 1.24.0 does: the read timeout of the GET,
+		// about a second in, and no retry of its own.
+		if first.Error != "httpx.ReadTimeout" {
+			t.Errorf("the client failed with %s (%s), not a read timeout", first.Error, first.Message)
+		}
+		if first.Seconds > 2.5 {
+			t.Errorf("the client took %.1fs to give up with a one-second timeout", first.Seconds)
+		}
+		if files := cached(t, home); len(files) != 0 {
+			t.Errorf("the failed download left files in the cache: %v", files)
+		}
+		// The fetch carried on without the client, and a retry once it has
+		// finished is served from the registry.
+		local.waitStored(t)
+		second := hfFetch(t, local.url, home, hubRepo, hubFile, timeout)
+		if !second.OK || second.SHA256 != kit.SHA256Hex(content) {
+			t.Fatalf("the retry after the fetch finished: %+v", second)
+		}
+		if hub.fetches() != 1 {
+			t.Errorf("the upstream was asked for the file %d times, want once", hub.fetches())
+		}
+		t.Logf("the registry answered: %s", local.answers())
+	})
+
+	t.Run("streaming on: the same download succeeds first time", func(t *testing.T) {
+		t.Parallel()
+		hub := newOneFileHub(t, content, slow)
+		local := startWatched(t, hub, server.Config{})
+		res := hfFetch(t, local.url, t.TempDir(), hubRepo, hubFile, timeout)
+		if !res.OK || res.SHA256 != kit.SHA256Hex(content) || res.Size != int64(len(content)) {
+			t.Fatalf("the download: %+v", res)
+		}
+		// One request, answered once, with the whole file: no timeout and
+		// no resumed transfer hides behind the success.
+		if got := local.answers(); got != "200" {
+			t.Errorf("the registry answered %q, want a single 200", got)
+		}
+		if res.Seconds < 2.5 {
+			t.Errorf("the download took %.1fs, less than the upstream takes to send the file", res.Seconds)
+		}
+		if hub.fetches() != 1 {
+			t.Errorf("the upstream was asked for the file %d times, want once", hub.fetches())
+		}
+	})
+}
+
+// TestHubClientAgainstAnUpstreamThatSendsTheWrongBytes is the price of
+// sending before verifying, and what keeps it from being paid. The
+// upstream's content does not match the digest in its listing. The file is
+// twelve mebibytes because huggingface_hub takes a download in pieces of
+// ten: with less, it has kept nothing by the time the transfer is cut, and
+// has nothing to resume from.
+//
+// The client is sent eleven mebibytes before the registry can know, the
+// transfer is cut, and the client, holding ten of them, asks for the rest.
+// It must never end up with a complete file made of those ten.
+func TestHubClientAgainstAnUpstreamThatSendsTheWrongBytes(t *testing.T) {
+	python(t)
+	content := numbered(12 * mib)
+	tampered := content[:100] + "TAMPERED" + content[108:]
+	want := kit.SHA256Hex(content)
+	const kept = "bytes=10485760-" // what a client holding ten mebibytes asks for
+
+	t.Run("the upstream stays wrong, then is corrected", func(t *testing.T) {
+		t.Parallel()
+		var mu sync.Mutex
+		corrected := false
+		hub := newOneFileHub(t, content, func(h *oneFileHub, n int, w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			body := tampered
+			if corrected {
+				body = content
+			}
+			mu.Unlock()
+			if n == 1 {
+				h.sendAndHoldTheEnd(w, r, body)
+				return
+			}
+			sendAll(w, body)
+		})
+		local := startWatched(t, hub, server.Config{})
+		home := t.TempDir()
+
+		first := hfFetch(t, local.url, home, hubRepo, hubFile)
+		if first.OK {
+			t.Fatalf("the client has a file although the upstream's bytes are wrong: %+v", first)
+		}
+		// The transfer was cut, the client asked for the rest, and that was
+		// refused with the reason: the registry had by then fetched the file
+		// again, in full, and found it wrong again.
+		if got := local.answers(); got != "200; 502 to Range "+kept {
+			t.Errorf("the registry answered %q", got)
+		}
+		if first.Error != "huggingface_hub.errors.HfHubHTTPError" || !strings.Contains(first.Message, "verification failed") {
+			t.Errorf("the client failed with %s: %s", first.Error, first.Message)
+		}
+		if files := cached(t, home); len(files) != 0 {
+			t.Fatalf("the failed download left files in the client's cache: %v", files)
+		}
+		if local.isStored() {
+			t.Fatal("the registry recorded the file")
+		}
+
+		mu.Lock()
+		corrected = true
+		mu.Unlock()
+		second := hfFetch(t, local.url, home, hubRepo, hubFile)
+		if !second.OK || second.SHA256 != want {
+			t.Fatalf("after the upstream was corrected: %+v, want sha256 %s", second, want)
+		}
+		t.Logf("the registry answered: %s", local.answers())
+	})
+
+	// The case that would go wrong: the upstream is sound again by the time
+	// the client asks for the rest. Sending the rest would complete a file
+	// whose first ten mebibytes are the wrong ones.
+	t.Run("the upstream is corrected before the client resumes", func(t *testing.T) {
+		t.Parallel()
+		hub := newOneFileHub(t, content, func(h *oneFileHub, n int, w http.ResponseWriter, r *http.Request) {
+			if n == 1 {
+				h.sendAndHoldTheEnd(w, r, tampered)
+				return
+			}
+			sendAll(w, content)
+		})
+		local := startWatched(t, hub, server.Config{})
+		home := t.TempDir()
+
+		res := hfFetch(t, local.url, home, hubRepo, hubFile)
+		// The client asked for the rest and was sent the whole file, which
+		// it took in place of what it had.
+		if got := local.answers(); got != "200; 200 to Range "+kept {
+			t.Errorf("the registry answered %q", got)
+		}
+		if !res.OK || res.Size != int64(len(content)) {
+			t.Fatalf("the download: %+v", res)
+		}
+		if res.SHA256 != want {
+			t.Fatalf("the client ended with a complete file that is not the genuine one: sha256 %s, want %s", res.SHA256, want)
+		}
+		for name, size := range cached(t, home) {
+			if size != int64(len(content)) {
+				t.Errorf("the cache holds %s with %d bytes", name, size)
+			}
+		}
+	})
 }

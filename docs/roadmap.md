@@ -18,10 +18,6 @@ of dates. Issues and pull requests that move an item forward are welcome.
 ## After that
 
 - **Scheduled sync.** Keep chosen mirrors up to date with upstream.
-- **Serve while fetching.** Today the first download of a file through
-  pull-through waits until the whole file is stored and verified. Stream
-  it to that first client as it arrives, holding back the end until the
-  digest has been checked.
 - **Mirror every branch and tag** of a repository in one command.
 - **Resumable uploads** for `modelctl push`.
 - **A migration command** to move stored files between local disk and S3.

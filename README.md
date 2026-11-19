@@ -154,6 +154,7 @@ setting that is not a secret has both; a flag wins over its variable.
 | `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
 | `--pull-through-allow` | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
 | `--pull-through-max-file-bytes` | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
+| `--pull-through-stream` | `REGISTRY_PULL_THROUGH_STREAM` | `true` | Send a file to the clients waiting for it while pull-through is still fetching it, holding back its end until it is verified. `false` sends nothing until the file is stored. See [the first download](docs/operations.md#the-first-download-of-a-file) |
 | `--max-blob-bytes` | `REGISTRY_MAX_BLOB_BYTES` | `0` (no limit) | Largest single file, in bytes, that an upload may store. Larger uploads are refused with `413` |
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | `--backup-interval` | `REGISTRY_BACKUP_INTERVAL` | `0` (off) | Store a metadata backup this often, for example `1h`; at least a minute |
@@ -193,9 +194,13 @@ it is asked for and does not have. The first request for a model records
 its file listing from the upstream hub, which takes a moment. Each file's
 content is then fetched the first time someone downloads that file, checked
 against its digest, and stored. Asking for one file of a large repository
-fetches one file. The first download of a large file waits while the
-registry fetches it; if the client gives up, the fetch carries on and a
-retry is served from the registry. Anyone allowed to download can trigger a
+fetches one file. That first download is sent to the client while the
+registry is still fetching the file, so it takes about as long as the
+fetch and starts at once; the end of the file is held back until the
+whole of it has matched its digest, and a mismatch cuts the download
+short (`--pull-through-stream=false` sends nothing before the file is
+verified and stored, at the price of the first download of a large file
+timing out). Anyone allowed to download can trigger a
 fetch, so on a registry others can reach, combine it with `--require-auth`
 or an allow list. A repository you pushed is never added to from upstream;
 if you push your own models as well, use an allow list that leaves your

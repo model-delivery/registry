@@ -266,26 +266,38 @@ func TestPullResumesFromAPartFile(t *testing.T) {
 		}
 	})
 
-	t.Run("a part of the full size and the wrong content: refused, removed, and the next pull starts again", func(t *testing.T) {
+	t.Run("a part of the full size and the wrong content: thrown away, and the file fetched whole", func(t *testing.T) {
 		t.Parallel()
 		s := &served{}
 		cl, dir := lyingRegistry(t, listed, honest(s)), t.TempDir()
 		leave(t, dir, strings.Repeat("x", len(content)))
-		_, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil)
-		if err == nil || !strings.Contains(err.Error(), "integrity check failed") || !strings.Contains(err.Error(), "model.bin") {
-			t.Fatalf("got %v, want the integrity check to fail", err)
-		}
-		// Nothing was fetched, nothing is kept, and nothing was installed.
-		if got := requests(s); len(got) != 0 {
-			t.Fatalf("requested %d times", len(got))
-		}
-		if n := dirBytes(t, dir); n != 0 {
-			t.Fatalf("%d bytes left in the target directory", n)
-		}
 		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
-			t.Fatalf("the pull after that: %v", err)
+			t.Fatal(err)
 		}
 		pulled(t, dir)
+		if got := requests(s); len(got) != 1 || got[0] != "" {
+			t.Fatalf("requests carried Range %q, want one request for the whole file", got)
+		}
+	})
+
+	t.Run("the same for a file named only by its git blob id", func(t *testing.T) {
+		t.Parallel()
+		// A file the registry had not fetched when it listed it has no
+		// SHA-256, so the part is checked against the git blob id.
+		oid, err := kit.GitBlobID(strings.NewReader(content), int64(len(content)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := &served{}
+		cl, dir := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), GitOID: oid}, honest(s)), t.TempDir()
+		leave(t, dir, strings.Repeat("x", len(content)))
+		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
+			t.Fatal(err)
+		}
+		pulled(t, dir)
+		if got := requests(s); len(got) != 1 || got[0] != "" {
+			t.Fatalf("requests carried Range %q, want one request for the whole file", got)
+		}
 	})
 
 	t.Run("a part that is not the start of the file: the result fails its check and is removed", func(t *testing.T) {
@@ -305,23 +317,69 @@ func TestPullResumesFromAPartFile(t *testing.T) {
 		pulled(t, dir)
 	})
 
-	t.Run("a registry that ignores the range: its answer is not appended to the part", func(t *testing.T) {
+	// ignoring answers 200 with the whole of body, whatever was asked for.
+	ignoring := func(s *served, body string) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			s.mu.Lock()
+			s.ranges = append(s.ranges, r.Header.Get("Range"))
+			s.mu.Unlock()
+			_, _ = w.Write([]byte(body))
+		}
+	}
+
+	t.Run("a registry that ignores the range: its answer replaces the part and is not appended to it", func(t *testing.T) {
 		t.Parallel()
-		// It answers 200 with the whole file, whatever was asked for. Taking
-		// that as the rest of the file would produce a file that starts
-		// twice; the pull stops instead, and what was there is untouched.
-		cl := lyingRegistry(t, listed, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(content)) })
-		dir := t.TempDir()
+		// Taking the answer as the rest of the file would produce a file that
+		// starts twice. Stopping over it would stop every later pull the same
+		// way, since the part file stays. The part is dropped and the answer
+		// taken as what it is: the whole file.
+		s := &served{}
+		cl, dir := lyingRegistry(t, listed, ignoring(s, content)), t.TempDir()
+		leave(t, dir, content[:8])
+		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
+			t.Fatal(err)
+		}
+		pulled(t, dir)
+		if got := requests(s); len(got) != 1 || got[0] != "bytes=8-" {
+			t.Fatalf("requests carried Range %q, want the one resume request", got)
+		}
+	})
+
+	t.Run("a registry that ignores the range, and a part that was never the start of the file", func(t *testing.T) {
+		t.Parallel()
+		s := &served{}
+		cl, dir := lyingRegistry(t, listed, ignoring(s, content)), t.TempDir()
+		leave(t, dir, "XXXXXXXX")
+		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
+			t.Fatal(err)
+		}
+		pulled(t, dir)
+	})
+
+	t.Run("a registry that ignores the range and sends the wrong content: refused, and nothing is kept", func(t *testing.T) {
+		t.Parallel()
+		s := &served{}
+		cl, dir := lyingRegistry(t, listed, ignoring(s, strings.Repeat("y", len(content)))), t.TempDir()
 		leave(t, dir, content[:8])
 		_, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil)
-		if err == nil || !strings.Contains(err.Error(), "did not honour the resume request") || !strings.Contains(err.Error(), "model.bin") {
-			t.Fatalf("got %v, want the pull to stop", err)
+		if err == nil || !strings.Contains(err.Error(), "integrity check failed") || !strings.Contains(err.Error(), "model.bin") {
+			t.Fatalf("got %v, want the integrity check to fail", err)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "model.bin")); !os.IsNotExist(err) {
-			t.Fatalf("a file was installed: %v", err)
+		if n := dirBytes(t, dir); n != 0 {
+			t.Fatalf("%d bytes left in the target directory", n)
 		}
-		if got, err := os.ReadFile(filepath.Join(dir, "model.bin"+partSuffix)); err != nil || string(got) != content[:8] {
-			t.Fatalf("the part file now holds %q, %v; want it as it was", got, err)
+	})
+
+	t.Run("a registry that ignores the range and sends too much: cut off, and nothing is kept", func(t *testing.T) {
+		t.Parallel()
+		s := &served{}
+		cl, dir := lyingRegistry(t, listed, ignoring(s, content+content)), t.TempDir()
+		leave(t, dir, content[:8])
+		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err == nil || !strings.Contains(err.Error(), "more data than the size it lists") {
+			t.Fatalf("got %v, want the download cut off", err)
+		}
+		if n := dirBytes(t, dir); n != 0 {
+			t.Fatalf("%d bytes left in the target directory", n)
 		}
 	})
 

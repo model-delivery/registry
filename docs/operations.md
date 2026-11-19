@@ -358,7 +358,10 @@ send bytes that do not match its own listing:
 - *A client that is not `huggingface_hub`.* The rule above relies on the
   client replacing its partial file when a request for a range is
   answered with the whole file (`200`). `huggingface_hub` does, and
-  `test/e2e` runs it. A download tool that appends the answer to what it
+  `test/e2e` runs it; so does `modelctl pull`, which drops its `.part`
+  file and takes the whole answer (before v0.4.0 it stopped with "registry
+  did not honour the resume request" until the `.part` file was deleted
+  by hand). A download tool that appends the answer to what it
   has regardless would end up with a damaged file. A tool that ignores
   the announced length and keeps a cut-off download as if it were whole
   has a file missing its last mebibyte, of unverified content.

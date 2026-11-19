@@ -732,18 +732,35 @@ func (c *Client) download(ctx context.Context, rev Revision, f File, dst string)
 	if err != nil {
 		return err
 	}
-	if have > f.Size {
-		have = 0
+	// restart drops what the part file holds, so that the file is taken
+	// from its first byte.
+	restart := func() error {
 		h.Reset()
 		if err := out.Truncate(0); err != nil {
 			return err
 		}
-		if _, err := out.Seek(0, io.SeekStart); err != nil {
+		_, err := out.Seek(0, io.SeekStart)
+		return err
+	}
+	// A part that cannot be the start of this file is not worth keeping, and
+	// failing over it would fail every later pull the same way: one that is
+	// larger than the file, or as large and not its content.
+	stale := have > f.Size
+	if have == f.Size && have > 0 {
+		if f.SHA256 != "" {
+			stale = hex.EncodeToString(h.Sum(nil)) != f.SHA256
+		} else {
+			stale = !f.matches(part)
+		}
+	}
+	if stale {
+		have = 0
+		if err := restart(); err != nil {
 			return err
 		}
 	}
 	if have < f.Size {
-		if err := c.fetchRange(ctx, rev, f, have, out, h); err != nil {
+		if err := c.fetchRange(ctx, rev, f, have, out, h, restart); err != nil {
 			if errors.Is(err, errOversized) {
 				// Nothing of an answer like that is worth resuming from.
 				_ = out.Close()
@@ -778,7 +795,15 @@ func (c *Client) download(ctx context.Context, rev Revision, f File, dst string)
 	return os.Rename(part, dst)
 }
 
-func (c *Client) fetchRange(ctx context.Context, rev Revision, f File, offset int64, out io.Writer, h hash.Hash) error {
+// fetchRange downloads f from offset to its end into out, which already
+// holds the bytes before offset, and adds what it writes to h.
+//
+// A registry may answer a request for the rest of a file with the whole of
+// it (200 where 206 was asked for): a server or proxy that ignores Range,
+// or this registry for a file whose earlier bytes it does not vouch for.
+// That body is never added to what is there. restart empties out and h, and
+// the whole file is taken from its first byte.
+func (c *Client) fetchRange(ctx context.Context, rev Revision, f File, offset int64, out io.Writer, h hash.Hash, restart func() error) error {
 	req := get("/" + kit.EscapePath(rev.Repo) + "/resolve/" + rev.SHA + "/" + kit.EscapePath(f.Path))
 	if offset > 0 {
 		req.header = http.Header{"Range": {fmt.Sprintf("bytes=%d-", offset)}}
@@ -789,7 +814,14 @@ func (c *Client) fetchRange(ctx context.Context, rev Revision, f File, offset in
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
-		return errors.New("registry did not honour the resume request")
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("the registry answered the request for the rest of the file with status %d; "+
+				"delete the %s file beside where it goes and pull again", resp.StatusCode, partSuffix)
+		}
+		if err := restart(); err != nil {
+			return err
+		}
+		offset = 0
 	}
 	// The registry said how large the file is. Take that much and one byte
 	// more: enough to tell that it is sending too much, without writing

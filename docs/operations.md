@@ -507,9 +507,18 @@ model files:
   elsewhere, or use `modelctl backup download` from another machine.
 
 Backups are named by time, `registry-20261118T140000Z.db`, and the oldest
-beyond the keep count are removed. A second backup taken in the same
-second is named `registry-20261118T140000Z_2.db`; it does not replace the
-first. A failed backup is logged as an error and the schedule carries on;
+beyond the keep count are removed, so that exactly that many are left. A
+second backup taken in the same second is named
+`registry-20261118T140000Z_2.db`; it does not replace the first, and a
+name is not used again once its backup has been removed. From the tenth
+of one second on, the number is preceded by a letter that says how many
+digits it has (`_9`, `_a10`, ... `_a99`, `_b100`), which keeps the names
+in the order the backups were taken wherever they are sorted as text.
+Versions before v0.4.0 wrote `_10` there, and a later backup in a second
+whose first had been removed took the plain name again, was listed as the
+oldest, and left one backup more than the keep count. Backups with the
+older names are listed, restored and removed like any other, in the order
+they were taken. A failed backup is logged as an error and the schedule carries on;
 alert on `scheduled metadata backup failed`. A backup that was stored but
 could not be followed by the removal of old ones is not a failure: it is
 logged as a warning (`old backups beyond the number to keep could not be

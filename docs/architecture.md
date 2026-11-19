@@ -407,8 +407,10 @@ version reads), and only then stored through `blob.Archive`, the four
 methods every storage backend has for keeping named files beside the
 blobs: under `backups/` in the data directory, or under `backups/` in the
 bucket. With object storage that puts the backup off the server's disk.
-Backups are named by time; the oldest beyond the number to keep are
-removed after the new one is stored, never before.
+Backups are named by time, with a number when several fall in one second,
+and are ordered by name; the name of a new one follows every name stored
+for its second and is never one that was used before. The oldest beyond
+the number to keep are removed after the new one is stored, never before.
 
 Three things take one: the schedule in `modelctl serve` (a loop that takes
 a backup on each tick of a ticker), `POST /api/v1/backups`, and

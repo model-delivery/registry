@@ -11,7 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
@@ -40,11 +41,63 @@ func BackupName(t time.Time) string {
 }
 
 // laterBackupName is the name of the nth backup taken in the same second
-// as t, for n of 2 and up. The suffix sorts after the plain name, so the
-// later backup still lists later.
+// as t, for n of 2 and up: the plain name with "_n" before the extension.
+//
+// Names are what orders backups, as text, wherever they are listed: here,
+// by `ls`, by an object store's console. "_10" would come before "_2" that
+// way. So a number of two digits or more is preceded by a letter that says
+// how long it is, "a" for two digits, "b" for three: "_9", "_a10", "_a99",
+// "_b100". A letter sorts after every digit, and a longer number has a
+// later letter, so the names of one second sort in the order they were
+// taken however many there are. The suffix sorts after the plain name.
+//
+// Versions before v0.4.0 wrote the bare number at any length ("_10").
+// Those names are still read (backupSeq), and blob.SortArchives puts them
+// where their number says.
 func laterBackupName(t time.Time, n int) string {
-	return fmt.Sprintf("registry-%s_%d.db", t.UTC().Format(backupTimeLayout), n)
+	number := strconv.Itoa(n)
+	width := ""
+	if len(number) > 1 {
+		// An int has at most nineteen digits, so the letter is never past "r".
+		width = "abcdefghijklmnopqrstuvwxyz"[len(number)-2 : len(number)-1]
+	}
+	return "registry-" + t.UTC().Format(backupTimeLayout) + "_" + width + number + ".db"
 }
+
+// backupSeq reports which backup of the second t a stored name is: 1 for
+// the plain name, n for a later one in either the current form or the one
+// before v0.4.0. ok is false for a name of another second, or one this
+// package did not write.
+func backupSeq(name string, t time.Time) (n int, ok bool) {
+	rest, ok := strings.CutPrefix(name, "registry-"+t.UTC().Format(backupTimeLayout))
+	if !ok {
+		return 0, false
+	}
+	if rest == ".db" {
+		return 1, true
+	}
+	rest, ok = strings.CutPrefix(rest, "_")
+	number, isDB := strings.CutSuffix(rest, ".db")
+	if !ok || !isDB {
+		return 0, false
+	}
+	if number != "" && number[0] >= 'a' && number[0] <= 'z' {
+		number = number[1:] // the letter that says how long the number is
+	}
+	if number == "" || strings.Trim(number, "0123456789") != "" {
+		return 0, false
+	}
+	// A number too long to read is not one this package wrote.
+	n, err := strconv.Atoi(number)
+	if err != nil || n < 1 || n > maxBackupSeq {
+		return 0, false
+	}
+	return n, true
+}
+
+// maxBackupSeq is the largest number read from a backup's name. It is far
+// beyond any number of backups a second can hold, and leaves room to add to.
+const maxBackupSeq = 1 << 40
 
 // SnapshotInfo is what a verified snapshot contains.
 type SnapshotInfo struct {
@@ -196,43 +249,62 @@ func (r *Registry) Backup(ctx context.Context, keep int) (BackupResult, error) {
 		return BackupResult{}, fmt.Errorf("list the backups already stored: %w", err)
 	}
 	now := r.now().UTC()
-	name := freeBackupName(now, stored)
+	// The name follows every backup stored for this second, and the last
+	// one this process took: that one counts even if it has since been
+	// removed, so that its name is not given out a second time.
+	name := freeBackupName(now, append(stored[:len(stored):len(stored)], Backup{Name: r.lastBackup}))
 	if err := r.blobs.PutArchive(ctx, name, path); err != nil {
 		return BackupResult{}, fmt.Errorf("store the backup: %w", err)
 	}
+	r.lastBackup = name
 	res := BackupResult{Backup: Backup{Name: name, Size: info.Size, ModTime: now}, Contents: info}
 	if keep > 0 {
-		res.PruneErr = r.pruneBackups(ctx, append(stored, res.Backup), name, keep)
+		res.PruneErr = r.pruneBackups(ctx, stored, name, keep)
 	}
 	return res, nil
 }
 
-// freeBackupName is the name for a backup taken at t that no stored backup
-// has. Names carry the time to the second; a second backup in the same
-// second gets a numbered suffix instead of replacing the first.
+// freeBackupName is the name for a backup taken at t: one that no stored
+// backup has, and that sorts after every backup stored for the same second.
+// Names carry the time to the second. The first backup of a second has the
+// plain name; each later one has the number after the highest in use, so a
+// name freed by pruning is never given out again while a later backup of
+// that second exists, and a later backup never lists before an earlier one.
 func freeBackupName(t time.Time, stored []Backup) string {
 	taken := make(map[string]bool, len(stored))
+	highest := 0
 	for _, b := range stored {
 		taken[b.Name] = true
+		if n, ok := backupSeq(b.Name, t); ok && n > highest {
+			highest = n
+		}
 	}
-	name := BackupName(t)
-	for n := 2; taken[name]; n++ {
-		name = laterBackupName(t, n)
+	if highest == 0 {
+		return BackupName(t)
+	}
+	name := laterBackupName(t, highest+1)
+	for n := highest + 2; taken[name]; n++ {
+		name = laterBackupName(t, n) // a name this package did not write is in the way
 	}
 	return name
 }
 
-// pruneBackups removes the oldest of all beyond keep, never the one just
-// written. It tries every removal and returns what failed.
-func (r *Registry) pruneBackups(ctx context.Context, all []Backup, justWritten string, keep int) error {
-	// Names sort by time, so the oldest come first.
-	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
-	var failed []error
-	for i := 0; i < len(all)-keep; i++ {
-		if all[i].Name == justWritten {
-			continue
+// pruneBackups removes the oldest of the backups stored before the one
+// just written, so that keep are left counting that one. The one just
+// written is never removed, wherever its name sorts. It tries every
+// removal and returns what failed.
+func (r *Registry) pruneBackups(ctx context.Context, earlier []Backup, justWritten string, keep int) error {
+	older := make([]Backup, 0, len(earlier))
+	for _, b := range earlier {
+		if b.Name != justWritten { // it was stored over a backup of the same name
+			older = append(older, b)
 		}
-		if err := r.blobs.DeleteArchive(ctx, all[i].Name); err != nil {
+	}
+	// Oldest first, in the order backups are listed in.
+	blob.SortArchives(older)
+	var failed []error
+	for i := 0; i < len(older)-(keep-1); i++ {
+		if err := r.blobs.DeleteArchive(ctx, older[i].Name); err != nil {
 			failed = append(failed, err)
 		}
 	}

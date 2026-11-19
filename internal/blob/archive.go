@@ -58,8 +58,60 @@ func validArchiveName(name string) error {
 	return nil
 }
 
-func sortArchives(list []ArchiveInfo) {
-	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+// SortArchives puts backups in the order of their names, oldest first: the
+// order ListArchives returns them in.
+func SortArchives(list []ArchiveInfo) {
+	sort.Slice(list, func(i, j int) bool { return archiveNameLess(list[i].Name, list[j].Name) })
+}
+
+// archiveNameLess orders backup names. A backup's name carries the time it
+// was taken and, when several were taken in one second, a number; names are
+// compared as text, except that a run of digits is compared as the number
+// it is. So "registry-<time>_10.db", which is how versions before v0.4.0
+// named the tenth backup of a second, comes after "registry-<time>_9.db"
+// and not between "_1" and "_2". Names that are the same by that rule
+// ("_02" and "_2") are ordered as text, so the order is total.
+func archiveNameLess(a, b string) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if isDigit(a[i]) && isDigit(b[j]) {
+			x, nextI := digits(a, i)
+			y, nextJ := digits(b, j)
+			if len(x) != len(y) {
+				return len(x) < len(y)
+			}
+			if x != y {
+				return x < y
+			}
+			i, j = nextI, nextJ
+			continue
+		}
+		if a[i] != b[j] {
+			return a[i] < b[j]
+		}
+		i++
+		j++
+	}
+	if rest, other := len(a)-i, len(b)-j; rest != other {
+		return rest < other
+	}
+	return a < b
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// digits returns the run of digits of s that starts at i, without its
+// leading zeros, and where the run ends. Two such runs of the same length
+// compare as text the way their numbers compare.
+func digits(s string, i int) (run string, end int) {
+	end = i
+	for end < len(s) && isDigit(s[end]) {
+		end++
+	}
+	for i < end-1 && s[i] == '0' {
+		i++
+	}
+	return s[i:end], end
 }
 
 // ---- filesystem ----
@@ -126,7 +178,7 @@ func archiveInfos(entries []fs.DirEntry) ([]ArchiveInfo, error) {
 		}
 		out = append(out, ArchiveInfo{Name: e.Name(), Size: fi.Size(), ModTime: fi.ModTime().UTC()})
 	}
-	sortArchives(out)
+	SortArchives(out)
 	return out, nil
 }
 
@@ -196,7 +248,7 @@ func (s *S3) ListArchives(ctx context.Context) ([]ArchiveInfo, error) {
 		}
 		out = append(out, ArchiveInfo{Name: name, Size: obj.Size, ModTime: obj.LastModified.UTC()})
 	}
-	sortArchives(out)
+	SortArchives(out)
 	return out, nil
 }
 

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -378,7 +379,9 @@ func cached(t *testing.T, home string) map[string]int64 {
 		if !strings.Contains(rel, "/blobs/") && !strings.Contains(rel, "/snapshots/") {
 			return nil
 		}
-		info, err := d.Info()
+		// Where the client can make symbolic links, a snapshot entry is a
+		// link to its blob: measure what it points at, not the link.
+		info, err := os.Stat(p)
 		if err != nil {
 			return err
 		}

@@ -85,6 +85,10 @@ type Server struct {
 	log     *slog.Logger
 	puller  *puller // nil unless pull-through caching is on
 	handler http.Handler
+	// patterns is every route registered, as the mux was given it. The
+	// documents that list routes are checked against it
+	// (TestAPIDocumentMatchesTheRoutes).
+	patterns []string
 	// stop ends the server's lifetime context, which every pull-through job
 	// runs on.
 	stop context.CancelFunc
@@ -115,74 +119,78 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	// and the way a refusal is written, or public, with a comment saying why
 	// no role is asked for. Handlers do not check roles themselves.
 	mux := http.NewServeMux()
+	handle := func(pattern string, h http.Handler) {
+		s.patterns = append(s.patterns, pattern)
+		mux.Handle(pattern, h)
+	}
 	// Says only that the process is up; probes carry no token.
-	mux.Handle("GET /healthz", public(func(w http.ResponseWriter, _ *http.Request) {
+	handle("GET /healthz", public(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": cfg.Version})
 	}))
 
 	// Registry API.
 	api := func(minimum registry.Role, h http.HandlerFunc) http.Handler { return s.gate(minimum, asAPI, h) }
-	mux.Handle("GET /api/v1/repos", api(registry.RoleRead, s.apiListRepos))
-	mux.Handle("GET /api/v1/repos/{ns}/{name}", api(registry.RoleRead, s.apiGetRepo))
-	mux.Handle("GET /api/v1/repos/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision))
-	mux.Handle("POST /api/v1/repos/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit))
-	mux.Handle("DELETE /api/v1/repos/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo))
-	mux.Handle("HEAD /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiStatBlob))
-	mux.Handle("PUT /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiPutBlob))
-	mux.Handle("POST /api/v1/mirror", api(registry.RoleWrite, s.apiMirror))
-	mux.Handle("GET /api/v1/stats", api(registry.RoleRead, s.apiStats))
-	mux.Handle("POST /api/v1/gc", api(registry.RoleAdmin, s.apiGC))
-	mux.Handle("POST /api/v1/verify", api(registry.RoleAdmin, s.apiVerify))
-	mux.Handle("GET /api/v1/backups", api(registry.RoleAdmin, s.apiListBackups))
-	mux.Handle("POST /api/v1/backups", api(registry.RoleAdmin, s.apiBackupNow))
-	mux.Handle("GET /api/v1/backups/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
+	handle("GET /api/v1/repos", api(registry.RoleRead, s.apiListRepos))
+	handle("GET /api/v1/repos/{ns}/{name}", api(registry.RoleRead, s.apiGetRepo))
+	handle("GET /api/v1/repos/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision))
+	handle("POST /api/v1/repos/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit))
+	handle("DELETE /api/v1/repos/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo))
+	handle("HEAD /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiStatBlob))
+	handle("PUT /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiPutBlob))
+	handle("POST /api/v1/mirror", api(registry.RoleWrite, s.apiMirror))
+	handle("GET /api/v1/stats", api(registry.RoleRead, s.apiStats))
+	handle("POST /api/v1/gc", api(registry.RoleAdmin, s.apiGC))
+	handle("POST /api/v1/verify", api(registry.RoleAdmin, s.apiVerify))
+	handle("GET /api/v1/backups", api(registry.RoleAdmin, s.apiListBackups))
+	handle("POST /api/v1/backups", api(registry.RoleAdmin, s.apiBackupNow))
+	handle("GET /api/v1/backups/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
 	// The address v0.3.0 shipped, kept so its clients go on working.
-	mux.Handle("GET /api/v1/backup/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
-	mux.Handle("GET /api/v1/tokens", api(registry.RoleAdmin, s.apiListTokens))
-	mux.Handle("POST /api/v1/tokens", api(registry.RoleAdmin, s.apiCreateToken))
-	mux.Handle("DELETE /api/v1/tokens/{name}", api(registry.RoleAdmin, s.apiRevokeToken))
+	handle("GET /api/v1/backup/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
+	handle("GET /api/v1/tokens", api(registry.RoleAdmin, s.apiListTokens))
+	handle("POST /api/v1/tokens", api(registry.RoleAdmin, s.apiCreateToken))
+	handle("DELETE /api/v1/tokens/{name}", api(registry.RoleAdmin, s.apiRevokeToken))
 
 	// Hugging Face compatible routes. Their paths carry percent-encoded
 	// revisions and repository ids of two segments, so they are parsed by
 	// hand instead of by mux patterns: hfModels does that for everything
 	// under /api/models/ and gates each route it finds with its own role.
-	mux.Handle("/api/models/", public(s.hfModels))
+	handle("/api/models/", public(s.hfModels))
 	// Answers who a token is, so it authenticates by itself: 401 unless the
 	// request carries a token this registry issued. No role is needed to
 	// ask, and an open registry's anonymous read does not apply.
-	mux.Handle("GET /api/whoami-v2", public(s.hfWhoami))
+	handle("GET /api/whoami-v2", public(s.hfWhoami))
 	// Uploads from Hugging Face clients (hfupload.go).
-	mux.Handle("POST /api/repos/create", s.gate(registry.RoleWrite, asHF, s.hfCreateRepo))
-	mux.Handle("POST /api/validate-yaml", s.gate(registry.RoleRead, asHF, s.hfValidateYAML))
+	handle("POST /api/repos/create", s.gate(registry.RoleWrite, asHF, s.hfCreateRepo))
+	handle("POST /api/validate-yaml", s.gate(registry.RoleRead, asHF, s.hfValidateYAML))
 	// Opened by the signed URL the batch route issued and by nothing else:
 	// clients send the file here without their token, as they would to a
 	// hub's object store. hfLFSUpload checks the signature, its expiry and
 	// that the token it was issued to still has the write role.
-	mux.Handle("PUT /api/lfs/upload/{sha256}", public(s.hfLFSUpload))
+	handle("PUT /api/lfs/upload/{sha256}", public(s.hfLFSUpload))
 	// A fixed explanation and a fixed "not implemented": neither says
 	// anything about what the registry holds.
-	mux.Handle("/api/xet-is-not-supported/", public(func(w http.ResponseWriter, _ *http.Request) {
+	handle("/api/xet-is-not-supported/", public(func(w http.ResponseWriter, _ *http.Request) {
 		hfError(w, http.StatusBadRequest, xetHint)
 	}))
-	mux.Handle("/api/", public(func(w http.ResponseWriter, _ *http.Request) {
+	handle("/api/", public(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "this endpoint is not implemented by the registry")
 	}))
 
 	// Web UI.
 	// The stylesheet and icon, which the sign-in page needs too.
-	mux.Handle("GET /static/", public(http.StripPrefix("/static/", http.FileServerFS(staticFS())).ServeHTTP))
+	handle("GET /static/", public(http.StripPrefix("/static/", http.FileServerFS(staticFS())).ServeHTTP))
 	// Signing in and out have to work without a token; signing in grants
 	// nothing unless the token typed into the form is valid.
-	mux.Handle("GET /ui/login", public(s.uiLoginForm))
-	mux.Handle("POST /ui/login", public(s.uiLogin))
-	mux.Handle("POST /ui/logout", public(s.uiLogout))
-	mux.Handle("GET /ui/repo/{ns}/{name}", s.gate(registry.RoleRead, asUI, s.uiRepo))
-	mux.Handle("POST /ui/repo/{ns}/{name}/delete", s.gate(registry.RoleAdmin, asUI, s.uiDeleteRepo))
+	handle("GET /ui/login", public(s.uiLoginForm))
+	handle("POST /ui/login", public(s.uiLogin))
+	handle("POST /ui/logout", public(s.uiLogout))
+	handle("GET /ui/repo/{ns}/{name}", s.gate(registry.RoleRead, asUI, s.uiRepo))
+	handle("POST /ui/repo/{ns}/{name}/delete", s.gate(registry.RoleAdmin, asUI, s.uiDeleteRepo))
 
 	// Everything else: file downloads at /{ns}/{name}/resolve/{rev}/{path},
 	// the large-file batch, the UI home page and hub-style repository links.
 	// Like hfModels, root parses the path and gates what it finds.
-	mux.Handle("/", public(s.root))
+	handle("/", public(s.root))
 
 	// Browsers may only make state-changing requests from our own pages.
 	// Non-browser clients (the CLI, Python libraries) are unaffected.

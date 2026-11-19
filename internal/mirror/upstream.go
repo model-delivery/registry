@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/registry"
 )
 
 // DefaultEndpoint is the hub mirrored from unless configured otherwise.
@@ -259,9 +260,20 @@ func (u *Upstream) checked(ctx context.Context, resp *http.Response, trusted boo
 	}
 }
 
-// info resolves a revision (branch, tag or revision id) upstream.
+// apiRepo is the address in the hub's API of the repository whose key
+// (registry.RepoKey) is key: under /api/models/ for a model and
+// /api/datasets/ for a dataset.
+func (u *Upstream) apiRepo(key string) string {
+	if typ, name := registry.SplitRepoKey(key); typ == registry.TypeDataset {
+		return u.endpoint() + "/api/datasets/" + name
+	}
+	return u.endpoint() + "/api/models/" + key
+}
+
+// info resolves a revision (branch, tag or revision id) of the repository
+// whose key is repo, upstream.
 func (u *Upstream) info(ctx context.Context, repo, revision string) (Info, error) {
-	resp, err := u.get(ctx, u.endpoint()+"/api/models/"+repo+"/revision/"+url.PathEscape(revision), nil)
+	resp, err := u.get(ctx, u.apiRepo(repo)+"/revision/"+url.PathEscape(revision), nil)
 	if err != nil {
 		return Info{}, err
 	}
@@ -285,13 +297,14 @@ func (u *Upstream) info(ctx context.Context, repo, revision string) (Info, error
 
 var nextLinkRe = regexp.MustCompile(`<([^>]+)>\s*;\s*rel="next"`)
 
-// tree lists every file in a revision, following the hub's pagination.
+// tree lists every file in a revision of the repository whose key is repo,
+// following the hub's pagination.
 func (u *Upstream) tree(ctx context.Context, repo, sha string) ([]Entry, error) {
 	home, err := url.Parse(u.endpoint())
 	if err != nil {
 		return nil, fmt.Errorf("the upstream address %q is not a URL", u.endpoint())
 	}
-	next := u.endpoint() + "/api/models/" + repo + "/tree/" + url.PathEscape(sha) + "?recursive=true&expand=false"
+	next := u.apiRepo(repo) + "/tree/" + url.PathEscape(sha) + "?recursive=true&expand=false"
 	var out []Entry
 	for pages := 0; next != ""; pages++ {
 		if pages > maxListingPages {
@@ -344,8 +357,10 @@ func (u *Upstream) tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 	return out, nil
 }
 
-// open streams a file's content. If the connection drops part-way the
-// returned reader reconnects and continues from where it stopped.
+// open streams a file's content. repo is the repository's key, which is
+// also the path the hub serves its files under (registry.RepoKey). If the
+// connection drops part-way the returned reader reconnects and continues
+// from where it stopped.
 func (u *Upstream) open(ctx context.Context, repo, sha, path string) io.ReadCloser {
 	fileURL := u.endpoint() + "/" + repo + "/resolve/" + sha + "/" + kit.EscapePath(path)
 	return &resumeReader{ctx: ctx, open: func(offset int64) (io.ReadCloser, error) {

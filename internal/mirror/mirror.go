@@ -40,9 +40,12 @@ const (
 type Event struct {
 	Event EventKind `json:"event"`
 	Repo  string    `json:"repo,omitempty"`
-	SHA   string    `json:"sha,omitempty"`
-	Ref   string    `json:"ref,omitempty"`
-	Path  string    `json:"path,omitempty"`
+	// RepoType is the type of Repo, on the start and done lines; absent for
+	// a model.
+	RepoType registry.RepoType `json:"repo_type,omitzero"`
+	SHA      string            `json:"sha,omitempty"`
+	Ref      string            `json:"ref,omitempty"`
+	Path     string            `json:"path,omitempty"`
 	// Status of a file event.
 	Status          FileStatus `json:"status,omitempty"`
 	Size            int64      `json:"size,omitempty"`
@@ -55,6 +58,9 @@ type Event struct {
 
 // Result is what a finished mirror did.
 type Result struct {
+	// Repo is the key (registry.RepoKey) the revision was recorded under:
+	// the upstream's name for a model, "datasets/" and its name for a
+	// dataset.
 	Repo string
 	SHA  string
 	// Ref is the branch that now points at the revision; empty when the
@@ -70,8 +76,20 @@ type Result struct {
 
 // doneEvent is the last line of a successful mirror's progress.
 func (r Result) doneEvent() Event {
-	return Event{Event: EventDone, Repo: r.Repo, SHA: r.SHA, Ref: r.Ref, Files: r.Files,
+	name, typ := eventRepo(r.Repo)
+	return Event{Event: EventDone, Repo: name, RepoType: typ, SHA: r.SHA, Ref: r.Ref, Files: r.Files,
 		Bytes: r.Bytes, DownloadedBytes: r.DownloadedBytes, ReusedBytes: r.ReusedBytes}
+}
+
+// eventRepo is how a progress line names the repository with key key: by
+// its name, with the type set only for a dataset. A model's lines are what
+// they were before datasets existed, down to the Go value.
+func eventRepo(key string) (string, registry.RepoType) {
+	typ, name := registry.SplitRepoKey(key)
+	if typ.IsZero() {
+		return name, ""
+	}
+	return name, typ
 }
 
 // DefaultConcurrency is how many files a mirror fetches at once unless
@@ -91,17 +109,24 @@ const maxStoredInfo = 1 << 20
 type Plan struct {
 	up       *Upstream
 	revision string
-	Info     Info
-	Entries  []Entry
+	// Repo is the key (registry.RepoKey) the revision is recorded under:
+	// the upstream's canonical name, of the type that was asked for.
+	Repo string
+	// Type is the repository's type.
+	Type    registry.RepoType
+	Info    Info
+	Entries []Entry
 }
 
-// Prepare resolves repo@revision upstream and lists its files. Nothing is
-// written locally, so callers can report upstream errors before committing
-// to a long transfer.
+// Prepare resolves repo@revision upstream and lists its files. repo is a
+// repository key (registry.RepoKey), so a dataset is asked for as
+// "datasets/namespace/name". Nothing is written locally, so callers can
+// report upstream errors before committing to a long transfer.
 func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, error) {
-	if err := registry.ValidateRepoName(repo); err != nil {
+	if err := registry.ValidateRepoKey(repo); err != nil {
 		return nil, err
 	}
+	typ, _ := registry.SplitRepoKey(repo)
 	if revision == "" {
 		revision = defaultRevision
 	}
@@ -119,7 +144,8 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 	if !registry.IsSHA(info.SHA) {
 		return nil, blame(fmt.Errorf("upstream revision id %q is not a 40-character hash", info.SHA))
 	}
-	entries, err := up.tree(ctx, info.ID, info.SHA)
+	key := registry.RepoKey(typ, info.ID)
+	entries, err := up.tree(ctx, key, info.SHA)
 	if err != nil {
 		return nil, blame(err)
 	}
@@ -131,7 +157,7 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 			return nil, blame(err)
 		}
 	}
-	return &Plan{up: up, revision: revision, Info: info, Entries: entries}, nil
+	return &Plan{up: up, revision: revision, Repo: key, Type: typ, Info: info, Entries: entries}, nil
 }
 
 // storedInfo is the upstream's model description as it is kept with the
@@ -168,8 +194,9 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 	if concurrency < 1 {
 		concurrency = DefaultConcurrency
 	}
-	repo, sha := p.Info.ID, p.Info.SHA
-	progress(Event{Event: EventStart, Repo: repo, SHA: sha, Files: len(p.Entries), Bytes: p.Bytes()})
+	repo, sha := p.Repo, p.Info.SHA
+	name, typ := eventRepo(repo)
+	progress(Event{Event: EventStart, Repo: name, RepoType: typ, SHA: sha, Files: len(p.Entries), Bytes: p.Bytes()})
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -269,7 +296,7 @@ func (p *Plan) lazyInput(branch string) registry.LazyInput {
 		files[i] = registry.File{Path: e.Path, Size: e.Size, GitOID: e.OID, LFS: e.LFSSHA256 != "", SHA256: e.LFSSHA256}
 	}
 	return registry.LazyInput{
-		Repo: p.Info.ID, Branch: branch, SHA: p.Info.SHA, Files: files,
+		Repo: p.Repo, Branch: branch, SHA: p.Info.SHA, Files: files,
 		Upstream: p.up.endpoint(), UpstreamInfo: p.storedInfo(), Message: "Mirrored from " + p.up.endpoint(),
 	}
 }
@@ -310,7 +337,7 @@ func FetchFileFollowed(ctx context.Context, up *Upstream, reg *registry.Registry
 	if f.LFS {
 		e.LFSSHA256 = f.SHA256
 	}
-	got, downloaded, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e, tail)
+	got, downloaded, err := ensureBlob(ctx, up, reg, c.Key(), c.SHA, e, tail)
 	if err != nil {
 		return false, err
 	}
@@ -318,8 +345,8 @@ func FetchFileFollowed(ctx context.Context, up *Upstream, reg *registry.Registry
 }
 
 // ensureBlob makes sure one upstream file's bytes are stored, downloading
-// and verifying them only if they are not already present. tail, when not
-// nil, follows the download.
+// and verifying them only if they are not already present. repo is the
+// repository's key. tail, when not nil, follows the download.
 func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo, sha string, e Entry, tail *blob.Tail) (registry.File, bool, error) {
 	f := registry.File{Path: e.Path, GitOID: e.OID, LFS: e.LFSSHA256 != ""}
 	want := blob.Expect{Size: e.Size, Tail: tail}

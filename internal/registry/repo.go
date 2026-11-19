@@ -241,22 +241,36 @@ func (r *Registry) Resolve(ctx context.Context, repoName, rev string) (Commit, e
 }
 
 // Files lists a revision's files in path order.
+//
+// Stored and pending files are in two tables, and a file moves from one to
+// the other when its content arrives (fulfil). Both are read in one
+// transaction, so a file that moves meanwhile is listed once: never
+// missing, never twice.
 func (r *Registry) Files(ctx context.Context, c Commit) ([]File, error) {
-	return allFiles(ctx, r.db, c.ID)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	return allFiles(ctx, tx, c.ID)
 }
 
 // File returns one file of a revision.
+//
+// It asks both tables in one statement, for the reason given at Files:
+// asked one after the other, a file whose content arrived in between is in
+// neither answer, and a download that should wait for it is told the file
+// does not exist.
 func (r *Registry) File(ctx context.Context, c Commit, path string) (File, error) {
 	f := File{Path: path}
-	err := r.db.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM files WHERE commit_id = ? AND path = ?", c.ID, path).
-		Scan(&f.Size, &f.SHA256, &f.GitOID, &f.LFS)
+	err := r.db.QueryRowContext(ctx,
+		`SELECT size, sha256, git_oid, lfs, 0 AS pending FROM files WHERE commit_id = ? AND path = ?
+		 UNION ALL
+		 SELECT size, sha256, git_oid, lfs, 1 FROM pending_files WHERE commit_id = ? AND path = ?
+		 ORDER BY pending LIMIT 1`, c.ID, path, c.ID, path).
+		Scan(&f.Size, &f.SHA256, &f.GitOID, &f.LFS, &f.Pending)
 	if errors.Is(err, sql.ErrNoRows) {
-		f.Pending = true
-		err = r.db.QueryRowContext(ctx, "SELECT size, sha256, git_oid, lfs FROM pending_files WHERE commit_id = ? AND path = ?", c.ID, path).
-			Scan(&f.Size, &f.SHA256, &f.GitOID, &f.LFS)
-		if errors.Is(err, sql.ErrNoRows) {
-			return File{}, fmt.Errorf("%w: %s", ErrEntryNotFound, path)
-		}
+		return File{}, fmt.Errorf("%w: %s", ErrEntryNotFound, path)
 	}
 	return f, err
 }

@@ -56,6 +56,24 @@ func EscapePath(p string) string {
 	return strings.Join(segs, "/")
 }
 
+// DatasetsSegment is the segment the Hub puts before a dataset's id in its
+// addresses: /datasets/{namespace}/{name}/....
+const DatasetsSegment = "datasets"
+
+// DatasetKey is the key of the dataset called name: its path on the Hub,
+// "datasets/" and its name. A model's key is its name.
+func DatasetKey(name string) string { return DatasetsSegment + "/" + name }
+
+// SplitKey reads a repository key: "datasets/" followed by two segments is
+// a dataset, and anything else (including a name of two segments whose
+// first is "datasets") is a model's name.
+func SplitKey(key string) (name string, dataset bool) {
+	if rest, ok := strings.CutPrefix(key, DatasetsSegment+"/"); ok && strings.Count(rest, "/") == 1 {
+		return rest, true
+	}
+	return key, false
+}
+
 // SHA256Hex is the SHA-256 of v in lowercase hex: the name content is
 // stored under.
 func SHA256Hex[T ~string | ~[]byte](v T) string {

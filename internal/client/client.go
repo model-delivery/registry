@@ -162,8 +162,45 @@ func (c *Client) document(ctx context.Context, method, path string, in, out any)
 	return raw, nil
 }
 
-// repoPath is the API path of a repository.
-func repoPath(repo string) string { return "/api/v1/repos/" + kit.EscapePath(repo) }
+// RepoType is a repository's type, as the registry's API names it.
+type RepoType string
+
+// The repository types. A document that names no type describes a model.
+const (
+	Model   RepoType = "model"
+	Dataset RepoType = "dataset"
+)
+
+// ParseRepoType reads a repository type as a person writes one (the hf
+// CLI's --repo-type). The empty string is a model.
+func ParseRepoType(s string) (RepoType, error) {
+	switch RepoType(s) {
+	case "", Model:
+		return Model, nil
+	case Dataset:
+		return Dataset, nil
+	}
+	return "", fmt.Errorf("repository type must be model or dataset, not %q", s)
+}
+
+// RepoKey is how this client's methods name a repository: by its name for
+// a model, and "datasets/" and its name for a dataset, which is the path
+// the Hub gives each.
+func RepoKey(typ RepoType, name string) string {
+	if typ == Dataset {
+		return kit.DatasetKey(name)
+	}
+	return name
+}
+
+// repoPath is the API path of the repository with key repo: under
+// /api/v1/repos for a model and /api/v1/datasets for a dataset.
+func repoPath(repo string) string {
+	if name, dataset := kit.SplitKey(repo); dataset {
+		return "/api/v1/datasets/" + kit.EscapePath(name)
+	}
+	return "/api/v1/repos/" + kit.EscapePath(repo)
+}
 
 // ---- repositories ----
 
@@ -174,6 +211,8 @@ func repoPath(repo string) string { return "/api/v1/repos/" + kit.EscapePath(rep
 // RepoSummary is one repository in a listing.
 type RepoSummary struct {
 	Name string `json:"name"`
+	// Type is Dataset for a dataset and empty for a model.
+	Type RepoType `json:"type,omitempty"`
 	// Upstream is the hub the repository was mirrored from; empty for one
 	// created by a push or an upload.
 	Upstream    string    `json:"upstream"`
@@ -189,10 +228,19 @@ type RepoList struct {
 	Raw   json.RawMessage `json:"-"`
 }
 
-// ListRepos lists every repository.
+// ListRepos lists every model.
 func (c *Client) ListRepos(ctx context.Context) (RepoList, error) {
+	return c.ListRepositories(ctx, Model)
+}
+
+// ListRepositories lists every repository of type typ.
+func (c *Client) ListRepositories(ctx context.Context, typ RepoType) (RepoList, error) {
+	path := "/api/v1/repos"
+	if typ == Dataset {
+		path = "/api/v1/datasets"
+	}
 	var out RepoList
-	raw, err := c.document(ctx, http.MethodGet, "/api/v1/repos", nil, &out)
+	raw, err := c.document(ctx, http.MethodGet, path, nil, &out)
 	out.Raw = raw
 	return out, err
 }
@@ -219,13 +267,14 @@ type RevisionSummary struct {
 // RepoDetail is a repository with its refs and its revisions, newest first.
 type RepoDetail struct {
 	Name      string            `json:"name"`
+	Type      RepoType          `json:"type,omitempty"` // Dataset, or empty for a model
 	Upstream  string            `json:"upstream"`
 	Refs      []Ref             `json:"refs"`
 	Revisions []RevisionSummary `json:"revisions"`
 	Raw       json.RawMessage   `json:"-"`
 }
 
-// Repo describes one repository.
+// Repo describes one repository; repo is its key (RepoKey).
 func (c *Client) Repo(ctx context.Context, repo string) (RepoDetail, error) {
 	var out RepoDetail
 	raw, err := c.document(ctx, http.MethodGet, repoPath(repo), nil, &out)
@@ -245,7 +294,8 @@ type Freed struct {
 	Raw     json.RawMessage `json:"-"`
 }
 
-// DeleteRepo deletes a repository and frees the files only it used.
+// DeleteRepo deletes the repository with key repo and frees the files only
+// it used.
 func (c *Client) DeleteRepo(ctx context.Context, repo string) (Freed, error) {
 	var out Freed
 	raw, err := c.document(ctx, http.MethodDelete, repoPath(repo), nil, &out)
@@ -420,12 +470,17 @@ func gitBlobID(path string) (string, error) {
 
 // Revision is a revision and its files.
 type Revision struct {
-	Repo  string `json:"repo"`
-	SHA   string `json:"sha"`
-	Files []File `json:"files"`
+	Repo     string   `json:"repo"`
+	RepoType RepoType `json:"repo_type,omitempty"` // Dataset, or empty for a model
+	SHA      string   `json:"sha"`
+	Files    []File   `json:"files"`
 }
 
-// Revision resolves a branch, tag or revision id.
+// Key is the key (RepoKey) of the revision's repository.
+func (r Revision) Key() string { return RepoKey(r.RepoType, r.Repo) }
+
+// Revision resolves a branch, tag or revision id of the repository with key
+// repo.
 func (c *Client) Revision(ctx context.Context, repo, rev string) (Revision, error) {
 	var out Revision
 	_, err := c.document(ctx, http.MethodGet, repoPath(repo)+"/revisions/"+url.PathEscape(rev), nil, &out)
@@ -496,25 +551,32 @@ func stream[E progressLine](ctx context.Context, c *Client, req request, cut cut
 
 // MirrorEvent is one progress line from a mirror run.
 type MirrorEvent struct {
-	Event           string `json:"event"`
-	Repo            string `json:"repo"`
-	SHA             string `json:"sha"`
-	Ref             string `json:"ref"`
-	Path            string `json:"path"`
-	Status          string `json:"status"`
-	Size            int64  `json:"size"`
-	Files           int    `json:"files"`
-	Bytes           int64  `json:"bytes"`
-	DownloadedBytes int64  `json:"downloaded_bytes"`
-	ReusedBytes     int64  `json:"reused_bytes"`
-	Error           string `json:"error"`
+	Event           string   `json:"event"`
+	Repo            string   `json:"repo"`
+	RepoType        RepoType `json:"repo_type,omitempty"` // Dataset, or empty for a model
+	SHA             string   `json:"sha"`
+	Ref             string   `json:"ref"`
+	Path            string   `json:"path"`
+	Status          string   `json:"status"`
+	Size            int64    `json:"size"`
+	Files           int      `json:"files"`
+	Bytes           int64    `json:"bytes"`
+	DownloadedBytes int64    `json:"downloaded_bytes"`
+	ReusedBytes     int64    `json:"reused_bytes"`
+	Error           string   `json:"error"`
 }
 
 // Mirror asks the registry to import repo@revision from its upstream and
-// reports progress as it happens. It returns the final "done" event.
+// reports progress as it happens. repo is a key (RepoKey), so a dataset is
+// "datasets/namespace/name". It returns the final "done" event.
 func (c *Client) Mirror(ctx context.Context, repo, revision, upstreamToken string, progress func(MirrorEvent)) (MirrorEvent, error) {
-	req, err := jsonRequest(http.MethodPost, "/api/v1/mirror",
-		map[string]string{"repo": repo, "revision": revision, "upstream_token": upstreamToken})
+	body := map[string]string{"repo": repo, "revision": revision, "upstream_token": upstreamToken}
+	if name, dataset := kit.SplitKey(repo); dataset {
+		// Only a dataset names its type, so a model's request is what it
+		// always was; a registry too old for datasets refuses the field.
+		body["repo"], body["type"] = name, string(Dataset)
+	}
+	req, err := jsonRequest(http.MethodPost, "/api/v1/mirror", body)
 	if err != nil {
 		return MirrorEvent{}, err
 	}
@@ -572,12 +634,14 @@ type PushOptions struct {
 
 // PushResult is the revision a push produced.
 type PushResult struct {
-	Repo string `json:"repo"`
-	SHA  string `json:"sha"`
+	Repo     string   `json:"repo"`
+	RepoType RepoType `json:"repo_type,omitempty"` // Dataset, or empty for a model
+	SHA      string   `json:"sha"`
 }
 
-// Push uploads the files under dir and records them as a new revision.
-// Files the registry already holds (by SHA-256) are not sent again.
+// Push uploads the files under dir and records them as a new revision of
+// the repository with key repo. Files the registry already holds (by
+// SHA-256) are not sent again.
 func (c *Client) Push(ctx context.Context, dir, repo string, opt PushOptions) (PushResult, error) {
 	type entry struct {
 		Path   string `json:"path"`
@@ -804,7 +868,7 @@ func (c *Client) download(ctx context.Context, rev Revision, f File, dst string)
 // That body is never added to what is there. restart empties out and h, and
 // the whole file is taken from its first byte.
 func (c *Client) fetchRange(ctx context.Context, rev Revision, f File, offset int64, out io.Writer, h hash.Hash, restart func() error) error {
-	req := get("/" + kit.EscapePath(rev.Repo) + "/resolve/" + rev.SHA + "/" + kit.EscapePath(f.Path))
+	req := get("/" + kit.EscapePath(rev.Key()) + "/resolve/" + rev.SHA + "/" + kit.EscapePath(f.Path))
 	if offset > 0 {
 		req.header = http.Header{"Range": {fmt.Sprintf("bytes=%d-", offset)}}
 	}

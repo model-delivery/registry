@@ -78,6 +78,30 @@ func TestEscapePath(t *testing.T) {
 }
 
 // The ids below are what `git hash-object` prints for the same content.
+// A repository key is the path the Hub gives the repository: a model's is
+// its name, a dataset's is "datasets/" and its name.
+func TestRepositoryKeys(t *testing.T) {
+	t.Parallel()
+	if kit.DatasetKey("acme/x") != "datasets/acme/x" {
+		t.Fatalf("DatasetKey = %q", kit.DatasetKey("acme/x"))
+	}
+	tests := []struct {
+		key, name string
+		dataset   bool
+	}{
+		{"acme/x", "acme/x", false},
+		{"datasets/acme/x", "acme/x", true},
+		{"datasets/legacy", "datasets/legacy", false}, // a model in the datasets namespace
+		{"datasets/a/b/c", "datasets/a/b/c", false},
+		{"", "", false},
+	}
+	for _, tc := range tests {
+		if name, dataset := kit.SplitKey(tc.key); name != tc.name || dataset != tc.dataset {
+			t.Errorf("SplitKey(%q) = %q, %v; want %q, %v", tc.key, name, dataset, tc.name, tc.dataset)
+		}
+	}
+}
+
 func TestGitBlobID(t *testing.T) {
 	t.Parallel()
 	tests := []struct{ content, want string }{

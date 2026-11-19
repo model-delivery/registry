@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // Source is where a revision came from.
@@ -46,7 +48,7 @@ const (
 
 // datasetKeyPrefix is how the key of a dataset begins: the segment the Hub
 // puts before a dataset's id in its URLs.
-const datasetKeyPrefix = "datasets/"
+const datasetKeyPrefix = kit.DatasetsSegment + "/"
 
 // ParseRepoType reads a repository type as a request or a flag names it.
 // The empty string is a model.
@@ -81,7 +83,7 @@ func (t RepoType) OrModel() RepoType {
 // than two segments would read as another key.
 func RepoKey(t RepoType, name string) string {
 	if t == TypeDataset {
-		return datasetKeyPrefix + name
+		return kit.DatasetKey(name)
 	}
 	return name
 }
@@ -91,8 +93,8 @@ func RepoKey(t RepoType, name string) string {
 // namespace was reserved); "datasets/" followed by two segments is a
 // dataset.
 func SplitRepoKey(key string) (RepoType, string) {
-	if rest, ok := strings.CutPrefix(key, datasetKeyPrefix); ok && strings.Count(rest, "/") == 1 {
-		return TypeDataset, rest
+	if name, dataset := kit.SplitKey(key); dataset {
+		return TypeDataset, name
 	}
 	return TypeModel, key
 }

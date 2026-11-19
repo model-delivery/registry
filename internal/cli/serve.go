@@ -112,29 +112,83 @@ func cmdServe(e *env, args []string) error {
 	// No read or write timeout: model files are large and transfers are
 	// long. Slow-header attacks are still bounded, and the handlers of the
 	// small JSON and form routes set a deadline for their own bodies.
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout}
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
 		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)
 
+	var backups func(context.Context)
 	if backupEvery > 0 {
 		log.Info("scheduled metadata backups are on", "every", backupEvery.String(), "keep", backupKeep)
-		go runBackups(e.ctx, reg, backupEvery, backupKeep, log)
+		backups = func(ctx context.Context) { runBackups(ctx, reg, backupEvery, backupKeep, log) }
 	}
+	// The registry is closed (deferred, above) only after this returns.
+	return serve(e.ctx, srv, ln, handler, backups, shutdownGrace, log)
+}
 
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
+// Time limits of the HTTP server and of stopping it.
+const (
+	// readHeaderTimeout is how long a client may take to send a request's
+	// headers.
+	readHeaderTimeout = 15 * time.Second
+	// idleTimeout is how long a connection with no request on it is kept.
+	idleTimeout = 2 * time.Minute
+	// shutdownGrace is how long stopping waits for transfers in flight and
+	// for the server's own work before it gives up on them.
+	shutdownGrace = 30 * time.Second
+)
+
+// serve answers requests on ln until ctx ends, then stops everything this
+// process runs against the registry and returns once all of it has stopped,
+// or after grace if some of it has not. Three things are stopped:
+//
+//   - requests in flight, which the HTTP server waits for;
+//   - the server's own pull-through fetches, which no request owns: they
+//     are cancelled and waited for (server.Server.Shutdown);
+//   - background, the scheduled-backup loop when there is one, which runs
+//     on a context that ends here.
+//
+// The caller closes the registry after serve returns. Returning while one
+// of these is still running would let it read and write a closed registry.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, handler *server.Server, background func(context.Context), grace time.Duration, log *slog.Logger) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	backgroundDone := make(chan struct{})
+	go func() {
+		defer close(backgroundDone)
+		if background != nil {
+			background(ctx)
+		}
+	}()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	var failed error
 	select {
-	case err := <-errc:
-		return err
-	case <-e.ctx.Done():
+	case failed = <-serveErr: // the listener failed; stop the rest all the same
+	case <-ctx.Done():
+		log.Info("shutting down; waiting for transfers in flight")
 	}
-	log.Info("shutting down; waiting for transfers in flight")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stop()
+
+	deadline, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return err
+	// Requests and fetches are stopped at the same time, not one after the
+	// other: a request can be waiting on a fetch, and is answered as soon
+	// as the fetch is cancelled.
+	httpStopped := make(chan error, 1)
+	go func() { httpStopped <- srv.Shutdown(deadline) }()
+	if err := handler.Shutdown(deadline); err != nil {
+		log.Warn("stopped waiting for pull-through fetches", "error", err)
 	}
-	return nil
+	if err := <-httpStopped; err != nil && !errors.Is(err, context.DeadlineExceeded) && failed == nil {
+		failed = err
+	}
+	select {
+	case <-backgroundDone:
+	case <-deadline.Done():
+		log.Warn("stopped waiting for a scheduled backup that was still running")
+	}
+	return failed
 }
 
 // openStore builds the storage backend the configuration names.

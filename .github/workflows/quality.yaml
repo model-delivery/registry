@@ -20,6 +20,10 @@ on:
         description: Also mirror a real model and real datasets from huggingface.co. Off for pull requests, so an outage there cannot fail someone's unrelated change.
         type: boolean
         default: false
+      unit-test-on:
+        description: The runners the unit tests run on, as a JSON list. A release leaves macOS out (see release.yaml).
+        type: string
+        default: '["ubuntu-latest", "macos-latest", "windows-latest"]'
 
 permissions:
   contents: read
@@ -67,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(inputs.unit-test-on) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

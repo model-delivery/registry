@@ -1,6 +1,12 @@
-# Runs when a version tag (v1.2.3) is pushed. It runs the full gate on the
+# Runs when a version tag (v1.2.3) is pushed. It runs the gate on the
 # tagged commit, publishes the multi-architecture container image, then
 # builds the binaries and creates the GitHub release.
+#
+# The gate here leaves out the unit tests on macOS. Hosted macOS runners
+# are often slow to arrive, which stalled releases without finding
+# anything, and the same commit has already passed them: the tagged commit
+# must have a successful merge.yaml run, which runs every platform, or the
+# release stops before it starts.
 #
 # Start a release with the "Cut release" button (release-cut.yaml), or by
 # pushing a tag yourself:
@@ -45,12 +51,33 @@ jobs:
             exit 1
           fi
 
+  merged-green:
+    name: The tagged commit passed on main
+    needs: check-tag
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: A successful merge.yaml run exists for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          passed=$(gh api "repos/${REPO}/actions/workflows/merge.yaml/runs?head_sha=${SHA}&status=success&per_page=1" --jq '.total_count')
+          if [ "${passed:-0}" -lt 1 ]; then
+            echo "::error::${SHA} has no successful merge.yaml run. A release is cut from a commit that passed on main, on every platform; wait for that run to finish, or re-run it, then run this workflow again."
+            exit 1
+          fi
+
   quality:
     name: Quality
-    needs: check-tag
+    needs: merged-green
     uses: ./.github/workflows/quality.yaml
     with:
       mirror-from-huggingface: true
+      # macOS is covered by the merge run checked above.
+      unit-test-on: '["ubuntu-latest", "windows-latest"]'
 
   image:
     name: Publish the container image

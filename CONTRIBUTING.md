@@ -70,7 +70,7 @@ can find the one that ran from the event you caused:
 |---|---|---|
 | `pull-request.yaml` | A pull request is opened or updated | Runs the checks |
 | `merge.yaml` | A commit lands on `main` | Runs the checks again, plus the test against huggingface.co, then publishes the `edge` container image |
-| `release.yaml` | A version tag (`v1.2.3`) is pushed | Runs the checks, publishes the container image, the binaries and the GitHub release |
+| `release.yaml` | A version tag (`v1.2.3`) is pushed | Requires that the tagged commit passed `merge.yaml`, runs the checks again except the macOS unit tests, then publishes the container image, the binaries and the GitHub release |
 | `release-cut.yaml` | A maintainer presses **Cut release** | Picks the next version, tags `main`, starts `release.yaml` |
 | `quality.yaml` | Called by the three above | The checks themselves, in one place |
 

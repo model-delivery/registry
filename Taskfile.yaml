@@ -18,6 +18,18 @@ tasks:
     desc: Build the modelctl binary into bin/
     cmd: go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/ ./cmd/modelctl
 
+  build:targets:
+    desc: Check that modelctl compiles for every platform a release is built for (CI runs this too)
+    cmds:
+      - for: [linux/amd64, linux/arm64, linux/arm, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64]
+        cmd: go build -o {{.DISCARD}} ./cmd/modelctl
+        env:
+          GOOS: '{{splitList "/" .ITEM | first}}'
+          GOARCH: '{{splitList "/" .ITEM | last}}'
+          CGO_ENABLED: "0"
+    vars:
+      DISCARD: '{{if eq OS "windows"}}NUL{{else}}/dev/null{{end}}'
+
   run:
     desc: Run the registry on http://localhost:8080 with data in ./data
     cmd: go run ./cmd/modelctl serve {{.CLI_ARGS}}

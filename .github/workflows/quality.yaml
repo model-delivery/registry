@@ -52,6 +52,14 @@ jobs:
           test -z "$missing" || (echo "missing the copyright and licence header:"; echo "$missing"; exit 1)
       - name: go vet
         run: go vet -tags=integration ./...
+      - name: Compiles for every platform a release is built for
+        # Before anything is published: a constant too large for a 32-bit
+        # int once stopped a release at the image build. `task build:targets`.
+        run: |
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "$target"
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/modelctl
+          done
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

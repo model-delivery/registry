@@ -96,8 +96,9 @@ func backupSeq(name string, t time.Time) (n int, ok bool) {
 }
 
 // maxBackupSeq is the largest number read from a backup's name. It is far
-// beyond any number of backups a second can hold, and leaves room to add to.
-const maxBackupSeq = 1 << 40
+// beyond any number of backups a second can hold, leaves room to add to,
+// and fits an int on 32-bit platforms, which the registry is built for.
+const maxBackupSeq = 1 << 30
 
 // SnapshotInfo is what a verified snapshot contains.
 type SnapshotInfo struct {

@@ -1,6 +1,6 @@
 # Model Delivery Registry
 
-**A self-hosted registry for AI models that existing Hugging Face tools can download from and upload to.**
+**A self-hosted registry for AI models and datasets that existing Hugging Face tools can download from and upload to.**
 
 Your models. Your infrastructure. Your rules. Website: <https://model.delivery>
 
@@ -20,8 +20,9 @@ any S3-compatible bucket instead. It runs the same on a Raspberry Pi, a
 homelab box or a server.
 
 > **Status: early release.** Downloading, uploading, mirroring, pull-through
-> caching, backups, the CLI and the web UI work. The Hugging Face
-> compatible routes are tested against the real `huggingface_hub` library.
+> caching, backups, the CLI and the web UI work, for models and for
+> datasets. The Hugging Face compatible routes are tested against the real
+> `huggingface_hub` and `datasets` libraries.
 > Read [what is not supported yet](#what-is-not-supported-yet) and the
 > [compatibility table](#hugging-face-compatibility) before relying on it.
 
@@ -96,6 +97,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | | |
 |---|---|
 | **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id. Private and gated repositories work with your Hugging Face token. |
+| **Datasets** | Everything here works for dataset repositories too: mirror, cache on demand, push, pull, upload and serve them to `snapshot_download(repo_type="dataset")`, `hf download --repo-type dataset` and `load_dataset`. A model and a dataset of the same name are two repositories. |
 | **Cache on demand** | Optionally, let the registry fetch from Hugging Face what it does not have: the file listing the first time a model is asked for, and each file the first time it is downloaded. Point your tools at the registry and it fills itself, one requested file at a time. |
 | **Serve** | Existing clients download through the Hugging Face compatible API, including range requests. |
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
@@ -254,20 +256,23 @@ called `metrics` and `datasets` cannot be used for repositories, like
 ## Hugging Face compatibility
 
 The rows marked "Supported" are run against the real `huggingface_hub`
-Python library in CI (`test/e2e`).
+and `datasets` Python libraries in CI (`test/e2e`).
 
 | Capability | Status |
 |---|---|
 | `snapshot_download`, `hf_hub_download`, `hf download` | Supported |
-| `model_info`, `list_repo_tree`, `list_repo_files`, `list_repo_refs` | Supported |
+| `model_info`, `list_repo_tree`, `list_repo_files`, `list_repo_refs`, `get_paths_info` | Supported |
+| Datasets: the calls above with `repo_type="dataset"` (`--repo-type dataset`), `dataset_info`, uploads, mirroring and pull-through | Supported |
+| `load_dataset("org/name")` from a repository of csv, jsonl or parquet files | Supported for those layouts; others are expected to work but are not tested. The Hub's dataset viewer is not implemented, and the library falls back to the repository's files: see [Datasets](docs/compatibility.md#datasets) |
 | Branches, tags and pinned revision ids | Supported |
 | Private access with `HF_TOKEN` | Supported |
 | Uploading with `hf upload`, `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Supported, with one condition for large files: see Xet, below |
 | Range requests, which clients use to resume an interrupted download | Served and tested at the HTTP level; a resumed `huggingface_hub` download is not part of the client tests |
 | Libraries that download through `huggingface_hub` (`transformers`, `diffusers`, ...) | Expected to work; not individually tested yet |
 | Xet transfer | Not implemented. **Downloads** need nothing: the registry does not offer Xet, so clients download over plain HTTP. **Uploads** of files over 10 MiB need `HF_HUB_DISABLE_XET=1` on a client that has the `hf_xet` package, which `huggingface_hub` installs by default; such a client sends large files through Xet without asking the server. Smaller files upload without it |
-| Datasets and Spaces | Not supported |
-| Model search and listing (`list_models`) | Not supported |
+| Spaces | Not supported |
+| The dataset viewer (parquet conversion, row previews, croissant) | Not implemented |
+| Search and listing (`list_models`, `list_datasets`) | Not supported |
 | `git clone` / git-lfs access | Not supported |
 | Hub-only features (discussions, likes, inference, gating workflows) | Out of scope |
 

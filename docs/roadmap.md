@@ -8,12 +8,11 @@ move an item forward are welcome.
 
 ## Next
 
-The first three are about keeping independent copies of models, and the
-data they were trained on, that do not depend on one host.
+The first two are about keeping independent copies of models, and the
+data they were trained on, that do not depend on one host. (Dataset
+repositories, the item that used to head this list, are in the registry
+now: see the [README](../README.md#what-it-does).)
 
-- **Datasets.** The same registry for dataset repositories: mirror them,
-  cache them on demand, and serve them to `datasets` and `hf download`.
-  Today the registry stores model repositories only.
 - **Keeping mirrors up to date.** A mirror is a snapshot of one revision,
   and picking up a newer one means running `modelctl mirror` again. Two
   additions:

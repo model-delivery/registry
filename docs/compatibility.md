@@ -1,14 +1,15 @@
 # Hugging Face compatibility
 
 The registry implements the part of the Hugging Face Hub HTTP API that
-clients use to **download and upload models**. It does not implement the
-whole Hub API, and this page lists exactly what is covered.
+clients use to **download and upload models and datasets**. It does not
+implement the whole Hub API, and this page lists exactly what is covered.
 
-Compatibility is checked in CI by running the real `huggingface_hub`
-Python library against the registry (`test/e2e`). CI installs the latest
-release on the day. The suite was last run locally against
-`huggingface_hub` 2.4.0. Where a client's behaviour differs between
-versions in a way that matters here, this page says so.
+Compatibility is checked in CI by running the real `huggingface_hub` and
+`datasets` Python libraries against the registry (`test/e2e`). CI installs
+the latest release of both on the day. The suite was last run locally
+against `huggingface_hub` 2.4.0 and `datasets` 5.2.0. Where a client's
+behaviour differs between versions in a way that matters here, this page
+says so.
 
 ## Using it
 
@@ -49,6 +50,8 @@ registry you run.
 | Reading with `HF_TOKEN` from a registry that requires a token | And being refused without one |
 | `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Adding, replacing and deleting files. **Large files need `HF_HUB_DISABLE_XET=1`**; see [Uploading](#uploading) |
 | `hf upload` | The command: a folder, one file, and a folder to a new branch |
+| `HfApi.get_paths_info` | For a model and for a dataset: files and directories by path. `expand` is ignored |
+| All of the above with `repo_type="dataset"`, and `HfApi.dataset_info` | See [Datasets](#datasets) for exactly which |
 
 All of these run with the `hf_xet` package installed, as a default
 installation has it. Downloads are unaffected by it; uploads are covered
@@ -58,6 +61,98 @@ Libraries that fetch files through `huggingface_hub` (`transformers`,
 `diffusers`, `sentence-transformers` and others) use the calls above, so
 they are expected to work. They are not tested individually yet. If one
 does not work, please open an issue naming the library and the call.
+
+## Datasets
+
+A dataset repository is served, uploaded, mirrored and cached exactly as a
+model is, at the Hub's dataset addresses. A model and a dataset of the
+same name are two repositories with their own revisions and files. Point
+the client at the registry and say `repo_type="dataset"`, as you would
+against the Hub:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download("acme/reviews", repo_type="dataset")
+```
+
+```bash
+hf download acme/reviews --repo-type dataset
+```
+
+```python
+from datasets import load_dataset
+load_dataset("acme/reviews")
+```
+
+### Tested
+
+With `huggingface_hub`, against a mirrored dataset with the upstream gone
+(`TestHubClientDatasetAgainstMirror`): `snapshot_download` and
+`hf_hub_download` with `repo_type="dataset"`, by branch and by revision
+id, including a file with a space in its name; `hf download --repo-type
+dataset`, a whole dataset and one file; `dataset_info`; `list_repo_tree`
+with and without `recursive`; `list_repo_refs`; `get_paths_info`; and the
+model of the same name beside it, with different content.
+
+Uploads (`TestHubClientDatasetUpload`): `create_repo(repo_type="dataset")`,
+`upload_folder` with a file over 10 MiB (with `HF_HUB_DISABLE_XET=1`, as
+for models), `upload_file`, and `hf upload --repo-type dataset` of a
+folder and of one file, each read back.
+
+Pull-through (`TestHubClientDatasetPullThrough`): `hf_hub_download` of a
+dataset the registry has never seen, including an 8 MiB file that the
+upstream takes about three seconds to send against a client timeout of
+one second. It arrives in one request, sent while the registry fetches
+it.
+
+With `datasets` (`TestLoadDatasetAgainstMirror`): `load_dataset("org/name")`
+with no other argument on three mirrored datasets, with the upstream gone:
+
+| Layout | Result |
+|---|---|
+| `train.csv` and `test.csv`, and a `README.md` without metadata | `train` and `test` splits with the right rows |
+| `train.jsonl` and `test.jsonl`, no `README.md` | `train` and `test` splits with the right rows |
+| `train.parquet` and `test.parquet`, no `README.md` | `train` and `test` splits with the right rows |
+
+These requests are what `load_dataset` made of the registry in that test:
+`HEAD /datasets/{id}/resolve/main/README.md` (and, when that is not
+there, `GET /api/datasets/{id}` for the revision id); `HEAD` of
+`{name}.py` (a loading script, which `datasets` no longer runs) and of
+`.huggingface.yaml` and `dataset_infos.json`, all optional;
+`GET /api/datasets/{id}/revision/{sha}`; `GET /api/datasets/{id}/tree/{sha}`
+at the top and in `data/`, not recursive; and `HEAD` and `GET` of each
+data file at the revision id. It made no `paths-info` request.
+
+### The dataset viewer is not implemented
+
+On the Hub a separate service, the dataset viewer, converts datasets to
+parquet and describes them. The registry does not implement it:
+`/api/datasets/{id}/parquet`, `/croissant` and the like answer `404`.
+
+`load_dataset` asks the viewer for one thing, a dataset's exported
+description, when it is given no `data_files`, `data_dir` or revision
+other than `main`. It sends that request not to `HF_ENDPOINT` but to the
+host `datasets-server.` followed by `HF_ENDPOINT`'s host
+(`datasets/utils/_dataset_viewer.py`): with `HF_ENDPOINT=https://models.example.com`
+it asks `https://datasets-server.models.example.com/info?dataset=...`,
+**with the user's token**. There is no setting to turn it off. Any
+failure (the name does not resolve, nothing listens, `404`) makes the
+library read the repository's own files instead, which is what the test
+above shows: the request was delivered to the registry, answered `404`,
+and the splits loaded. An operator who controls DNS for the registry's
+domain should make sure `datasets-server.<registry host>` does not
+resolve to anything they do not run, since that host would receive the
+tokens of users who load datasets.
+
+So the viewer is not needed to load a dataset from its files. The three
+layouts above are tested; other layouts that `datasets` reads from a
+repository's own files (other formats it reads, `data/` folders, splits
+named in the dataset card) take the same requests and are expected to
+work, but are not tested. What cannot work: anything that relies on the
+viewer's conversion, such as reading the `refs/convert/parquet`
+revision, and datasets that need a loading script, which `datasets`
+5.2.0 refuses to run against any hub ("Dataset scripts are no longer
+supported").
 
 ## Uploading
 
@@ -99,8 +194,10 @@ What an upload does and does not do:
   revision it came from.
 - **The repository is created on first use.** A repository id without a
   namespace is put under the name of the token that created it.
+- **Datasets upload the same way**, with `repo_type="dataset"` or
+  `--repo-type dataset`; see [Datasets](#datasets).
 - **Not supported:** pull requests (`create_pr`), uploading to a revision
-  id, datasets and Spaces, and `git push`.
+  id, Spaces, and `git push`.
 - **Not tested:** `upload_large_folder`, and `push_to_hub` in libraries
   such as `transformers`. They are built on the calls above, so they are
   expected to work with the same setting.
@@ -113,9 +210,10 @@ What an upload does and does not do:
 | `GET /api/models/{repo}/revision/{revision}` | |
 | `GET /api/models/{repo}/tree/{revision}[/{directory}]` | `recursive` is honoured. All entries are returned in one response; there is no pagination |
 | `GET /api/models/{repo}/refs` | |
+| `POST /api/models/{repo}/paths-info/{revision}` | A form with `paths` (repeated); the entries `tree` gives, for the paths that exist. `expand` is ignored. Needs the read role, though it is a POST |
 | `HEAD`, `GET /{repo}/resolve/{revision}/{path}` | Sends `ETag`, `X-Repo-Commit`, `Content-Length`, `Accept-Ranges`; honours `Range` and `If-None-Match` |
 | `GET /api/whoami-v2` | Reports the registry token's name |
-| `POST /api/repos/create` | Models only. `409` if the repository exists, which `exist_ok` clients accept |
+| `POST /api/repos/create` | `type` of `model` (or none) or `dataset`; `space` is refused. `409` if the repository exists, which `exist_ok` clients accept |
 | `POST /api/models/{repo}/preupload/{branch}` | Files up to 10 MiB are sent inline, larger ones through the large-file protocol |
 | `POST /{repo}.git/info/lfs/objects/batch` | git-lfs batch API, `upload` operation, `basic` transfer. Returns a signed, expiring URL per object, or nothing for an object already stored |
 | `PUT /api/lfs/upload/{sha256}` | The signed URL. Accepts only the bytes it was issued for, for up to 12 hours, and only while the token that asked for it still exists and has the write role |
@@ -123,6 +221,13 @@ What an upload does and does not do:
 | `POST /api/models/{repo}/branch/{branch}` | Creates the branch from `startingPoint` (default `main`). On a repository with no revision yet it succeeds and creates nothing: the branch comes into being with its first commit |
 | `POST /api/validate-yaml` | Always accepts; the registry stores `README.md` as a file |
 | `GET /api/models/{repo}/xet-read-token/{revision}`, `xet-write-token` | Not Xet: a redirect to an address that answers `400` and whose path says to set `HF_HUB_DISABLE_XET=1`. See [Uploading](#uploading) |
+
+Every route above has a dataset twin at the Hub's address for it:
+`/api/datasets/{repo}/...` for each `/api/models/{repo}/...` route,
+`/datasets/{repo}/resolve/{revision}/{path}` for files, and
+`/datasets/{repo}.git/info/lfs/objects/batch` for large uploads. The
+dataset viewer's routes (`/api/datasets/{repo}/parquet`, `/croissant`)
+answer `404`; see [Datasets](#datasets).
 
 When the registry is configured to redirect downloads to S3, `resolve`
 answers `302` with `Location` (a signed bucket URL), `X-Linked-Etag`,
@@ -147,13 +252,14 @@ Hub reports LFS files, with its SHA-256 as the `ETag`.
 |---|---|
 | **Xet uploads** | Large files from a client with `hf_xet` installed need `HF_HUB_DISABLE_XET=1`. See [Uploading](#uploading). |
 | **Pull requests, uploading to a revision id** | Upload to a branch, or use `modelctl push`. |
-| **Datasets and Spaces** | Only model repositories. `repo_type="dataset"` returns 404. |
-| **Search and listing** (`list_models`, `GET /api/models`) | Use `modelctl list` or the web UI. |
+| **Spaces** | Models and datasets only. `repo_type="space"` returns 404, and `create_repo` of one 400. |
+| **The dataset viewer** (parquet conversion, row previews, croissant) | See [Datasets](#datasets) for what that means for `load_dataset`. |
+| **Search and listing** (`list_models`, `list_datasets`, `GET /api/models`, `GET /api/datasets`) | Use `modelctl list` (with `--repo-type dataset` for datasets) or the web UI. |
 | **Repository ids without a namespace** (`gpt2`) | Use the full id (`openai-community/gpt2`). When mirroring, the registry stores the repository under the canonical id the upstream reports. |
 | **Case-insensitive ids** | Ids are matched exactly. |
 | **git and git-lfs** | The registry is not a git server. `git clone` does not work. |
 | **Xet transfer** | The registry does not advertise it, so clients use plain HTTP downloads. |
-| **Commit history** (`list_repo_commits`), **file metadata** (`get_paths_info`) | Not implemented. |
+| **Commit history** (`list_repo_commits`) | Not implemented. |
 | **Hub features**: discussions, pull requests, likes, collections, inference, access requests | Out of scope. |
 
 A request for an unimplemented Hub route returns `404` with a JSON error

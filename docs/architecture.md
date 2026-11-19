@@ -12,7 +12,7 @@ be kept in an S3-compatible bucket instead of on local disk.
         +------------------------------------------------------------------------------+
         |  internal/server      one HTTP handler                                       |
         |    server.go       the route table, the access gate, how errors are written  |
-        |    hf.go           Hugging Face downloads    /api/models/...  /.../resolve   |
+        |    hf.go           Hugging Face downloads    /api/{models,datasets}/...      |
         |    hfupload.go     Hugging Face uploads      preupload, lfs batch, commit    |
         |    pullthrough.go  fetching from upstream what a client asks for             |
         |    stream.go       sending a file to clients while it is fetched             |
@@ -90,6 +90,19 @@ own key. The type itself is a typed value, `registry.RepoType`, whose
 values on the wire and in the database are `model` and `dataset`;
 documents leave it out for a model, so model documents read as they
 always have.
+
+Every surface serves both types through the same code, with the type
+taken from the address. The Hugging Face routes are the Hub's own:
+`/api/datasets/...` beside `/api/models/...`, handled by one router
+(`hfRepos`), and `/datasets/{id}/resolve/...` beside `/{id}/resolve/...`,
+read by one path parser (`parseRootPath`) that both routing and the
+metrics use. The registry's API has `/api/v1/datasets` beside
+`/api/v1/repos`, registered from one loop over the types; the web UI has
+`/ui/dataset/` beside `/ui/repo/`. Mirroring asks the upstream at its
+dataset addresses, and pull-through's allow list is matched against the
+key, so a pattern written for models never matches a dataset. The Hub's
+dataset viewer, a separate service, is not reproduced; see
+[compatibility.md](compatibility.md#datasets).
 
 ### Schema versions
 

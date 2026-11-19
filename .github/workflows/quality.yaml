@@ -92,8 +92,10 @@ jobs:
         with:
           python-version: "3.12"
       # Deliberately unpinned: this job exists to find out when a new
-      # huggingface_hub release stops working against the registry.
-      - run: pip install huggingface_hub
+      # huggingface_hub or datasets release stops working against the
+      # registry. datasets is what runs load_dataset in the tests; it
+      # requires a recent huggingface_hub, which it installs.
+      - run: pip install huggingface_hub datasets
       - name: The real client against the registry (no network)
         run: go test -tags=integration -count=1 -v ./test/e2e/
       - name: Mirror a real model from huggingface.co, and pull one file through

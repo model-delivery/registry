@@ -287,6 +287,22 @@ repositories: mirroring one never touches the other. `push`, `pull`,
 clients reach the dataset with `repo_type="dataset"` (see
 [compatibility.md](compatibility.md#datasets)).
 
+**The `datasets-server.` name.** The `datasets` library's `load_dataset`
+also asks the Hub's dataset viewer for a description of the dataset. It
+does not send that request to `HF_ENDPOINT`: it sends it to
+`datasets-server.` followed by `HF_ENDPOINT`'s host name (for a registry
+at `https://models.example.com`, to
+`https://datasets-server.models.example.com/info?dataset=...`), and it
+sends the user's token with it. The registry does not implement the
+viewer. When that name does not resolve, or whatever answers says `404`,
+the library reads the dataset's own files from the registry instead, and
+loading works (tested). There is no client setting to stop the request.
+If you control DNS for the registry's domain, make sure
+`datasets-server.<registry host>` resolves to nothing, or to the registry
+itself (which answers `404`), and never to a host you do not run: that
+host would be handed the tokens of everyone who loads a dataset. A
+wildcard record for the domain covers that name too.
+
 ## Pull-through caching
 
 With `--pull-through` (or `REGISTRY_PULL_THROUGH=true`) the registry fills

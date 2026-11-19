@@ -56,8 +56,9 @@ Read `docs/architecture.md` before changing anything structural, and
   package needs it, not before.
 - `internal/regtest` — helpers for tests: a registry served over HTTP,
   `modelctl serve` on a free port, the fake-S3 environment. Test code only.
-- `test/e2e` — runs the real `huggingface_hub` Python library against the
-  registry. Build tag `integration`.
+- `test/e2e` — runs the real `huggingface_hub` Python library, and the
+  `datasets` library when it is installed, against the registry. Build tag
+  `integration`.
 
 - `.github/workflows` — named for the event that starts them:
   `pull-request.yaml`, `merge.yaml` (push to main), `release.yaml` (version
@@ -68,7 +69,8 @@ Read `docs/architecture.md` before changing anything structural, and
 ## Commands
 
 Use the Taskfile: `task check` (format, vet, headers, lint, unit tests,
-tidy modules), `task test:e2e` (needs Python with `huggingface_hub`),
+tidy modules), `task test:e2e` (needs Python with `huggingface_hub`, and
+`datasets` for the `load_dataset` tests, which are skipped without it),
 `task test:s3` (real S3 server in Docker; the only place multipart uploads
 are exercised), `task build`, `task docker`.
 
@@ -221,8 +223,8 @@ are exercised), `task build`, `task docker`.
   and `TestMetricsCountWhatTheRegistryDoes` is where what it counts is
   checked.
 - **Compatibility claims need a real-client test.** If the README or
-  `docs/compatibility.md` says a `huggingface_hub` call works, `test/e2e`
-  must exercise it.
+  `docs/compatibility.md` says a `huggingface_hub` or `datasets` call
+  works, `test/e2e` must exercise it, for each repository type claimed.
 - **A test that needs a clock or a schedule supplies it.** Hand the code
   under test its clock or its ticks (`server.Config.Now`, the tick channel
   of `runBackups`) and wait on what it does, rather than sleeping until it

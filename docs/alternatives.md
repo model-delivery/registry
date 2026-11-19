@@ -10,23 +10,27 @@ request correcting it is welcome, including from the projects named.
 
 ## What this project is for
 
-Model Delivery is a registry for the models you depend on. It is one Go
-binary with SQLite inside, and it:
+Model Delivery is a registry for the models you depend on and the
+datasets they are trained on. It is one Go binary with SQLite inside, and
+it:
 
-- mirrors model repositories from Hugging Face, or caches them on demand,
-  and checks every file against the digest the hub publishes before
-  storing it;
+- mirrors model and dataset repositories from Hugging Face, or caches
+  them on demand, and checks every file against the digest the hub
+  publishes before storing it;
 - keeps revisions immutable, with the ids they have upstream, so a pinned
   revision is the same files on every registry that holds it;
-- serves them to existing Hugging Face clients through `HF_ENDPOINT`, and
-  accepts uploads of your own models from the same clients;
+- serves them to existing Hugging Face clients through `HF_ENDPOINT`
+  (`huggingface_hub`, the `hf` command, and `load_dataset` from the
+  `datasets` library), and accepts uploads of your own models and
+  datasets from the same clients;
 - stores files on disk or in an S3-compatible bucket, backs up its own
   metadata, and can re-check everything it holds.
 
-It stores models only. Dataset repositories are on the
-[roadmap](roadmap.md), not in the product, and several projects below
-handle them today. It is a single server; see
-[what is not supported yet](../README.md#what-is-not-supported-yet).
+It does not store Spaces, and it does not run the Hub's dataset viewer
+(parquet conversion and row previews); `load_dataset` reads a
+repository's own files instead (see
+[compatibility.md](compatibility.md#datasets)). It is a single server;
+see [what is not supported yet](../README.md#what-is-not-supported-yet).
 
 ## Caching mirrors of Hugging Face
 
@@ -37,9 +41,9 @@ These sit in front of Hugging Face and keep what passes through.
   caches files in chunks as users download them. It lists model, dataset
   and Spaces mirroring, and cache clean-up policies.
 
-  Choose it if you want a download cache that also covers datasets and
-  Spaces, with eviction when the disk fills. Model Delivery keeps what it
-  stores until you delete it, records each revision, and takes uploads.
+  Choose it if you want a download cache that also covers Spaces, with
+  eviction when the disk fills. Model Delivery keeps what it stores until
+  you delete it, records each revision, and takes uploads.
 
 - **[DingoSpeed](https://github.com/dingodb/dingo-hfmirror)** (Go)
   describes itself as a self-hosted Hugging Face mirror service for models

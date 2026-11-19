@@ -7,8 +7,10 @@
 // library. Run with: go test -tags=integration ./test/e2e/
 //
 // It needs Python with huggingface_hub installed (set REGISTRY_E2E_PYTHON
-// to pick an interpreter). The test that mirrors from huggingface.co also
-// needs the network and only runs when REGISTRY_E2E_NETWORK=1.
+// to pick an interpreter). The load_dataset tests also need the datasets
+// library and are skipped, saying so, without it. The test that mirrors
+// from huggingface.co also needs the network and only runs when
+// REGISTRY_E2E_NETWORK=1.
 package e2e
 
 import (

@@ -56,7 +56,7 @@ tasks:
     cmd: go test -race ./...
 
   test:e2e:
-    desc: Run the huggingface_hub compatibility tests (needs Python with huggingface_hub; no network)
+    desc: Run the huggingface_hub and datasets compatibility tests (needs Python with huggingface_hub, and datasets for load_dataset; no network)
     cmd: go test -tags=integration -count=1 ./test/e2e/
 
   test:e2e:network:

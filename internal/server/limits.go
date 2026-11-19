@@ -23,6 +23,13 @@ const (
 	// one short field each. Without it a multipart body would be spooled
 	// to the server's temporary directory in full.
 	maxFormBytes = 64 << 10
+	// maxSmallJSONBytes bounds a JSON body that names one thing: the
+	// repository to create, the branch to start from.
+	maxSmallJSONBytes = 1 << 20
+	// maxJSONBytes bounds a JSON body that lists files: a commit through
+	// the registry API, the files of an upload, the objects of a large-file
+	// batch. A repository of a hundred thousand files fits.
+	maxJSONBytes = 64 << 20
 	// defaultMaxCommitBytes bounds the whole body of a Hugging Face commit
 	// request: every file small enough to travel inside it, base64-encoded.
 	// It is far more than a real upload sends (files over 10 MiB do not
@@ -62,6 +69,9 @@ func (s *Server) bodyTimeout() time.Duration {
 //
 // A request without a body is left alone: downloads and other long
 // responses are not timed.
+//
+// The deadlines in this file are set from time.Now, not the server's
+// clock: a connection's deadline is compared with the real time.
 func (s *Server) guardBodies(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength != 0 && !isFileTransfer(r) {

@@ -39,7 +39,7 @@ hf download {{$repo}} --revision {{$sha}}</pre>
     <td>{{.Source}}</td>
     <td class="num">{{.Files}}</td>
     <td class="num">{{bytes .Bytes}}</td>
-    <td title="{{date .CreatedAt}}">{{ago .CreatedAt}}</td>
+    <td title="{{date .CreatedAt}}">{{$.Ago .CreatedAt}}</td>
   </tr>
   {{end}}
   </tbody>

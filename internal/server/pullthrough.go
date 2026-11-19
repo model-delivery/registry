@@ -33,7 +33,9 @@ import (
 //   - A fetch belongs to the server, not to the request that started it. A
 //     large file takes minutes, and clients give up sooner than that. If the
 //     client disconnects the fetch carries on, and the next request for the
-//     same thing joins it instead of starting another.
+//     same thing joins it instead of starting another. What does end a fetch
+//     is the server stopping: Server.Shutdown cancels every job and waits
+//     for it, so none is still writing when the registry is closed.
 //   - Nothing is served unverified. A file is only handed to a client once
 //     all of it is stored and has matched its digest.
 //   - What the registry already holds is served as is. Pull-through fills
@@ -43,6 +45,8 @@ import (
 
 // errUpstream wraps a pull-through failure that is the upstream's or the
 // network's doing, so it is reported as a gateway error, not as "not found".
+// Only a failure mirror.FromUpstream vouches for is wrapped in it; one of
+// the registry's own is an errInternal.
 type errUpstream struct{ err error }
 
 func (e errUpstream) Error() string { return "could not fetch from upstream: " + e.err.Error() }
@@ -50,6 +54,10 @@ func (e errUpstream) Unwrap() error { return e.err }
 
 // errPullBusy refuses a new fetch while too many are already waiting.
 var errPullBusy = errors.New("the registry is busy fetching other files from upstream; try again in a minute")
+
+// errShuttingDown is what a fetch ends with when the server stops under it,
+// and what a request that would start one is told from then on.
+var errShuttingDown = errors.New("the registry is shutting down; try again in a minute")
 
 // errNotFromUpstream refuses to fetch into a repository that was created in
 // this registry (by a push or an upload) and not from the upstream.
@@ -70,13 +78,21 @@ const (
 	// How long an upstream "not found" is remembered, so a client retrying
 	// a wrong name does not turn into a stream of upstream requests.
 	missTTL = time.Minute
-	// How many fetches may run at once.
+	// How many remembered misses are kept before they are all dropped. It
+	// bounds memory; forgetting them early only costs an upstream request.
+	maxRememberedMisses = 10_000
+	// How many file fetches may run at once.
 	maxConcurrentPulls = 4
-	// How many more fetches may wait for one of those slots. A fetch outlives
-	// the request that started it, so without a bound a client could queue
-	// any number of them by asking and hanging up.
+	// How many revision listings may be asked for at once. A listing is one
+	// small request, and it has slots of its own so that it never waits
+	// behind file fetches, which can each run for hours.
+	maxConcurrentListings = 8
+	// How many more jobs may wait for a slot. A job outlives the request
+	// that started it, so without a bound a client could queue any number
+	// of them by asking and hanging up.
 	maxWaitingPulls = 64
-	// The most time one fetch may take before it is abandoned.
+	// The most time one job may take, once it has a slot, before it is
+	// abandoned.
 	pullTimeout = 12 * time.Hour
 	// The longest "repository@revision" that is looked up or remembered as a
 	// miss. Valid names are shorter; this bounds what a request can make the
@@ -91,12 +107,22 @@ type puller struct {
 	// maxFileBytes is the largest file fetched on demand; 0 means no limit.
 	maxFileBytes int64
 	log          *slog.Logger
+	// ctx is the lifetime every job runs on: the server's, which ends at
+	// Server.Shutdown. It is never a request's.
+	ctx context.Context
+	now func() time.Time
 
 	mu      sync.Mutex
 	jobs    map[string]*pullJob
 	waiting int // jobs that do not hold a slot yet
 	misses  map[string]time.Time
-	slots   chan struct{}
+	// closed is set when the server stops: no job starts after it.
+	closed bool
+	// drained is closed once closed is set and no job is left.
+	drained  chan struct{}
+	allGone  sync.Once
+	slots    chan struct{} // file fetches in progress
+	listings chan struct{} // revision listings in progress
 }
 
 type pullJob struct {
@@ -105,11 +131,16 @@ type pullJob struct {
 	err  error
 }
 
+// newPuller builds a coordinator whose jobs run until they finish. The
+// server gives it its own lifetime and clock (see New).
 func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow []string, maxFileBytes int64, log *slog.Logger) *puller {
 	return &puller{
 		reg: reg, upstream: upstream, allow: allow, maxFileBytes: maxFileBytes, log: log,
+		ctx: context.Background(), now: time.Now,
 		jobs: map[string]*pullJob{}, misses: map[string]time.Time{},
-		slots: make(chan struct{}, maxConcurrentPulls),
+		drained:  make(chan struct{}),
+		slots:    make(chan struct{}, maxConcurrentPulls),
+		listings: make(chan struct{}, maxConcurrentListings),
 	}
 }
 
@@ -128,16 +159,30 @@ func (p *puller) allowed(repo string) bool {
 	return false
 }
 
-// share runs work once per key however many callers ask for it at the same
-// time, on the server's own context, and lets each caller wait only as
-// long as its own ctx lives. A new job is refused with errPullBusy while
+// share runs a file fetch once per key however many callers ask for it at
+// the same time, on the server's lifetime, and lets each caller wait only
+// as long as its own ctx lives. A new job is refused with errPullBusy while
 // maxWaitingPulls others are waiting for a slot; joining a job that already
 // exists is never refused.
 func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
+	return p.run(ctx, key, p.slots, work)
+}
+
+// shareListing is share for a revision listing, which takes its slot from
+// the listings' own pool.
+func (p *puller) shareListing(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
+	return p.run(ctx, key, p.listings, work)
+}
+
+func (p *puller) run(ctx context.Context, key string, pool chan struct{}, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
 	p.mu.Lock()
 	job := p.jobs[key]
 	if job == nil {
-		if p.waiting >= maxWaitingPulls {
+		switch {
+		case p.closed:
+			p.mu.Unlock()
+			return nil, errShuttingDown
+		case p.waiting >= maxWaitingPulls:
 			p.mu.Unlock()
 			return nil, errPullBusy
 		}
@@ -146,22 +191,7 @@ func (p *puller) share(ctx context.Context, key string, work func(ctx context.Co
 		p.jobs[key] = job
 		// Deliberately not the request's context: the fetch must outlive the
 		// request that started it (see the note at the top of this file).
-		go func() { //nolint:gosec // G118: detached from the request on purpose.
-			bg, cancel := context.WithTimeout(context.Background(), pullTimeout)
-			defer cancel()
-			defer func() {
-				p.mu.Lock()
-				delete(p.jobs, key)
-				p.mu.Unlock()
-				close(job.done)
-			}()
-			p.slots <- struct{}{}
-			p.mu.Lock()
-			p.waiting--
-			p.mu.Unlock()
-			defer func() { <-p.slots }()
-			work(bg, job)
-		}()
+		go p.do(key, job, pool, work)
 	}
 	p.mu.Unlock()
 
@@ -170,6 +200,64 @@ func (p *puller) share(ctx context.Context, key string, work func(ctx context.Co
 		return job, job.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+// do is one job's goroutine: wait for a slot in pool, run work, and take
+// the job off the books.
+func (p *puller) do(key string, job *pullJob, pool chan struct{}, work func(ctx context.Context, job *pullJob)) {
+	defer p.finish(key, job)
+	select {
+	case pool <- struct{}{}:
+		defer func() { <-pool }()
+	case <-p.ctx.Done():
+	}
+	p.mu.Lock()
+	p.waiting--
+	p.mu.Unlock()
+	if p.ctx.Err() != nil {
+		job.err = errShuttingDown
+		return
+	}
+	// The time limit starts here, with the slot in hand: time spent queued
+	// behind other jobs does not count against this one.
+	ctx, cancel := context.WithTimeout(p.ctx, pullTimeout)
+	defer cancel()
+	work(ctx, job)
+	if job.err != nil && p.ctx.Err() != nil {
+		// Whatever the work failed with, the reason is that the server stopped.
+		job.err = errShuttingDown
+	}
+}
+
+// finish forgets a job and releases whoever waits on it. It is the last
+// thing a job's goroutine does.
+func (p *puller) finish(key string, job *pullJob) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.jobs, key)
+	close(job.done)
+	if p.closed && len(p.jobs) == 0 {
+		p.allGone.Do(func() { close(p.drained) })
+	}
+}
+
+// wait stops new jobs from starting and returns when the last one running
+// has finished, or with ctx's error. The caller cancels the jobs' lifetime
+// first (Server.Shutdown), or this waits for them to run to the end.
+func (p *puller) wait(ctx context.Context) error {
+	p.mu.Lock()
+	p.closed = true
+	left := len(p.jobs)
+	if left == 0 {
+		p.allGone.Do(func() { close(p.drained) })
+	}
+	p.mu.Unlock()
+	select {
+	case <-p.drained:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%d pull-through fetches had not stopped: %w", left, ctx.Err())
 	}
 }
 
@@ -183,7 +271,7 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	}
 	p.mu.Lock()
 	if until, missed := p.misses[key]; missed {
-		if time.Now().Before(until) {
+		if p.now().Before(until) {
 			p.mu.Unlock()
 			return "", fmt.Errorf("%w: %s@%s", mirror.ErrUpstreamNotFound, repo, rev)
 		}
@@ -191,7 +279,7 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	}
 	p.mu.Unlock()
 
-	job, err := p.share(ctx, key, func(ctx context.Context, job *pullJob) {
+	job, err := p.shareListing(ctx, key, func(ctx context.Context, job *pullJob) {
 		// A request that missed locally just before another job recorded
 		// this revision arrives here after that job has gone. Look again
 		// before asking the upstream a second time.
@@ -204,10 +292,10 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 			job.err = err
 			if errors.Is(err, mirror.ErrUpstreamNotFound) {
 				p.mu.Lock()
-				if len(p.misses) > 10_000 {
+				if len(p.misses) > maxRememberedMisses {
 					clear(p.misses)
 				}
-				p.misses[key] = time.Now().Add(missTTL)
+				p.misses[key] = p.now().Add(missTTL)
 				p.mu.Unlock()
 				return
 			}
@@ -251,16 +339,31 @@ func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.F
 		return errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
 	}
 	_, err = p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context, job *pullJob) {
-		started := time.Now()
+		started := p.now()
 		if err := mirror.FetchFile(ctx, p.upstream(), p.reg, c, f); err != nil {
 			job.err = err
 			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
 			return
 		}
 		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
-			"took", time.Since(started).Round(time.Millisecond))
+			"took", p.now().Sub(started).Round(time.Millisecond))
 	})
 	return err
+}
+
+// pullFailure says whose failure a pull-through job's error is, for the
+// answer to the client. Only what the upstream caused is reported as the
+// upstream's (502, with the reason). Anything else that went wrong while
+// fetching is the registry's own (its disk, its database): 500, logged in
+// full, and described to the client no further.
+func pullFailure(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, errPullBusy), errors.Is(err, errShuttingDown):
+		return err
+	case mirror.FromUpstream(err):
+		return errUpstream{err}
+	}
+	return errInternal{err}
 }
 
 // resolve is Registry.Resolve with pull-through: a revision the registry
@@ -303,10 +406,8 @@ func (s *Server) resolve(ctx context.Context, repo, rev string) (registry.Commit
 		// Upstream does not have it either, or it belongs in a repository
 		// that was created here: the local "not found" stands.
 		return c, err
-	case errors.Is(pullErr, context.Canceled), errors.Is(pullErr, context.DeadlineExceeded), errors.Is(pullErr, errPullBusy):
-		return c, pullErr
 	default:
-		return c, errUpstream{pullErr}
+		return c, pullFailure(pullErr)
 	}
 }
 

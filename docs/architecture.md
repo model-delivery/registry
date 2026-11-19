@@ -196,10 +196,24 @@ a mirrored one.
 
 A small coordinator keeps one job per thing being fetched, whether a
 revision's listing or one file. A request for something already being
-fetched waits on the existing job. Jobs run on the server's own context,
-not the request's, so a client that disconnects does not stop one. Four
-run at a time and a bounded number wait; past that, a request that would
-start another is answered `503`.
+fetched waits on the existing job. Jobs run on the server's lifetime, not
+on the request's, so a client that disconnects does not stop one. What
+does stop them is the server stopping: `Server.Shutdown` cancels every job
+and returns once the last has ended, and `modelctl serve` waits for that,
+and for a scheduled backup in progress, before it closes the registry.
+
+Four file fetches run at a time. Listings have slots of their own, since
+a listing is one small request and a file fetch can run for hours: a first
+request for another repository is not held up by downloads in progress. A
+bounded number of jobs wait for a slot; past that, a request that would
+start another is answered `503`. The time a job is allowed starts when it
+gets its slot.
+
+An error from a job is attributed before it is reported. What the upstream
+caused (unreachable, an error answer, content that does not match its
+digest) is answered `502` with the reason. Anything else, such as a full
+disk while storing what was fetched, is the registry's own failure: `500`,
+logged in full, and not described to the client.
 
 **Which repositories.** The lookup goes upstream only for a repository the
 registry does not hold, or one whose `upstream` field is set, meaning it
@@ -282,10 +296,12 @@ These are the seams where larger deployments would plug in. None is a
 plugin system; each is a small interface or a single function.
 
 - **Storage backend**: `blob.Store`.
-- **Authentication**: `Server.roleOf` maps a request to a role. A different
-  identity source replaces that one function.
-- **Authorization**: every route declares the role it needs through
-  `Server.need`. Finer-grained rules replace that one check.
+- **Authentication**: `Server.identify` maps a request to a token, once,
+  before any handler runs. A different identity source replaces that one
+  function.
+- **Authorization**: every route is registered through `Server.gate` with
+  the role it needs, and the gate is the only place a role is compared.
+  Finer-grained rules replace that one check.
 - **Audit**: every state change goes through a handful of handlers in
   `api.go` that already log what changed.
 

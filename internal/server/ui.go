@@ -6,6 +6,7 @@ package server
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -13,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/model-delivery/registry/internal/registry"
 )
 
 //go:embed templates/*.html static/*
@@ -26,10 +29,12 @@ func staticFS() fs.FS {
 	return sub
 }
 
+// shortSHALen is how much of a revision id the pages show.
+const shortSHALen = 12
+
 var uiFuncs = template.FuncMap{
 	"bytes":   humanBytes,
-	"short":   func(s string) string { return s[:min(len(s), 12)] },
-	"ago":     ago,
+	"short":   func(s string) string { return s[:min(len(s), shortSHALen)] },
 	"date":    func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04 UTC") },
 	"repoURL": func(name string) string { return "/ui/repo/" + escapeRepo(name) },
 	"fileURL": func(repo, sha, p string) string {
@@ -68,8 +73,9 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-func ago(t time.Time) string {
-	d := time.Since(t)
+// ago says how long before now t was, in words.
+func ago(now, t time.Time) string {
+	d := now.Sub(t)
 	switch {
 	case d < time.Minute:
 		return "just now"
@@ -86,9 +92,19 @@ func ago(t time.Time) string {
 // redirect. The address carries a code (?notice=deleted) and the text comes
 // from here, so a link cannot make the registry display words of someone
 // else's choosing. An unknown code shows nothing.
+// The codes of the notices (see notices).
+const (
+	noticeDeleted       = "deleted"
+	noticeDeletedPartly = "deleted-partly"
+	noticeNotDeleted    = "not-deleted"
+)
+
 var notices = map[string]string{
-	"deleted":     "The repository was deleted, and the files nothing else uses were freed.",
-	"not-deleted": "Nothing deleted: the name you typed did not match.",
+	noticeDeleted: "The repository was deleted. The files only it used were freed, " +
+		"except any that an upload in progress has just sent; garbage collection removes those later if the upload does not use them.",
+	noticeDeletedPartly: "The repository was deleted, but some of the files only it used could not be removed and still take up space. " +
+		"The server log has the reason.",
+	noticeNotDeleted: "Nothing deleted: the name you typed did not match.",
 }
 
 type uiPage struct {
@@ -99,46 +115,31 @@ type uiPage struct {
 	IsAdmin bool
 	Host    string
 	Flash   string
-	Data    any
+	// Now is when the page was made, for times shown as "3 h ago".
+	Now  time.Time
+	Data any
 }
 
+// Ago says how long before the page was made t was.
+func (p uiPage) Ago(t time.Time) string { return ago(p.Now, t) }
+
 func (s *Server) render(w http.ResponseWriter, r *http.Request, status int, page, title string, data any) {
-	rl, tok := s.roleOf(r)
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
+	tok := s.identity(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.WriteHeader(status)
 	err := uiPages[page].Execute(w, uiPage{
-		Title: title, Version: s.cfg.Version, Viewer: tok.Name, IsAdmin: rl >= roleAdmin,
-		Host: scheme + "://" + r.Host, Flash: notices[r.URL.Query().Get("notice")], Data: data,
+		Title: title, Version: s.cfg.Version, Viewer: tok.Name, IsAdmin: tok.Role.Allows(registry.RoleAdmin),
+		Host: baseURL(r), Flash: notices[r.URL.Query().Get("notice")], Now: s.now(), Data: data,
 	})
 	if err != nil {
 		s.log.Error("render page", "page", page, "error", err)
 	}
 }
 
-// uiGate sends visitors who may not read to the sign-in page.
-func (s *Server) uiGate(w http.ResponseWriter, r *http.Request) bool {
-	if granted, _ := s.allowed(r, roleRead); granted {
-		return true
-	}
-	http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
-	return false
-}
-
 func (s *Server) uiIndex(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if !s.uiGate(w, r) {
-		return
-	}
 	repos, err := s.reg.ListRepos(r.Context())
 	if err != nil {
 		s.uiError(w, r, err)
@@ -155,11 +156,8 @@ func (s *Server) uiIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
-	if !s.uiGate(w, r) {
-		return
-	}
 	name := repoParam(r)
-	detail, err := s.repoDetail(r, name)
+	detail, err := s.describeRepo(r.Context(), name)
 	if err != nil {
 		s.uiError(w, r, err)
 		return
@@ -172,10 +170,10 @@ func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	// Show the requested revision, else main, else the newest one.
 	rev := r.URL.Query().Get("rev")
-	if rev == "" && len(detail.Revisions) > 0 {
+	if rev == "" {
 		rev = detail.Revisions[0].SHA
 		for _, ref := range detail.Refs {
-			if ref.Name == "main" {
+			if ref.Name == defaultBranch {
 				rev = ref.SHA
 			}
 		}
@@ -217,25 +215,26 @@ func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
-	if rl, _ := s.roleOf(r); rl < roleAdmin {
-		s.render(w, r, http.StatusForbidden, "login.html", "Sign in", map[string]any{
-			"Error": "Deleting a repository needs an admin token.",
-		})
-		return
-	}
 	name := repoParam(r)
 	// Typing the name guards against deleting the wrong repository.
 	if s.formValue(w, r, "confirm") != name {
-		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice=not-deleted", http.StatusSeeOther)
+		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice="+noticeNotDeleted, http.StatusSeeOther)
 		return
 	}
 	res, err := s.reg.DeleteRepo(r.Context(), name)
-	if err != nil && res.Blobs == 0 {
+	// As in apiDeleteRepo: once the deletion has committed the repository
+	// is gone, whatever then happens to the files it held.
+	notice := noticeDeleted
+	switch {
+	case errors.Is(err, registry.ErrBlobsNotFreed):
+		s.log.Warn("stored files could not be removed", "repo", name, "error", err)
+		notice = noticeDeletedPartly
+	case err != nil:
 		s.uiError(w, r, err)
 		return
 	}
 	s.log.Info("repository deleted", "repo", name, "blobs_freed", res.Blobs, "bytes_freed", res.Bytes, "via", "ui")
-	http.Redirect(w, r, "/?notice=deleted", http.StatusSeeOther)
+	http.Redirect(w, r, "/?notice="+notice, http.StatusSeeOther)
 }
 
 func (s *Server) uiLoginForm(w http.ResponseWriter, r *http.Request) {
@@ -257,24 +256,32 @@ func (s *Server) uiLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	http.SetCookie(w, s.sessionCookie(r, secret, 30*24*3600))
+	http.SetCookie(w, sessionCookie(r, secret, sessionLifetime))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) uiLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, s.sessionCookie(r, "", -1))
+	http.SetCookie(w, sessionCookie(r, "", 0))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// sessionCookie builds the sign-in cookie. It is never readable by scripts
-// and never sent on requests from other sites. It is marked Secure whenever
-// the request arrived over HTTPS; a registry on a home network is often
-// plain HTTP, where a Secure cookie would make signing in impossible.
-func (s *Server) sessionCookie(r *http.Request, value string, maxAge int) *http.Cookie {
+// sessionLifetime is how long a browser stays signed in.
+const sessionLifetime = 30 * 24 * time.Hour
+
+// sessionCookie builds the sign-in cookie, to last for lifetime; none
+// deletes it. It is never readable by scripts and never sent on requests
+// from other sites. It is marked Secure whenever the request arrived over
+// HTTPS; a registry on a home network is often plain HTTP, where a Secure
+// cookie would make signing in impossible.
+func sessionCookie(r *http.Request, value string, lifetime time.Duration) *http.Cookie {
+	maxAge := int(lifetime.Seconds())
+	if lifetime <= 0 {
+		maxAge = -1 // tells the browser to delete the cookie now
+	}
 	return &http.Cookie{ //nolint:gosec // Secure is set for HTTPS requests; see the comment above.
 		Name: cookieName, Value: value, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, SameSite: http.SameSiteStrictMode,
-		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+		Secure: isHTTPS(r),
 	}
 }
 

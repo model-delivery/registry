@@ -3,7 +3,8 @@
 
 // Package server is the HTTP face of the registry. It serves three things
 // from one handler: the Hugging Face compatible routes existing clients
-// call (hf.go), the registry's own REST API (api.go) and the web UI (ui.go).
+// call (hf.go, hfupload.go), the registry's own REST API (api.go,
+// backup.go) and the web UI (ui.go).
 package server
 
 import (
@@ -14,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,108 +68,184 @@ type Config struct {
 	// The default one refuses redirects that lead to local and private
 	// addresses; see mirror.Upstream.Client before replacing it.
 	UpstreamClient *http.Client
-	Version        string
-	Logger         *slog.Logger
+	// Now is the clock the server reads; nil means time.Now. Tests set it
+	// to move time: when a signed upload URL expires, how long an upstream
+	// "not found" is remembered.
+	Now     func() time.Time
+	Version string
+	Logger  *slog.Logger
 }
 
-// Server holds the handler's dependencies.
+// Server is the registry's HTTP handler, together with the work it does on
+// its own account: pull-through fetches, which outlive the requests that
+// start them. Call Shutdown before closing the registry.
 type Server struct {
-	reg    *registry.Registry
-	cfg    Config
-	log    *slog.Logger
-	puller *puller // nil unless pull-through caching is on
+	reg     *registry.Registry
+	cfg     Config
+	log     *slog.Logger
+	puller  *puller // nil unless pull-through caching is on
+	handler http.Handler
+	// stop ends the server's lifetime context, which every pull-through job
+	// runs on.
+	stop context.CancelFunc
 	// uploadKey signs the URLs large files are uploaded to. It is made at
 	// start and never stored, so a restart invalidates URLs in flight; the
 	// client then asks for new ones.
 	uploadKey []byte
 }
 
-// New builds the HTTP handler.
-func New(reg *registry.Registry, cfg Config) http.Handler {
+// New builds the server. The result is the http.Handler to serve.
+func New(reg *registry.Registry, cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
 	if cfg.Upstream == "" {
 		cfg.Upstream = mirror.DefaultEndpoint
 	}
-	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, uploadKey: newUploadKey()}
+	// The server's lifetime: from here until Shutdown. Background work is
+	// started on it, never on a request's context and never on none.
+	lifetime, stop := context.WithCancel(context.Background())
+	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, stop: stop, uploadKey: newUploadKey()}
 	if cfg.PullThrough {
 		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.PullThroughMaxFileBytes, cfg.Logger)
+		s.puller.ctx, s.puller.now = lifetime, s.now
 	}
 
+	// Every route is registered with the access it needs: gate, with a role
+	// and the way a refusal is written, or public, with a comment saying why
+	// no role is asked for. Handlers do not check roles themselves.
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// Says only that the process is up; probes carry no token.
+	mux.Handle("GET /healthz", public(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": cfg.Version})
-	})
+	}))
 
 	// Registry API.
-	mux.Handle("GET /api/v1/repos", s.need(roleRead, s.apiListRepos))
-	mux.Handle("GET /api/v1/repos/{ns}/{name}", s.need(roleRead, s.apiGetRepo))
-	mux.Handle("GET /api/v1/repos/{ns}/{name}/revisions/{rev...}", s.need(roleRead, s.apiGetRevision))
-	mux.Handle("POST /api/v1/repos/{ns}/{name}/commits", s.need(roleWrite, s.apiCommit))
-	mux.Handle("DELETE /api/v1/repos/{ns}/{name}", s.need(roleAdmin, s.apiDeleteRepo))
-	mux.Handle("HEAD /api/v1/blobs/{sha256}", s.need(roleWrite, s.apiStatBlob))
-	mux.Handle("PUT /api/v1/blobs/{sha256}", s.need(roleWrite, s.apiPutBlob))
-	mux.Handle("POST /api/v1/mirror", s.need(roleWrite, s.apiMirror))
-	mux.Handle("GET /api/v1/stats", s.need(roleRead, s.apiStats))
-	mux.Handle("POST /api/v1/gc", s.need(roleAdmin, s.apiGC))
-	mux.Handle("POST /api/v1/verify", s.need(roleAdmin, s.apiVerify))
-	mux.Handle("GET /api/v1/backups", s.need(roleAdmin, s.apiListBackups))
-	mux.Handle("POST /api/v1/backups", s.need(roleAdmin, s.apiBackupNow))
-	mux.Handle("GET /api/v1/backup/snapshot", s.need(roleAdmin, s.apiSnapshot))
-	mux.Handle("GET /api/v1/tokens", s.need(roleAdmin, s.apiListTokens))
-	mux.Handle("POST /api/v1/tokens", s.need(roleAdmin, s.apiCreateToken))
-	mux.Handle("DELETE /api/v1/tokens/{name}", s.need(roleAdmin, s.apiRevokeToken))
+	api := func(minimum registry.Role, h http.HandlerFunc) http.Handler { return s.gate(minimum, asAPI, h) }
+	mux.Handle("GET /api/v1/repos", api(registry.RoleRead, s.apiListRepos))
+	mux.Handle("GET /api/v1/repos/{ns}/{name}", api(registry.RoleRead, s.apiGetRepo))
+	mux.Handle("GET /api/v1/repos/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision))
+	mux.Handle("POST /api/v1/repos/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit))
+	mux.Handle("DELETE /api/v1/repos/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo))
+	mux.Handle("HEAD /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiStatBlob))
+	mux.Handle("PUT /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiPutBlob))
+	mux.Handle("POST /api/v1/mirror", api(registry.RoleWrite, s.apiMirror))
+	mux.Handle("GET /api/v1/stats", api(registry.RoleRead, s.apiStats))
+	mux.Handle("POST /api/v1/gc", api(registry.RoleAdmin, s.apiGC))
+	mux.Handle("POST /api/v1/verify", api(registry.RoleAdmin, s.apiVerify))
+	mux.Handle("GET /api/v1/backups", api(registry.RoleAdmin, s.apiListBackups))
+	mux.Handle("POST /api/v1/backups", api(registry.RoleAdmin, s.apiBackupNow))
+	mux.Handle("GET /api/v1/backups/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
+	// The address v0.3.0 shipped, kept so its clients go on working.
+	mux.Handle("GET /api/v1/backup/snapshot", api(registry.RoleAdmin, s.apiSnapshot))
+	mux.Handle("GET /api/v1/tokens", api(registry.RoleAdmin, s.apiListTokens))
+	mux.Handle("POST /api/v1/tokens", api(registry.RoleAdmin, s.apiCreateToken))
+	mux.Handle("DELETE /api/v1/tokens/{name}", api(registry.RoleAdmin, s.apiRevokeToken))
 
 	// Hugging Face compatible routes. Their paths carry percent-encoded
 	// revisions and repository ids of two segments, so they are parsed by
-	// hand instead of by mux patterns.
-	mux.Handle("/api/models/", s.need(roleRead, s.hfModels))
-	mux.HandleFunc("GET /api/whoami-v2", s.hfWhoami)
+	// hand instead of by mux patterns: hfModels does that for everything
+	// under /api/models/ and gates each route it finds with its own role.
+	mux.Handle("/api/models/", public(s.hfModels))
+	// Answers who a token is, so it authenticates by itself: 401 unless the
+	// request carries a token this registry issued. No role is needed to
+	// ask, and an open registry's anonymous read does not apply.
+	mux.Handle("GET /api/whoami-v2", public(s.hfWhoami))
 	// Uploads from Hugging Face clients (hfupload.go).
-	mux.Handle("POST /api/repos/create", s.need(roleWrite, s.hfCreateRepo))
-	mux.Handle("POST /api/validate-yaml", s.need(roleRead, s.hfValidateYAML))
-	mux.HandleFunc("PUT /api/lfs/upload/{sha256}", s.hfLFSUpload) // authorised by its signed URL
-	mux.HandleFunc("/api/xet-is-not-supported/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.Handle("POST /api/repos/create", s.gate(registry.RoleWrite, asHF, s.hfCreateRepo))
+	mux.Handle("POST /api/validate-yaml", s.gate(registry.RoleRead, asHF, s.hfValidateYAML))
+	// Opened by the signed URL the batch route issued and by nothing else:
+	// clients send the file here without their token, as they would to a
+	// hub's object store. hfLFSUpload checks the signature, its expiry and
+	// that the token it was issued to still has the write role.
+	mux.Handle("PUT /api/lfs/upload/{sha256}", public(s.hfLFSUpload))
+	// A fixed explanation and a fixed "not implemented": neither says
+	// anything about what the registry holds.
+	mux.Handle("/api/xet-is-not-supported/", public(func(w http.ResponseWriter, _ *http.Request) {
 		hfError(w, http.StatusBadRequest, xetHint)
-	})
-	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("/api/", public(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "this endpoint is not implemented by the registry")
-	})
+	}))
 
 	// Web UI.
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(staticFS())))
-	mux.HandleFunc("GET /ui/login", s.uiLoginForm)
-	mux.HandleFunc("POST /ui/login", s.uiLogin)
-	mux.HandleFunc("POST /ui/logout", s.uiLogout)
-	mux.HandleFunc("GET /ui/repo/{ns}/{name}", s.uiRepo)
-	mux.HandleFunc("POST /ui/repo/{ns}/{name}/delete", s.uiDeleteRepo)
+	// The stylesheet and icon, which the sign-in page needs too.
+	mux.Handle("GET /static/", public(http.StripPrefix("/static/", http.FileServerFS(staticFS())).ServeHTTP))
+	// Signing in and out have to work without a token; signing in grants
+	// nothing unless the token typed into the form is valid.
+	mux.Handle("GET /ui/login", public(s.uiLoginForm))
+	mux.Handle("POST /ui/login", public(s.uiLogin))
+	mux.Handle("POST /ui/logout", public(s.uiLogout))
+	mux.Handle("GET /ui/repo/{ns}/{name}", s.gate(registry.RoleRead, asUI, s.uiRepo))
+	mux.Handle("POST /ui/repo/{ns}/{name}/delete", s.gate(registry.RoleAdmin, asUI, s.uiDeleteRepo))
 
 	// Everything else: file downloads at /{ns}/{name}/resolve/{rev}/{path},
-	// the UI home page, and hub-style repository links.
-	mux.HandleFunc("/", s.root)
+	// the large-file batch, the UI home page and hub-style repository links.
+	// Like hfModels, root parses the path and gates what it finds.
+	mux.Handle("/", public(s.root))
 
 	// Browsers may only make state-changing requests from our own pages.
 	// Non-browser clients (the CLI, Python libraries) are unaffected.
-	return s.guardBodies(http.NewCrossOriginProtection().Handler(s.identify(mux)))
+	s.handler = s.guardBodies(http.NewCrossOriginProtection().Handler(s.identify(mux)))
+	return s
 }
 
+// ServeHTTP makes the server the handler to pass to http.Server.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+
+// Shutdown ends the work the server does on its own account and waits for
+// it: pull-through fetches are cancelled, and Shutdown returns once every
+// one of them has stopped, or with ctx's error if they have not by then.
+// Requests are not its business; stop the http.Server for those.
+//
+// Call it before closing the registry. After it returns nil, nothing the
+// server started is still reading or writing.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.stop()
+	if s.puller == nil {
+		return nil
+	}
+	return s.puller.wait(ctx)
+}
+
+// now is the server's clock. Deadlines set on a connection are the one use
+// of time that does not go through it: those are the operating system's.
+func (s *Server) now() time.Time {
+	if s.cfg.Now != nil {
+		return s.cfg.Now()
+	}
+	return time.Now()
+}
+
+// root routes what no mux pattern claims. It checks nothing itself: each
+// route below is gated with its own role where it is chosen.
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 	segs, ok := splitPath(r.URL.EscapedPath())
+	read := r.Method == http.MethodGet || r.Method == http.MethodHead
 	switch {
 	case !ok:
 		writeError(w, http.StatusBadRequest, "malformed path")
+	case len(segs) == 0 && !read, isLFSBatch(segs) && r.Method != http.MethodPost:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	case len(segs) == 0:
-		s.uiIndex(w, r)
-	case len(segs) == 6 && strings.HasSuffix(segs[1], ".git") && strings.Join(segs[2:], "/") == "info/lfs/objects/batch":
-		s.hfLFSBatch(w, r, segs[0]+"/"+strings.TrimSuffix(segs[1], ".git"))
+		s.gate(registry.RoleRead, asUI, s.uiIndex).ServeHTTP(w, r)
+	case isLFSBatch(segs):
+		repo := segs[0] + "/" + strings.TrimSuffix(segs[1], ".git")
+		s.gate(registry.RoleWrite, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfLFSBatch(w, r, repo) }).ServeHTTP(w, r)
 	case len(segs) >= 5 && segs[2] == "resolve":
-		s.need(roleRead, func(w http.ResponseWriter, r *http.Request) { s.hfResolve(w, r, segs) }).ServeHTTP(w, r)
+		s.gate(registry.RoleRead, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfResolve(w, r, segs) }).ServeHTTP(w, r)
 	case len(segs) == 2 && r.Method == http.MethodGet:
+		// A hub-style link. It only points at the repository page, which is
+		// gated, and says nothing about whether the repository exists.
 		http.Redirect(w, r, "/ui/repo/"+url.PathEscape(segs[0])+"/"+url.PathEscape(segs[1]), http.StatusFound)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// isLFSBatch reports whether segs is /{ns}/{name}.git/info/lfs/objects/batch.
+func isLFSBatch(segs []string) bool {
+	return len(segs) == 6 && strings.HasSuffix(segs[1], ".git") && strings.Join(segs[2:], "/") == "info/lfs/objects/batch"
 }
 
 // splitPath splits an escaped URL path into decoded segments, so an
@@ -193,35 +271,29 @@ func (s *Server) upstream() *mirror.Upstream {
 	return &mirror.Upstream{Endpoint: s.cfg.Upstream, Token: s.cfg.UpstreamToken, Client: s.cfg.UpstreamClient, Log: s.log}
 }
 
-// ---- authentication ----
-
-type role int
-
-const (
-	roleNone role = iota
-	roleRead
-	roleWrite
-	roleAdmin
-)
-
-func roleFromName(name registry.Role) role {
-	switch name {
-	case registry.RoleAdmin:
-		return roleAdmin
-	case registry.RoleWrite:
-		return roleWrite
-	case registry.RoleRead:
-		return roleRead
-	}
-	return roleNone
+// isHTTPS reports whether the client reached the server over HTTPS, either
+// directly or through a proxy that says so.
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
+
+// baseURL is how the client reached this server, for links sent back to it.
+func baseURL(r *http.Request) string {
+	if isHTTPS(r) {
+		return "https://" + r.Host
+	}
+	return "http://" + r.Host
+}
+
+// ---- authentication ----
 
 const cookieName = "md_token"
 
 // presentedToken returns the secret a request carries, if any.
 func presentedToken(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
-		return strings.TrimSpace(h[7:])
+	const scheme = "bearer "
+	if h := r.Header.Get("Authorization"); len(h) > len(scheme) && strings.EqualFold(h[:len(scheme)], scheme) {
+		return strings.TrimSpace(h[len(scheme):])
 	}
 	if c, err := r.Cookie(cookieName); err == nil {
 		return c.Value
@@ -234,7 +306,7 @@ func presentedToken(r *http.Request) string {
 type identityKey struct{}
 
 // identify looks up the token a request carries, once, before any handler
-// runs, and leaves the answer in the request's context for roleOf.
+// runs, and leaves the answer in the request's context for identity.
 //
 // "No such token" and "the database could not be asked" are different
 // answers. The first is an anonymous request. The second is the server's
@@ -251,10 +323,11 @@ func (s *Server) identify(next http.Handler) http.Handler {
 	})
 }
 
-// roleOf reports what the request's token allows. A token this registry
-// does not know grants nothing: people who switch HF_ENDPOINT often still
-// send their Hugging Face token, and that must not break anonymous reads.
-func (s *Server) roleOf(r *http.Request) (role, registry.Token) {
+// identity is the token the request presented; the zero Token, which has
+// no role, when it presented none this registry knows. A token from
+// elsewhere grants nothing: people who switch HF_ENDPOINT often still send
+// their Hugging Face token, and that must not break anonymous reads.
+func (s *Server) identity(r *http.Request) registry.Token {
 	tok, identified := r.Context().Value(identityKey{}).(registry.Token)
 	if !identified {
 		// A handler reached without identify in front of it, which only a
@@ -262,37 +335,102 @@ func (s *Server) roleOf(r *http.Request) (role, registry.Token) {
 		var err error
 		if tok, _, err = s.reg.Authenticate(r.Context(), presentedToken(r)); err != nil {
 			s.log.Error("look up the request's access token", "error", err)
-			return roleNone, registry.Token{}
+			return registry.Token{}
 		}
 	}
-	return roleFromName(tok.Role), tok
+	return tok
 }
 
-// allowed applies the access rule shared by the API and the UI.
-func (s *Server) allowed(r *http.Request, minRole role) (granted bool, authenticated bool) {
-	got, _ := s.roleOf(r)
-	if got >= minRole || (minRole == roleRead && s.cfg.AnonymousRead) {
-		return true, got != roleNone
-	}
-	return false, got != roleNone
-}
+// errorStyle is how a route tells a caller it may not do what it asked.
+type errorStyle int
 
-func (s *Server) need(minRole role, h http.HandlerFunc) http.Handler {
+const (
+	// asAPI answers 401 or 403 with the registry API's JSON error.
+	asAPI errorStyle = iota
+	// asHF answers the same statuses and repeats the message in
+	// X-Error-Message, which is where Hugging Face clients read it.
+	asHF
+	// asUI answers a browser: a visitor who may not read is sent to the
+	// sign-in page, and one who may read but not do what was asked is shown
+	// that page with the reason.
+	asUI
+)
+
+// gate is the one place access is decided. It lets a request through to h
+// when its token has at least the minimum role, or when the role is read
+// and the registry is open to anonymous readers; otherwise it answers in
+// the given style and h never runs.
+func (s *Server) gate(minimum registry.Role, style errorStyle, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		granted, authenticated := s.allowed(r, minRole)
-		switch {
-		case granted:
+		held := s.identity(r).Role
+		if held.Allows(minimum) || (minimum == registry.RoleRead && s.cfg.AnonymousRead) {
 			h(w, r)
-		case authenticated:
-			writeError(w, http.StatusForbidden, "this token does not have permission for this operation")
-		default:
-			w.Header().Set("WWW-Authenticate", `Bearer realm="registry"`)
-			writeError(w, http.StatusUnauthorized, "a valid access token is required")
+			return
 		}
+		// Any role at all means the request carried a token of ours.
+		s.refuse(w, r, minimum, style, held.Allows(registry.RoleRead))
 	})
 }
 
+// public marks a route that asks for no role, so that every registration
+// says how it is protected. The comment at each use says why none is asked.
+func public(h http.HandlerFunc) http.Handler { return h }
+
+// refuse answers a request the gate turned away.
+func (s *Server) refuse(w http.ResponseWriter, r *http.Request, minimum registry.Role, style errorStyle, authenticated bool) {
+	if style == asUI {
+		if minimum == registry.RoleRead {
+			http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
+			return
+		}
+		s.render(w, r, http.StatusForbidden, "login.html", "Sign in", map[string]any{
+			"Error": "That needs a token with the " + string(minimum) + " role.",
+		})
+		return
+	}
+	status, msg := http.StatusForbidden, "this token does not have permission for this operation"
+	if !authenticated {
+		status, msg = http.StatusUnauthorized, "a valid access token is required"
+		w.Header().Set("WWW-Authenticate", `Bearer realm="registry"`)
+	}
+	if style == asAPI {
+		writeError(w, status, msg)
+		return
+	}
+	if minimum == registry.RoleWrite {
+		// The write routes Hugging Face clients call are the upload steps;
+		// say what the person running the upload has to change.
+		msg = "this token does not have permission to upload; it needs the write role"
+		if !authenticated {
+			msg = "uploading needs an access token with the write role: set HF_TOKEN"
+		}
+	}
+	hfError(w, status, msg)
+}
+
 // ---- responses ----
+
+// Statuses and headers with no name in net/http.
+const (
+	// statusClientClosedRequest is the conventional status for a request
+	// whose client went away before it was answered. Nobody receives it; it
+	// is what the access log of a proxy in front shows.
+	statusClientClosedRequest = 499
+	// retryAfterBusy is how long a client is told to wait when the registry
+	// cannot take on another fetch.
+	retryAfterBusy = time.Minute
+	// internalErrorMessage is all a client is told about a failure of the
+	// server's own. The log has the rest.
+	internalErrorMessage = "internal error"
+)
+
+// The values of X-Error-Code that huggingface_hub turns into its own
+// exceptions (RepositoryNotFoundError and so on).
+const (
+	hfCodeRepoNotFound     = "RepoNotFound"
+	hfCodeRevisionNotFound = "RevisionNotFound"
+	hfCodeEntryNotFound    = "EntryNotFound"
+)
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -304,9 +442,21 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// statusFor maps registry errors to HTTP statuses and the error codes
-// Hugging Face clients look for in X-Error-Code.
+// errInternal marks a failure as the server's own, whatever it wraps: it is
+// answered 500 and logged in full, and the client is told only that
+// something went wrong. Wrapping is for errors that would otherwise be
+// classified by what is inside them.
+type errInternal struct{ err error }
+
+func (e errInternal) Error() string { return e.err.Error() }
+func (e errInternal) Unwrap() error { return e.err }
+
+// statusFor maps an error to its HTTP status and, where Hugging Face
+// clients look for one in X-Error-Code, its error code.
 func statusFor(err error) (int, string) {
+	if errors.As(err, new(errInternal)) {
+		return http.StatusInternalServerError, ""
+	}
 	if errors.As(err, new(errUpstream)) {
 		return http.StatusBadGateway, ""
 	}
@@ -314,14 +464,14 @@ func statusFor(err error) (int, string) {
 		return http.StatusRequestEntityTooLarge, ""
 	}
 	switch {
-	case errors.Is(err, errPullBusy):
+	case errors.Is(err, errPullBusy), errors.Is(err, errShuttingDown):
 		return http.StatusServiceUnavailable, ""
 	case errors.Is(err, registry.ErrRepoNotFound):
-		return http.StatusNotFound, "RepoNotFound"
+		return http.StatusNotFound, hfCodeRepoNotFound
 	case errors.Is(err, registry.ErrRevisionNotFound):
-		return http.StatusNotFound, "RevisionNotFound"
+		return http.StatusNotFound, hfCodeRevisionNotFound
 	case errors.Is(err, registry.ErrEntryNotFound), errors.Is(err, blob.ErrNotFound):
-		return http.StatusNotFound, "EntryNotFound"
+		return http.StatusNotFound, hfCodeEntryNotFound
 	case errors.Is(err, registry.ErrTokenNotFound):
 		return http.StatusNotFound, ""
 	case errors.Is(err, registry.ErrInvalid), errors.Is(err, registry.ErrBlobMissing), errors.Is(err, blob.ErrMismatch):
@@ -333,25 +483,64 @@ func statusFor(err error) (int, string) {
 	case errors.Is(err, mirror.ErrUpstreamAuth), errors.Is(err, mirror.ErrUnsafeUpstream):
 		return http.StatusBadGateway, ""
 	case errors.Is(err, context.Canceled):
-		return 499, ""
+		return statusClientClosedRequest, ""
 	}
 	return http.StatusInternalServerError, ""
 }
 
-// fail writes err as a JSON error. Unexpected errors are logged and hidden.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
-	status, code := statusFor(err)
-	msg := err.Error()
+// failure decides what a client is told about err: the status, the error
+// code if it has one, and the message. A failure of the server's own is
+// logged in full here and its message replaced, so that no path, query or
+// driver error reaches a client.
+func (s *Server) failure(w http.ResponseWriter, r *http.Request, err error) (status int, code, msg string) {
+	status, code = statusFor(err)
+	msg = err.Error()
 	if status == http.StatusInternalServerError {
 		s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
-		msg = "internal error"
+		msg = internalErrorMessage
 	}
-	if errors.Is(err, errPullBusy) {
-		w.Header().Set("Retry-After", "60")
+	if errors.Is(err, errPullBusy) || errors.Is(err, errShuttingDown) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfterBusy.Seconds())))
 	}
+	return status, code, msg
+}
+
+// fail writes err as the registry API's JSON error. An error that has a
+// code carries it, and its message, in the headers as well, since the
+// registry API's revision lookup is also read by Hugging Face clients.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	status, code, msg := s.failure(w, r, err)
 	if code != "" {
 		w.Header().Set("X-Error-Code", code)
 		w.Header().Set("X-Error-Message", msg)
 	}
 	writeError(w, status, msg)
+}
+
+// hfFail writes err the way Hugging Face clients read one. Every Hugging
+// Face route reports its errors through it or through hfError.
+func (s *Server) hfFail(w http.ResponseWriter, r *http.Request, err error) {
+	status, code, msg := s.failure(w, r, err)
+	writeHFError(w, status, code, msg, nil)
+}
+
+// hfError writes a fixed message the way Hugging Face clients read one.
+func hfError(w http.ResponseWriter, status int, msg string) {
+	writeHFError(w, status, "", msg, nil)
+}
+
+// writeHFError is the one writer of errors on Hugging Face routes. The
+// message goes in the body and always in X-Error-Message, which is what
+// huggingface_hub shows; the code, when there is one, goes in X-Error-Code,
+// which is what it decides the exception by. more is added to the body.
+func writeHFError(w http.ResponseWriter, status int, code, msg string, more map[string]string) {
+	if code != "" {
+		w.Header().Set("X-Error-Code", code)
+	}
+	w.Header().Set("X-Error-Message", msg)
+	body := map[string]string{"error": msg}
+	for k, v := range more {
+		body[k] = v
+	}
+	writeJSON(w, status, body)
 }

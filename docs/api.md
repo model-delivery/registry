@@ -11,11 +11,19 @@ for administration. The Hugging Face compatible routes are described in
   open to everyone unless the server runs with `--require-auth`.
 - **Errors**: a non-2xx status with `{"error": "what went wrong"}`.
   `401` means no valid token was sent; `403` means the token's role is too
-  low.
+  low. The other statuses are listed under [Statuses](#statuses).
 - **Request bodies**: a JSON body may be at most 64 MiB and must arrive
   within 30 seconds, or the request is refused with `400`. File uploads
   have no time limit. If the operator has set `REGISTRY_MAX_BLOB_BYTES`, a
   larger file is refused with `413`.
+- **Unknown fields are refused.** A JSON body with a field these routes do
+  not define is answered `400`, naming the field, and nothing is done. A
+  misspelt `branch` is an error, not a commit to `main`. (The Hugging Face
+  compatible routes ignore fields they do not use, as the Hub does.)
+- **Warnings**: an operation that did what was asked and then could not
+  finish tidying up answers with its usual success status and body, plus a
+  `warning` string. The field is absent otherwise. Its reason is in the
+  server's log.
 - **Repository ids** are `namespace/name` and appear in paths as two
   segments.
 - **Revision** means a branch name, a tag name, or a 40-character revision
@@ -27,6 +35,27 @@ Examples assume:
 export R=http://localhost:8080
 export T=md_your_token
 ```
+
+### Statuses
+
+| Status | Meaning |
+|---|---|
+| `400` | The request is malformed: invalid JSON, an unknown field, a name or path that is not allowed, a file that was never uploaded, or an upload that does not hash to its digest. |
+| `401`, `403` | No valid token, or a token whose role is too low. |
+| `404` | No such repository, revision, file, token or backup. Looking up a revision also sets the `X-Error-Code` header to `RepoNotFound` or `RevisionNotFound`. |
+| `409` | The request conflicts with what is recorded: a tag that already names another revision, a branch name that is a tag, a token name that is taken, or a commit onto a branch whose revision still has files that were never fetched (see `pending` below). Nothing is changed. |
+| `413` | A file larger than `REGISTRY_MAX_BLOB_BYTES`. |
+| `500` | The registry itself failed, for example its disk or database. The body says only `internal error`; the server's log has the reason. |
+| `502` | The upstream hub is at fault. Mirroring answers this when the upstream denies access or redirects somewhere the registry does not follow. Looking up a revision with pull-through on answers it for any upstream failure: unreachable, an error answer, access denied. The body says which. |
+| `503` | The registry is fetching as much from the upstream as it will at once, or is shutting down. `Retry-After` says when to try again. |
+
+A failure of the registry's own while it fetches from the upstream is a
+`500`, not a `502`: before v0.3.1 both were reported as `502`.
+
+One case is not what the table suggests: a mirror request whose upstream
+cannot be reached at all, or answers with a server error, is `500` with
+`internal error`, where a pull-through lookup in the same situation is
+`502` with the reason.
 
 ## Repositories
 
@@ -67,12 +96,34 @@ curl $R/api/v1/repos/acme/tiny/revisions/main
  "files": [{"path": "config.json", "size": 21, "sha256": "...", "git_oid": "...", "lfs": true}]}
 ```
 
+Two things about `files` are easy to trip over:
+
+- Here it is the list of files. In the revisions of
+  [Inspect a repository](#inspect-a-repository), and in the last line of a
+  mirror, `files` is a number: how many there are.
+- A file can carry `"pending": true`. That is a file of a revision that
+  pull-through has listed from the upstream but whose content the registry
+  has not fetched yet. Its `size` is known, and so is its `sha256` if the
+  upstream tracks it with LFS; otherwise `sha256` is empty until the file
+  is fetched. The field is absent for a stored file. A pending file is
+  fetched the first time it is downloaded, or all at once by
+  `modelctl mirror`.
+
+With pull-through on, a revision the registry does not hold is looked up
+upstream, so this route can also answer `502` or `503` (see
+[Statuses](#statuses)).
+
 ### Delete a repository
 
 `DELETE /api/v1/repos/{namespace}/{name}` (admin)
 
 Removes every revision and frees the stored files no other repository
 uses. Returns `{"blobs": 3, "bytes": 28183891}`: what was freed.
+
+If the repository was deleted and some of its files could not then be
+removed from storage, the answer is still `200`, with a `warning` beside
+the counts. The repository is gone either way; the files left behind take
+up space and are referenced by nothing.
 
 ## Pushing
 
@@ -116,9 +167,11 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 | `message` | Free text. |
 | `merge` | `false` (default): `files` is the complete revision. `true`: keep the branch's current files and add or replace these. |
 
-Returns the revision, including its `sha`. The repository is created if it
-does not exist. Recording the same content the branch already has returns
-the existing revision.
+Returns the revision, including its `sha`, with status `201`. The
+repository is created if it does not exist. Recording the same content the
+branch already has returns the existing revision, also with `201`, although
+nothing new was recorded: compare `sha` with the branch's previous one to
+tell.
 
 ## Mirroring
 
@@ -135,8 +188,10 @@ curl -N -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json
 | `revision` | Branch, tag or revision id. Default `main`. |
 | `upstream_token` | Token for the upstream hub, for private or gated repositories. Used for this request only and not stored. |
 
-If the upstream refuses (unknown repository, missing access) the response
-is an ordinary error. Otherwise it is `200` with a stream of JSON lines:
+If the upstream refuses, the response is an ordinary error: `404` for a
+repository or revision it does not have, `502` when it denies access (see
+[Statuses](#statuses) for an upstream that cannot be reached). Otherwise it
+is `200` with a stream of JSON lines:
 
 ```json
 {"event":"start","repo":"hf-internal-testing/tiny-random-bert","sha":"f171d7baecaf37b5da5a3616d8833b9969753535","files":10,"bytes":28183891}
@@ -150,7 +205,10 @@ already held those bytes and did not download them.)
 
 A failure after the stream has started arrives as a final
 `{"event":"error","error":"..."}` line, and no revision is recorded. Always
-check the last line.
+check the last line. The line gives the reason when the upstream caused the
+failure (a file that did not match its digest, a connection that kept
+dropping). When the registry itself could not store the revision, it says
+so and no more; the reason is in the server's log.
 
 The upstream hub itself is fixed by the server's `--upstream` setting.
 
@@ -172,14 +230,18 @@ All `admin`. See [operations.md](operations.md#backup-and-restore).
 |---|---|
 | `GET /api/v1/backups` | List stored backups, oldest first: `name`, `size`, `created_at`. |
 | `POST /api/v1/backups` | Take a backup and store it next to the model files. Returns `backup` and `contents` (`schema_version`, `repos`, `revisions`, `size`), and a `warning` string when the backup was stored but old backups beyond the number to keep could not be removed. |
-| `GET /api/v1/backup/snapshot` | Download a fresh, verified snapshot of the metadata database (`application/vnd.sqlite3`). |
+| `GET /api/v1/backups/snapshot` | Download a fresh, verified snapshot of the metadata database (`application/vnd.sqlite3`). |
+
+The snapshot's address was `GET /api/v1/backup/snapshot` in v0.3.0. That
+address still works and answers the same; new clients should use
+`/api/v1/backups/snapshot`, beside the other two.
 
 ## Maintenance
 
 | | |
 |---|---|
 | `GET /api/v1/stats` (read) | `repos`, `revisions`, `blobs`, `stored_bytes` (on disk), `logical_bytes` (sum over every file of every revision). |
-| `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed. |
+| `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed, as `{"blobs": 3, "bytes": 28183891}`, with a `warning` string when some of them could not be removed from storage. |
 | `POST /api/v1/verify` (admin) | Re-read every stored file and check it against its digest. See below. |
 | `GET /healthz` | `{"status": "ok", "version": "..."}`. No authentication. |
 

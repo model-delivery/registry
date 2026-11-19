@@ -59,7 +59,7 @@ func (s *Server) apiSnapshot(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = snapshot.Close() }()
 	h := w.Header()
 	h.Set("Content-Type", "application/vnd.sqlite3")
-	h.Set("Content-Disposition", `attachment; filename="`+registry.BackupName(time.Now())+`"`)
+	h.Set("Content-Disposition", `attachment; filename="`+registry.BackupName(s.now())+`"`)
 	h.Set("Content-Length", strconv.FormatInt(info.Size, 10))
 	h.Set("Cache-Control", "no-store")
 	s.log.Info("metadata snapshot downloaded", "bytes", info.Size, "repos", info.Repos, "revisions", info.Revisions)

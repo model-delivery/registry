@@ -370,8 +370,9 @@ func TestAccessControl(t *testing.T) {
 		{"open: admin verify", open, http.MethodPost, "/api/v1/verify", admin, "", 200},
 		{"open: admin lists tokens", open, http.MethodGet, "/api/v1/tokens", admin, "", 200},
 
-		// The routes below do not go through Server.need: each checks access
-		// in a way of its own. They are pinned here all the same.
+		// The routes below answer a refusal in a way of their own (a page, a
+		// Hugging Face header) or ask for no role at all. They once checked
+		// access by themselves; the cases have not changed since.
 
 		// Web UI pages apply the read rule and send a visitor who may not
 		// read to the sign-in page instead of answering 401.

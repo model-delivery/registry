@@ -89,8 +89,21 @@ Docker; the only place multipart uploads are exercised), `task build`,
   whose body is model content must be added there, or slow uploads to it
   are cut off; `TestFileTransfersHaveNoBodyDeadline` is where to add the
   case.
-- **Every route declares the role it needs** via `Server.need`. A new route
-  without it is a bug; `TestAccessControl` is where to add the case.
+- **Every route says how it is protected, where it is registered.** Either
+  `Server.gate`, with the role it needs and the style a refusal is written
+  in (`asAPI`, `asHF`, `asUI`), or `public`, with a comment saying why no
+  role is asked (the signed upload URL, whoami, sign-in, the health check).
+  Paths the mux cannot match are routed by `Server.root` and
+  `Server.hfModels`, which gate each route they find the same way. The gate
+  is the only place a role is compared: a handler never checks one itself.
+  A new route registered any other way is a bug; `TestAccessControl` is
+  where to add the case.
+- **Work that outlives a request runs on the server's lifetime**, never on
+  `context.Background()`. Pull-through jobs do (`puller.ctx`), and
+  `Server.Shutdown` cancels and waits for them; `serve` in
+  `internal/cli/serve.go` waits for that and for the backup loop before the
+  registry is closed. `TestServeStopsItsOwnWorkBeforeTheRegistryCloses` is
+  where a new kind of background work joins.
 - **Compatibility claims need a real-client test.** If the README or
   `docs/compatibility.md` says a `huggingface_hub` call works, `test/e2e`
   must exercise it.

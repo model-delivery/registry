@@ -4,11 +4,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
@@ -18,10 +19,17 @@ import (
 
 // The registry's own API, documented in docs/api.md.
 
+// defaultBranch is the branch meant when a request names none.
+const defaultBranch = "main"
+
+// mirrorEventBuffer is how many progress lines of a mirror may wait to be
+// written to the client before the file fetches that report them wait too.
+const mirrorEventBuffer = 64
+
 func repoParam(r *http.Request) string { return r.PathValue("ns") + "/" + r.PathValue("name") }
 
 func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := s.readJSON(w, r, 64<<20, v, true); err != nil {
+	if err := s.readJSON(w, r, maxJSONBytes, v, true); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return false
 	}
@@ -37,31 +45,32 @@ func (s *Server) apiListRepos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
 }
 
-// RepoDetail is the body of GET /api/v1/repos/{repo}.
-type RepoDetail struct {
+// repoDetail is the body of GET /api/v1/repos/{repo}.
+type repoDetail struct {
 	registry.Repo
 	Refs      []registry.Ref           `json:"refs"`
 	Revisions []registry.CommitSummary `json:"revisions"`
 }
 
-func (s *Server) repoDetail(r *http.Request, name string) (RepoDetail, error) {
-	repo, err := s.reg.GetRepo(r.Context(), name)
+// describeRepo gathers a repository with its refs and revisions.
+func (s *Server) describeRepo(ctx context.Context, name string) (repoDetail, error) {
+	repo, err := s.reg.GetRepo(ctx, name)
 	if err != nil {
-		return RepoDetail{}, err
+		return repoDetail{}, err
 	}
-	refs, err := s.reg.Refs(r.Context(), repo)
+	refs, err := s.reg.Refs(ctx, repo)
 	if err != nil {
-		return RepoDetail{}, err
+		return repoDetail{}, err
 	}
-	commits, err := s.reg.Commits(r.Context(), repo)
+	commits, err := s.reg.Commits(ctx, repo)
 	if err != nil {
-		return RepoDetail{}, err
+		return repoDetail{}, err
 	}
-	return RepoDetail{Repo: repo, Refs: refs, Revisions: commits}, nil
+	return repoDetail{Repo: repo, Refs: refs, Revisions: commits}, nil
 }
 
 func (s *Server) apiGetRepo(w http.ResponseWriter, r *http.Request) {
-	d, err := s.repoDetail(r, repoParam(r))
+	d, err := s.describeRepo(r.Context(), repoParam(r))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -69,8 +78,8 @@ func (s *Server) apiGetRepo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, d)
 }
 
-// RevisionDetail is the body of GET /api/v1/repos/{repo}/revisions/{rev}.
-type RevisionDetail struct {
+// revisionDetail is the body of GET /api/v1/repos/{repo}/revisions/{rev}.
+type revisionDetail struct {
 	registry.Commit
 	Files []registry.File `json:"files"`
 }
@@ -86,11 +95,11 @@ func (s *Server) apiGetRevision(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, RevisionDetail{Commit: c, Files: files})
+	writeJSON(w, http.StatusOK, revisionDetail{Commit: c, Files: files})
 }
 
-// CommitRequest is the body of POST /api/v1/repos/{repo}/commits.
-type CommitRequest struct {
+// commitRequest is the body of POST /api/v1/repos/{repo}/commits.
+type commitRequest struct {
 	Branch  string   `json:"branch"`
 	Tags    []string `json:"tags"`
 	Message string   `json:"message"`
@@ -104,12 +113,12 @@ type CommitRequest struct {
 }
 
 func (s *Server) apiCommit(w http.ResponseWriter, r *http.Request) {
-	var req CommitRequest
+	var req commitRequest
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
 	if req.Branch == "" {
-		req.Branch = "main"
+		req.Branch = defaultBranch
 	}
 	in := registry.CommitInput{Repo: repoParam(r), Branch: req.Branch, Tags: req.Tags, Message: req.Message,
 		Source: registry.SourcePush, Merge: req.Merge}
@@ -127,14 +136,44 @@ func (s *Server) apiCommit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, c)
 }
 
+// freed is the answer to an operation that removes stored files: what was
+// freed and, when some of it could not be, a warning saying so. The
+// operation itself succeeded either way.
+type freed struct {
+	registry.GCResult
+	Warning string `json:"warning,omitempty"`
+}
+
+// What a caller is told when files could not be removed from storage. The
+// reason is in the server's log.
+const (
+	deleteWarning = "the repository was deleted, but some stored files that only it used could not be removed and still take up space; the server log has the reason"
+	gcWarning     = "some unreferenced files could not be removed and still take up space; the server log has the reason"
+)
+
+// answerFreed reports res, with the warning if notFreed says some blobs
+// could not be removed. The failure is the operator's to look into, so it
+// is logged in full and not described to the caller.
+func (s *Server) answerFreed(w http.ResponseWriter, res registry.GCResult, notFreed error, warning string) {
+	out := freed{GCResult: res}
+	if notFreed != nil {
+		s.log.Warn("stored files could not be removed", "error", notFreed)
+		out.Warning = warning
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) apiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	res, err := s.reg.DeleteRepo(r.Context(), repoParam(r))
-	if err != nil && res.Blobs == 0 {
+	// The deletion is one transaction, and freeing the repository's files
+	// comes after it. A failure there leaves the repository deleted, which
+	// is what the caller asked for and is told.
+	if err != nil && !errors.Is(err, registry.ErrBlobsNotFreed) {
 		s.fail(w, r, err)
 		return
 	}
 	s.log.Info("repository deleted", "repo", repoParam(r), "blobs_freed", res.Blobs, "bytes_freed", res.Bytes)
-	writeJSON(w, http.StatusOK, res)
+	s.answerFreed(w, res, err, deleteWarning)
 }
 
 func (s *Server) apiStatBlob(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +181,8 @@ func (s *Server) apiStatBlob(w http.ResponseWriter, r *http.Request) {
 	// to upload it, so it also marks the blob as in use.
 	info, ok, err := s.reg.TouchBlob(r.Context(), r.PathValue("sha256"))
 	if err != nil {
+		// A HEAD answer has no body to explain itself in; the log does.
+		s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -149,7 +190,7 @@ func (s *Server) apiStatBlob(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Length", fmt.Sprint(info.Size))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -181,8 +222,8 @@ func (s *Server) apiPutBlob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"sha256": info.SHA256, "size": info.Size})
 }
 
-// MirrorRequest is the body of POST /api/v1/mirror.
-type MirrorRequest struct {
+// mirrorRequest is the body of POST /api/v1/mirror.
+type mirrorRequest struct {
 	Repo     string `json:"repo"`
 	Revision string `json:"revision"`
 	// UpstreamToken authenticates to the upstream hub for private or gated
@@ -190,8 +231,12 @@ type MirrorRequest struct {
 	UpstreamToken string `json:"upstream_token"`
 }
 
+// mirrorFailedLocally is the last line of a mirror that failed for a
+// reason of the registry's own. The reason is in the server's log.
+const mirrorFailedLocally = "mirror failed: the registry could not store the revision; the server log has the reason"
+
 func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
-	var req MirrorRequest
+	var req mirrorRequest
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
@@ -218,9 +263,9 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 		_ = enc.Encode(e)
 		_ = rc.Flush()
 	}
-	started := time.Now()
+	started := s.now()
 	// Progress callbacks arrive from several goroutines; serialise writes.
-	events := make(chan mirror.Event, 64)
+	events := make(chan mirror.Event, mirrorEventBuffer)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -233,16 +278,32 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	close(events)
 	<-done
 	if err != nil {
-		s.log.Warn("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
-		msg := err.Error()
-		if status, _ := statusFor(err); status == http.StatusInternalServerError && !errors.Is(err, blob.ErrMismatch) {
-			msg = "mirror failed: " + msg
-		}
-		emit(mirror.Event{Event: mirror.EventError, Error: msg})
+		emit(mirror.Event{Event: mirror.EventError, Error: s.mirrorFailure(plan, err)})
 		return
 	}
 	s.log.Info("mirror complete", "repo", res.Repo, "sha", res.SHA, "files", res.Files,
-		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", time.Since(started).Round(time.Millisecond))
+		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", s.now().Sub(started).Round(time.Millisecond))
+}
+
+// mirrorFailure logs why a mirror failed and returns what its client is
+// told, by the rule every other answer follows: a failure of the
+// registry's own (its disk, its database) is logged in full and described
+// no further, and anything else (the upstream's doing, or the request's)
+// is passed on with its reason.
+func (s *Server) mirrorFailure(plan *mirror.Plan, err error) string {
+	status, _ := statusFor(err)
+	switch {
+	case mirror.FromUpstream(err) && status == http.StatusInternalServerError:
+		// The upstream's doing, of a kind with no status of its own: a
+		// dropped connection, an error answer.
+		s.log.Warn("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+		return "mirror failed: " + err.Error()
+	case status == http.StatusInternalServerError:
+		s.log.Error("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+		return mirrorFailedLocally
+	}
+	s.log.Warn("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+	return err.Error()
 }
 
 func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
@@ -256,12 +317,24 @@ func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiGC(w http.ResponseWriter, r *http.Request) {
 	res, err := s.reg.GC(r.Context(), registry.BlobGrace)
+	// Nothing freed and an error is a collection that did not happen. Some
+	// freed and an error is one that did, with something left over.
 	if err != nil && res.Blobs == 0 {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+	s.log.Info("garbage collected", "blobs_freed", res.Blobs, "bytes_freed", res.Bytes)
+	s.answerFreed(w, res, err, gcWarning)
 }
+
+// The lines of a verify run's progress, in the order they are sent: one
+// start, a blob for each stored file, then done or error.
+const (
+	verifyStart = "start"
+	verifyBlob  = "blob"
+	verifyDone  = "done"
+	verifyError = "error"
+)
 
 // apiVerify re-reads every stored blob and streams what it finds as JSON
 // lines: a "start" line, one "blob" line per blob as it is checked, and a
@@ -283,8 +356,8 @@ func (s *Server) apiVerify(w http.ResponseWriter, r *http.Request) {
 		_ = enc.Encode(v)
 		_ = rc.Flush()
 	}
-	emit(map[string]any{"event": "start", "blobs": blobs, "bytes": bytes})
-	started := time.Now()
+	emit(map[string]any{"event": verifyStart, "blobs": blobs, "bytes": bytes})
+	started := s.now()
 	res, err := s.reg.Verify(r.Context(), func(c registry.BlobCheck) {
 		if c.Status != registry.BlobOK {
 			s.log.Warn("stored file failed verification", "sha256", c.SHA256, "status", c.Status, "detail", c.Detail, "repos", c.Repos)
@@ -292,7 +365,7 @@ func (s *Server) apiVerify(w http.ResponseWriter, r *http.Request) {
 		emit(struct {
 			Event string `json:"event"`
 			registry.BlobCheck
-		}{"blob", c})
+		}{verifyBlob, c})
 	})
 	if err != nil {
 		s.log.Warn("verify did not finish", "checked", res.Blobs, "error", err)
@@ -300,14 +373,14 @@ func (s *Server) apiVerify(w http.ResponseWriter, r *http.Request) {
 		if status, _ := statusFor(err); status == http.StatusInternalServerError {
 			msg = "the check did not finish; the server's log has the reason"
 		}
-		emit(map[string]any{"event": "error", "error": msg})
+		emit(map[string]any{"event": verifyError, "error": msg})
 		return
 	}
-	s.log.Info("verify complete", "blobs", res.Blobs, "bytes", res.Bytes, "failed", res.Failed, "took", time.Since(started).Round(time.Millisecond))
+	s.log.Info("verify complete", "blobs", res.Blobs, "bytes", res.Bytes, "failed", res.Failed, "took", s.now().Sub(started).Round(time.Millisecond))
 	emit(struct {
 		Event string `json:"event"`
 		registry.VerifyResult
-	}{"done", res})
+	}{verifyDone, res})
 }
 
 func (s *Server) apiListTokens(w http.ResponseWriter, r *http.Request) {
@@ -321,19 +394,19 @@ func (s *Server) apiListTokens(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
-		Role string `json:"role"`
+		Name string        `json:"name"`
+		Role registry.Role `json:"role"`
 	}
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
-	secret, err := s.reg.CreateToken(r.Context(), req.Name, registry.Role(req.Role))
+	secret, err := s.reg.CreateToken(r.Context(), req.Name, req.Role)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	s.log.Info("token created", "name", req.Name, "role", req.Role)
-	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name, "role": req.Role, "token": secret})
+	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name, "role": string(req.Role), "token": secret})
 }
 
 func (s *Server) apiRevokeToken(w http.ResponseWriter, r *http.Request) {

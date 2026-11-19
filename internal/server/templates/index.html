@@ -17,7 +17,7 @@
     <td>{{if .Upstream}}Mirror of {{.Upstream}}{{else}}Pushed here{{end}}</td>
     <td class="num">{{.Revisions}}</td>
     <td class="num">{{bytes .StoredBytes}}</td>
-    <td title="{{date .UpdatedAt}}">{{ago .UpdatedAt}}</td>
+    <td title="{{date .UpdatedAt}}">{{$.Ago .UpdatedAt}}</td>
   </tr>
   {{end}}
   </tbody>

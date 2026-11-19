@@ -6,6 +6,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -53,50 +54,30 @@ const (
 	// maxCommitLine bounds one line of a commit request: an inline file is
 	// base64, so a third larger than the file, plus its JSON wrapping.
 	maxCommitLine = 2*inlineUploadMax + 1<<20
+	// commitReadBuffer is the buffer a commit request is read through. A
+	// line longer than it is still read whole, up to maxCommitLine.
+	commitReadBuffer = 1 << 20
 	// uploadURLTTL is how long a signed upload URL is valid. It has to
 	// outlast the upload of the largest file, which starts after it is issued.
 	uploadURLTTL = 12 * time.Hour
+	// uploadKeyBytes is the length of the key upload URLs are signed with.
+	uploadKeyBytes = 32
+)
+
+// How the Hub tells a client to send a file, in the preupload answer.
+const (
+	uploadModeInline = "regular" // inside the commit request
+	uploadModeLFS    = "lfs"     // through the large-file protocol
 )
 
 const xetHint = "this registry does not support Xet uploads: set HF_HUB_DISABLE_XET=1 in the client's environment and run the upload again"
 
 func newUploadKey() []byte {
-	key := make([]byte, 32)
+	key := make([]byte, uploadKeyBytes)
 	if _, err := rand.Read(key); err != nil {
 		panic(err) // the system's random source is unavailable
 	}
 	return key
-}
-
-// baseURL is how the client reached this server, for links sent back to it.
-func baseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
-}
-
-// hfError writes an error the way Hugging Face clients read one: the
-// message in the body and in X-Error-Message.
-func hfError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("X-Error-Message", msg)
-	writeError(w, status, msg)
-}
-
-// requireRole is Server.need for handlers that pick their role by method.
-func (s *Server) requireRole(w http.ResponseWriter, r *http.Request, minRole role) bool {
-	granted, authenticated := s.allowed(r, minRole)
-	switch {
-	case granted:
-		return true
-	case authenticated:
-		hfError(w, http.StatusForbidden, "this token does not have permission to upload; it needs the write role")
-	default:
-		w.Header().Set("WWW-Authenticate", `Bearer realm="registry"`)
-		hfError(w, http.StatusUnauthorized, "uploading needs an access token with the write role: set HF_TOKEN")
-	}
-	return false
 }
 
 func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +86,7 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 		Organization string `json:"organization"`
 		Type         string `json:"type"`
 	}
-	if err := s.readJSON(w, r, 1<<20, &req, false); err != nil {
+	if err := s.readJSON(w, r, maxSmallJSONBytes, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -117,8 +98,7 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if namespace == "" {
 		// The Hub puts a repository named without a namespace under the
 		// caller's own. Here the caller is a token, so its name stands in.
-		_, tok := s.roleOf(r)
-		namespace = tok.Name
+		namespace = s.identity(r).Name
 	}
 	repo := namespace + "/" + req.Name
 	created, err := s.reg.CreateRepo(r.Context(), repo)
@@ -127,18 +107,18 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 			hfError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid repository id: use namespace/name with letters, digits, '.', '_' or '-'", repo))
 			return
 		}
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
-	url := baseURL(r) + "/" + repo
+	address := baseURL(r) + "/" + repo
 	if !created {
-		// Clients that pass exist_ok treat 409 as success.
-		w.Header().Set("X-Error-Message", "this repository already exists")
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "this repository already exists", "url": url})
+		// Clients that pass exist_ok treat 409 as success. The body names
+		// the repository that exists, as the Hub's does.
+		writeHFError(w, http.StatusConflict, "", "this repository already exists", map[string]string{"url": address})
 		return
 	}
 	s.log.Info("repository created", "repo", repo)
-	writeJSON(w, http.StatusOK, map[string]string{"url": url, "name": repo, "id": repo})
+	writeJSON(w, http.StatusOK, map[string]string{"url": address, "name": repo, "id": repo})
 }
 
 // hfValidateYAML accepts any model card. The Hub checks the card's
@@ -154,7 +134,7 @@ func (s *Server) hfPreupload(w http.ResponseWriter, r *http.Request, repo, rev s
 			Size int64  `json:"size"`
 		} `json:"files"`
 	}
-	if err := s.readJSON(w, r, 64<<20, &req, false); err != nil {
+	if err := s.readJSON(w, r, maxJSONBytes, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -168,9 +148,9 @@ func (s *Server) hfPreupload(w http.ResponseWriter, r *http.Request, repo, rev s
 	}
 	out := make([]file, len(req.Files))
 	for i, f := range req.Files {
-		mode := "lfs"
+		mode := uploadModeLFS
 		if f.Size <= inlineUploadMax {
-			mode = "regular"
+			mode = uploadModeInline
 		}
 		out[i] = file{Path: f.Path, UploadMode: mode}
 	}
@@ -193,16 +173,16 @@ func (s *Server) uploadTargetOK(w http.ResponseWriter, r *http.Request, repo, re
 	return false
 }
 
+// lfsError is why one object of a batch request cannot be uploaded, in the
+// git-lfs batch protocol's shape.
+type lfsError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
 // hfLFSBatch answers the git-lfs batch request: for each object the client
 // wants to upload, either "already stored" or a signed URL to PUT it to.
 func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if !s.requireRole(w, r, roleWrite) {
-		return
-	}
 	var req struct {
 		Operation string `json:"operation"`
 		Objects   []struct {
@@ -210,7 +190,7 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 			Size int64  `json:"size"`
 		} `json:"objects"`
 	}
-	if err := s.readJSON(w, r, 64<<20, &req, false); err != nil {
+	if err := s.readJSON(w, r, maxJSONBytes, &req, false); err != nil {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -227,32 +207,32 @@ func (s *Server) hfLFSBatch(w http.ResponseWriter, r *http.Request, repo string)
 		OID     string            `json:"oid"`
 		Size    int64             `json:"size"`
 		Actions map[string]action `json:"actions,omitempty"`
-		Error   *map[string]any   `json:"error,omitempty"`
+		Error   *lfsError         `json:"error,omitempty"`
 	}
 	// The URLs issued below are bound to the token that asked for them.
-	_, tok := s.roleOf(r)
+	tok := s.identity(r)
 	out := make([]object, len(req.Objects))
 	for i, o := range req.Objects {
 		out[i] = object{OID: o.OID, Size: o.Size}
 		if !blob.ValidDigest(o.OID) || o.Size < 0 {
-			out[i].Error = &map[string]any{"code": 422, "message": "the object id must be a lowercase hex SHA-256 and the size must not be negative"}
+			out[i].Error = &lfsError{http.StatusUnprocessableEntity, "the object id must be a lowercase hex SHA-256 and the size must not be negative"}
 			continue
 		}
 		if over, err := s.blobTooLarge(o.Size); over {
-			out[i].Error = &map[string]any{"code": http.StatusRequestEntityTooLarge, "message": err.Error()}
+			out[i].Error = &lfsError{http.StatusRequestEntityTooLarge, err.Error()}
 			continue
 		}
 		// Asking about a blob marks it in use, so garbage collection leaves
 		// it alone until this upload's commit arrives.
 		info, stored, err := s.reg.TouchBlob(r.Context(), o.OID)
 		if err != nil {
-			s.fail(w, r, err)
+			s.hfFail(w, r, err)
 			return
 		}
 		if stored && info.Size == o.Size {
 			continue // no actions: the client skips the upload
 		}
-		expires := time.Now().Add(uploadURLTTL).Unix()
+		expires := s.now().Add(uploadURLTTL).Unix()
 		out[i].Actions = map[string]action{"upload": {
 			Href: fmt.Sprintf("%s/api/lfs/upload/%s?size=%d&expires=%d&token=%s&signature=%s",
 				baseURL(r), o.OID, o.Size, expires, url.QueryEscape(tok.Name), s.signUpload(o.OID, o.Size, expires, tok.Name)),
@@ -276,6 +256,8 @@ func (s *Server) signUpload(oid string, size, expires int64, tokenName string) s
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// hfLFSUpload receives one large file. No role is asked of the request:
+// the signed URL is the grant, and everything it rests on is checked here.
 func (s *Server) hfLFSUpload(w http.ResponseWriter, r *http.Request) {
 	oid := r.PathValue("sha256")
 	q := r.URL.Query()
@@ -285,32 +267,32 @@ func (s *Server) hfLFSUpload(w http.ResponseWriter, r *http.Request) {
 	tokenName := q.Get("token")
 	want, _ := hex.DecodeString(s.signUpload(oid, size, expires, tokenName))
 	if errSize != nil || errExp != nil || errSig != nil || !hmac.Equal(given, want) {
-		writeError(w, http.StatusForbidden, "this upload URL is not valid: ask the registry for a new one")
+		hfError(w, http.StatusForbidden, "this upload URL is not valid: ask the registry for a new one")
 		return
 	}
-	if time.Now().Unix() > expires {
-		writeError(w, http.StatusForbidden, "this upload URL has expired: start the upload again")
+	if s.now().Unix() > expires {
+		hfError(w, http.StatusForbidden, "this upload URL has expired: start the upload again")
 		return
 	}
 	// The URL is only as good as the token it was issued to: revoking the
 	// token, or taking the write role from it, ends its uploads in flight.
 	tok, err := s.reg.Token(r.Context(), tokenName)
 	switch {
-	case errors.Is(err, registry.ErrTokenNotFound), err == nil && roleFromName(tok.Role) < roleWrite:
-		writeError(w, http.StatusForbidden, "the access token this upload URL was issued to has been revoked or no longer has the write role: start the upload again with a current token")
+	case errors.Is(err, registry.ErrTokenNotFound), err == nil && !tok.Role.Allows(registry.RoleWrite):
+		hfError(w, http.StatusForbidden, "the access token this upload URL was issued to has been revoked or no longer has the write role: start the upload again with a current token")
 		return
 	case err != nil:
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
 	if over, err := s.blobTooLarge(size); over {
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
 	// Streamed to storage and hashed on the way; rejected unless it is
 	// exactly the bytes the URL was issued for.
 	if _, err := s.reg.PutBlob(r.Context(), r.Body, blob.Expect{SHA256: oid, Size: size}); err != nil {
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -322,6 +304,15 @@ type commitLine struct {
 	Value json.RawMessage `json:"value"`
 }
 
+// The kinds of line in a commit request.
+const (
+	commitHeader        = "header"
+	commitFile          = "file"
+	commitLFSFile       = "lfsFile"
+	commitDeletedFile   = "deletedFile"
+	commitDeletedFolder = "deletedFolder"
+)
+
 func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev string) {
 	if !s.uploadTargetOK(w, r, repo, rev) {
 		return
@@ -329,7 +320,7 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 	in := registry.CommitInput{Repo: repo, Branch: rev, Source: registry.SourcePush, Merge: true}
 	// Each line is bounded below; this bounds how many there can be.
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxCommitBytes())
-	br := bufio.NewReaderSize(r.Body, 1<<20)
+	br := bufio.NewReaderSize(r.Body, commitReadBuffer)
 	sawHeader := false
 	for {
 		line, err := readLine(br, maxCommitLine)
@@ -359,33 +350,24 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 			hfError(w, http.StatusBadRequest, "the commit is not valid line-delimited JSON: "+err.Error())
 			return
 		}
-		if err := s.applyCommitLine(r, &in, entry); err != nil {
-			status, _ := statusFor(err)
-			if status == http.StatusInternalServerError {
-				s.fail(w, r, err)
-				return
-			}
-			hfError(w, status, err.Error())
+		if err := s.applyCommitLine(r.Context(), &in, entry); err != nil {
+			s.hfFail(w, r, err)
 			return
 		}
-		sawHeader = sawHeader || entry.Key == "header"
+		sawHeader = sawHeader || entry.Key == commitHeader
 	}
 	if !sawHeader {
 		hfError(w, http.StatusBadRequest, "the commit has no header line")
 		return
 	}
 	c, err := s.reg.Commit(r.Context(), in)
+	if errors.Is(err, registry.ErrConflict) {
+		// What the Hub answers when the branch moved under the client.
+		hfError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
 	if err != nil {
-		status, _ := statusFor(err)
-		if status == http.StatusInternalServerError {
-			s.fail(w, r, err)
-			return
-		}
-		if errors.Is(err, registry.ErrConflict) {
-			// What the Hub answers when the branch moved under the client.
-			status = http.StatusPreconditionFailed
-		}
-		hfError(w, status, err.Error())
+		s.hfFail(w, r, err)
 		return
 	}
 	s.log.Info("revision recorded", "repo", c.Repo, "sha", c.SHA, "branch", rev, "via", "hugging face upload")
@@ -397,53 +379,57 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 	})
 }
 
+// invalidf is an error for something in a request that cannot be accepted.
+func invalidf(format string, a ...any) error {
+	return fmt.Errorf("%w: %s", registry.ErrInvalid, fmt.Sprintf(format, a...))
+}
+
 // applyCommitLine folds one line of a commit request into the commit.
-func (s *Server) applyCommitLine(r *http.Request, in *registry.CommitInput, entry commitLine) error {
-	invalid := func(format string, a ...any) error {
-		return fmt.Errorf("%w: "+format, append([]any{registry.ErrInvalid}, a...)...)
-	}
+func (s *Server) applyCommitLine(ctx context.Context, in *registry.CommitInput, entry commitLine) error {
 	switch entry.Key {
-	case "header":
+	case commitHeader:
 		var h struct {
 			Summary      string `json:"summary"`
 			Description  string `json:"description"`
 			ParentCommit string `json:"parentCommit"`
 		}
 		if err := json.Unmarshal(entry.Value, &h); err != nil {
-			return invalid("unreadable commit header")
+			return invalidf("unreadable commit header")
 		}
 		in.Message = h.Summary
 		if h.Description != "" {
 			in.Message += "\n\n" + h.Description
 		}
 		in.ExpectParent = h.ParentCommit
-	case "file":
+	case commitFile:
 		var f struct {
 			Path     string `json:"path"`
 			Content  string `json:"content"`
 			Encoding string `json:"encoding"`
 		}
 		if err := json.Unmarshal(entry.Value, &f); err != nil {
-			return invalid("unreadable file entry")
+			return invalidf("unreadable file entry")
 		}
 		if f.Encoding != "base64" {
-			return invalid("file %s uses encoding %q; only base64 is supported", f.Path, f.Encoding)
+			return invalidf("file %s uses encoding %q; only base64 is supported", f.Path, f.Encoding)
 		}
 		content, err := base64.StdEncoding.DecodeString(f.Content)
 		if err != nil {
-			return invalid("file %s is not valid base64", f.Path)
+			return invalidf("file %s is not valid base64", f.Path)
 		}
 		if over, err := s.blobTooLarge(int64(len(content))); over {
 			return err
 		}
-		info, err := s.reg.PutBlob(r.Context(), bytes.NewReader(content), blob.Expect{Size: int64(len(content))})
+		info, err := s.reg.PutBlob(ctx, bytes.NewReader(content), blob.Expect{Size: int64(len(content))})
 		if err != nil {
 			return err
 		}
 		// A file sent inline is recorded the way the Hub records a file
-		// kept in git: identified by its git blob id.
+		// kept in git: not as an LFS file, so clients identify it by its
+		// git blob id. The id is not given here; Registry.Commit takes it
+		// from the stored blob when a file names none.
 		in.Files = append(in.Files, registry.File{Path: f.Path, SHA256: info.SHA256})
-	case "lfsFile":
+	case commitLFSFile:
 		var f struct {
 			Path string `json:"path"`
 			Algo string `json:"algo"`
@@ -451,12 +437,12 @@ func (s *Server) applyCommitLine(r *http.Request, in *registry.CommitInput, entr
 			Size int64  `json:"size"`
 		}
 		if err := json.Unmarshal(entry.Value, &f); err != nil {
-			return invalid("unreadable large-file entry")
+			return invalidf("unreadable large-file entry")
 		}
 		if f.Algo != "" && f.Algo != "sha256" {
-			return invalid("file %s is identified by %q; only sha256 is supported", f.Path, f.Algo)
+			return invalidf("file %s is identified by %q; only sha256 is supported", f.Path, f.Algo)
 		}
-		info, stored, err := s.reg.StatBlob(r.Context(), f.OID)
+		info, stored, err := s.reg.StatBlob(ctx, f.OID)
 		if err != nil {
 			return err
 		}
@@ -465,23 +451,23 @@ func (s *Server) applyCommitLine(r *http.Request, in *registry.CommitInput, entr
 				registry.ErrBlobMissing, f.Path, f.OID, xetHint)
 		}
 		if info.Size != f.Size {
-			return invalid("file %s is declared as %d bytes but the stored content is %d bytes", f.Path, f.Size, info.Size)
+			return invalidf("file %s is declared as %d bytes but the stored content is %d bytes", f.Path, f.Size, info.Size)
 		}
 		in.Files = append(in.Files, registry.File{Path: f.Path, SHA256: f.OID, LFS: true})
-	case "deletedFile", "deletedFolder":
+	case commitDeletedFile, commitDeletedFolder:
 		var d struct {
 			Path string `json:"path"`
 		}
 		if err := json.Unmarshal(entry.Value, &d); err != nil || d.Path == "" {
-			return invalid("unreadable delete entry")
+			return invalidf("unreadable delete entry")
 		}
 		path := strings.TrimSuffix(d.Path, "/")
-		if entry.Key == "deletedFolder" {
+		if entry.Key == commitDeletedFolder {
 			path += "/"
 		}
 		in.Delete = append(in.Delete, path)
 	default:
-		return invalid("commit operation %q is not supported", entry.Key)
+		return invalidf("commit operation %q is not supported", entry.Key)
 	}
 	return nil
 }
@@ -517,15 +503,15 @@ func (s *Server) hfCreateBranch(w http.ResponseWriter, r *http.Request, repoName
 	var req struct {
 		StartingPoint string `json:"startingPoint"`
 	}
-	_ = s.readJSON(w, r, 1<<20, &req, false) // the body is optional
+	_ = s.readJSON(w, r, maxSmallJSONBytes, &req, false) // the body is optional
 	repo, err := s.reg.GetRepo(r.Context(), repoName)
 	if err != nil {
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
 	commits, err := s.reg.Commits(r.Context(), repo)
 	if err != nil {
-		s.fail(w, r, err)
+		s.hfFail(w, r, err)
 		return
 	}
 	if len(commits) == 0 {
@@ -534,15 +520,10 @@ func (s *Server) hfCreateBranch(w http.ResponseWriter, r *http.Request, repoName
 	}
 	from := req.StartingPoint
 	if from == "" {
-		from = "main"
+		from = defaultBranch
 	}
 	if err := s.reg.CreateBranch(r.Context(), repoName, branch, from); err != nil {
-		status, _ := statusFor(err)
-		if status == http.StatusInternalServerError {
-			s.fail(w, r, err)
-			return
-		}
-		hfError(w, status, err.Error())
+		s.hfFail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)

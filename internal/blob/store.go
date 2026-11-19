@@ -34,6 +34,10 @@ type Expect struct {
 	SHA256 string
 	GitOID string
 	Size   int64
+	// Tail, when set, is told how the staging goes, so that readers can
+	// follow the bytes while they arrive (see Tail). It is not a check, and
+	// what is staged is verified and published the same with or without it.
+	Tail *Tail
 }
 
 // Info describes stored bytes. GitOID is the git blob id of the content,
@@ -211,6 +215,12 @@ func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (pat
 
 	h256 := sha256.New()
 	writers := []io.Writer{tmp, h256}
+	if want.Tail != nil {
+		// After the file in the list, so a follower is only ever told of
+		// bytes that are already in it.
+		want.Tail.begin(path)
+		writers = append(writers, tailWriter{want.Tail})
+	}
 	var hGit hash.Hash
 	src := r
 	if want.Size >= 0 {
@@ -249,6 +259,10 @@ func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (pat
 	}
 	if want.GitOID != "" && want.GitOID != info.GitOID {
 		return path, Info{}, fmt.Errorf("%w: expected git blob id %s, received %s", ErrMismatch, want.GitOID, info.GitOID)
+	}
+	if want.Tail != nil {
+		// Every check has passed: from here the bytes are what was expected.
+		want.Tail.verify()
 	}
 	return path, info, nil
 }

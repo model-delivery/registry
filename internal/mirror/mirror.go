@@ -189,7 +189,7 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 			defer wg.Done()
 			for i := range jobs {
 				e := p.Entries[i]
-				f, fetched, err := ensureBlob(ctx, p.up, reg, repo, sha, e)
+				f, fetched, err := ensureBlob(ctx, p.up, reg, repo, sha, e, nil)
 				mu.Lock()
 				if err != nil {
 					if firstErr == nil {
@@ -294,11 +294,19 @@ func (p *Plan) RecordLazy(ctx context.Context, reg *registry.Registry) (registry
 // FetchFile fetches the content of one pending file of revision c from up,
 // verifies it against the digest recorded for it, and marks it stored.
 func FetchFile(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File) error {
+	return FetchFileFollowed(ctx, up, reg, c, f, nil)
+}
+
+// FetchFileFollowed is FetchFile with a tail on the download, so the
+// caller's readers can follow the bytes while they arrive (blob.Tail says
+// what such a reader may rely on). The tail is used only if the content has
+// to be downloaded; ending it is the caller's business either way.
+func FetchFileFollowed(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File, tail *blob.Tail) error {
 	e := Entry{Path: f.Path, Size: f.Size, OID: f.GitOID}
 	if f.LFS {
 		e.LFSSHA256 = f.SHA256
 	}
-	got, _, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e)
+	got, _, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e, tail)
 	if err != nil {
 		return err
 	}
@@ -306,10 +314,11 @@ func FetchFile(ctx context.Context, up *Upstream, reg *registry.Registry, c regi
 }
 
 // ensureBlob makes sure one upstream file's bytes are stored, downloading
-// and verifying them only if they are not already present.
-func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo, sha string, e Entry) (registry.File, bool, error) {
+// and verifying them only if they are not already present. tail, when not
+// nil, follows the download.
+func ensureBlob(ctx context.Context, up *Upstream, reg *registry.Registry, repo, sha string, e Entry, tail *blob.Tail) (registry.File, bool, error) {
 	f := registry.File{Path: e.Path, GitOID: e.OID, LFS: e.LFSSHA256 != ""}
-	want := blob.Expect{Size: e.Size}
+	want := blob.Expect{Size: e.Size, Tail: tail}
 	if f.LFS {
 		if !blob.ValidDigest(e.LFSSHA256) {
 			return f, false, blame(fmt.Errorf("upstream lists a malformed sha256 %q", e.LFSSHA256))

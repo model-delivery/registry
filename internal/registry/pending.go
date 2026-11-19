@@ -36,7 +36,7 @@ CREATE TABLE pending_files (
 // LazyInput describes an upstream revision to record before its content is
 // fetched.
 type LazyInput struct {
-	Repo         string
+	Repo         string // the repository's key (RepoKey)
 	Branch       string // moved to the revision; empty records the revision only
 	SHA          string // the upstream revision id
 	Message      string
@@ -56,7 +56,7 @@ type LazyInput struct {
 // CommitLazy records a revision whose files are all pending. If the
 // revision is already recorded, complete or not, only the branch is moved.
 func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error) {
-	if err := ValidateRepoName(in.Repo); err != nil {
+	if err := ValidateRepoKey(in.Repo); err != nil {
 		return Commit{}, err
 	}
 	if !IsSHA(in.SHA) {
@@ -81,7 +81,7 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 	defer func() { _ = tx.Rollback() }()
 	at, now := r.clock()
 
-	repoID, err := upsertRepo(ctx, tx, repoUpsert{name: in.Repo, upstream: in.Upstream, onlyFromUpstream: in.OnlyFromUpstream, now: now})
+	repoID, err := upsertRepo(ctx, tx, repoUpsert{key: in.Repo, upstream: in.Upstream, onlyFromUpstream: in.OnlyFromUpstream, now: now})
 	if err != nil {
 		return Commit{}, err
 	}
@@ -91,8 +91,9 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		return Commit{}, err
 	}
 	if !found {
-		c = Commit{RepoID: repoID, Repo: in.Repo, SHA: in.SHA, Message: in.Message, Source: SourceMirror,
+		c = Commit{RepoID: repoID, SHA: in.SHA, Message: in.Message, Source: SourceMirror,
 			UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
+		c.RepoType, c.Repo = SplitRepoKey(in.Repo)
 		// tree stays empty until the last pending file arrives: it is the
 		// digest of the complete file list, which is not known before then.
 		if c.ID, err = insertCommit(ctx, tx, c, "", now); err != nil {
@@ -197,7 +198,7 @@ func sealIfComplete(ctx context.Context, tx dbtx, commitID int64) (int, error) {
 // CompleteInput names a recorded revision and the stored content of its
 // files.
 type CompleteInput struct {
-	Repo string
+	Repo string // the repository's key (RepoKey)
 	SHA  string
 	// Branch to move to the revision. Empty moves none.
 	Branch string
@@ -218,7 +219,7 @@ type CompleteInput struct {
 // and with ErrConflict when the files given leave some of the revision's
 // files pending.
 func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Commit, error) {
-	if err := ValidateRepoName(in.Repo); err != nil {
+	if err := ValidateRepoKey(in.Repo); err != nil {
 		return Commit{}, err
 	}
 	if !IsSHA(in.SHA) {
@@ -235,7 +236,8 @@ func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Comm
 	defer func() { _ = tx.Rollback() }()
 
 	var c Commit
-	found, err := scanCommit(tx.QueryRowContext(ctx, commitCols+" WHERE r.name = ? AND c.sha = ?", in.Repo, in.SHA), &c)
+	typ, name := SplitRepoKey(in.Repo)
+	found, err := scanCommit(tx.QueryRowContext(ctx, commitCols+" WHERE r.type = ? AND r.name = ? AND c.sha = ?", typ, name, in.SHA), &c)
 	if err != nil {
 		return Commit{}, err
 	}

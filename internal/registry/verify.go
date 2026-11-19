@@ -38,7 +38,8 @@ type BlobCheck struct {
 	// Detail says what is wrong, when something is.
 	Detail string `json:"detail,omitempty"`
 	// Repos names repositories with a revision that uses the blob, when
-	// something is wrong with it: at most maxReposPerCheck of them.
+	// something is wrong with it: at most maxReposPerCheck of them, each by
+	// its key (a dataset as "datasets/namespace/name").
 	Repos []string `json:"repos,omitempty"`
 }
 
@@ -137,8 +138,9 @@ func (r *Registry) checkBlob(ctx context.Context, b blob.Info) (check BlobCheck,
 		check.Status, check.Detail = BlobUnreadable, found.Error()
 	}
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT DISTINCT r.name FROM files f JOIN commits c ON c.id = f.commit_id JOIN repos r ON r.id = c.repo_id
-		 WHERE f.sha256 = ? ORDER BY r.name LIMIT ?`, b.SHA256, maxReposPerCheck)
+		`SELECT DISTINCT CASE r.type WHEN ? THEN ? || r.name ELSE r.name END AS repo
+		 FROM files f JOIN commits c ON c.id = f.commit_id JOIN repos r ON r.id = c.repo_id
+		 WHERE f.sha256 = ? ORDER BY repo LIMIT ?`, TypeDataset, datasetKeyPrefix, b.SHA256, maxReposPerCheck)
 	if err != nil {
 		return check, false, err
 	}

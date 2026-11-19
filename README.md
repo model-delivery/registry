@@ -242,9 +242,9 @@ turned on. It follows read access: open when downloads are open, and with
 `--require-auth` it needs a token with the `read` role, which Prometheus
 sends as a bearer token. The metrics, a scrape configuration and alerts
 for a backup that is too old, a failing upstream and a full fetch queue
-are in [docs/operations.md](docs/operations.md#monitoring). A namespace
-called `metrics` cannot be used for repositories, like `api`, `ui`,
-`static` and `healthz`.
+are in [docs/operations.md](docs/operations.md#monitoring). Namespaces
+called `metrics` and `datasets` cannot be used for repositories, like
+`api`, `ui`, `static` and `healthz`.
 
 ## Hugging Face compatibility
 

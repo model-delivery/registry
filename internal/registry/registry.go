@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -41,7 +42,7 @@ var (
 )
 
 // schemaVersion is the database layout this version reads and writes.
-const schemaVersion = 2
+const schemaVersion = 3
 
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
@@ -104,6 +105,32 @@ CREATE TABLE tokens (
   created_at TEXT NOT NULL
 );
 `
+
+// typesSchema is version 3: a repository's type becomes part of its
+// identity, so that a model and a dataset of the same name can both exist.
+// SQLite cannot change the uniqueness of an existing column, so the table
+// is rebuilt: every row is copied with its id, which the revisions and refs
+// point at, and becomes a model. It runs with foreign keys off (see
+// migrate), or dropping the old table would delete every revision.
+const typesSchema = `
+CREATE TABLE repos_v3 (
+  id         INTEGER PRIMARY KEY,
+  type       TEXT NOT NULL DEFAULT 'model' CHECK (type IN ('model', 'dataset')),
+  name       TEXT NOT NULL,
+  upstream   TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  UNIQUE (type, name)
+);
+INSERT INTO repos_v3 (id, type, name, upstream, created_at)
+  SELECT id, 'model', name, upstream, created_at FROM repos;
+DROP TABLE repos;
+ALTER TABLE repos_v3 RENAME TO repos;
+`
+
+// stepHook, when not nil, is called after each step of a migration has run
+// inside its transaction, and an error from it abandons the migration. Only
+// tests pass one (openWithHook), to interrupt a migration part-way.
+type stepHook func(toVersion int) error
 
 // Registry is safe for concurrent use by one process. Running two processes
 // against the same data directory is not supported.
@@ -169,6 +196,11 @@ func (k *keyLock) lock(key string) func() {
 // Open opens the registry whose metadata lives in dataDir, creating it on
 // first use. File content goes to store; nil means local files in dataDir.
 func Open(dataDir string, store blob.Store) (*Registry, error) {
+	return openWithHook(dataDir, store, nil)
+}
+
+// openWithHook is Open, with a hook into the schema migration for tests.
+func openWithHook(dataDir string, store blob.Store, hook stepHook) (*Registry, error) {
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
@@ -188,7 +220,7 @@ func Open(dataDir string, store blob.Store) (*Registry, error) {
 		return nil, err
 	}
 	r := &Registry{db: db, blobs: store, now: time.Now, dir: dir}
-	if err := r.migrate(); err != nil {
+	if err := r.migrate(hook); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -212,9 +244,15 @@ func ownerOnly(paths ...string) {
 // Close releases the database.
 func (r *Registry) Close() error { return r.db.Close() }
 
-// migrate brings the database to schemaVersion. Each step adds to what
-// the one before it left; nothing existing is ever rewritten.
-func (r *Registry) migrate() error {
+// migrate brings the database to schemaVersion. Each step keeps everything
+// the one before it left: versions 1 and 2 only add tables, and version 3
+// rebuilds one table row for row (typesSchema).
+//
+// All the steps and the new version number are one transaction, so an
+// interrupted migration (a crash, a full disk, a failed step) leaves the
+// database as it was, at its old version, and the next start migrates it
+// again. Nothing reads the database before migrate has returned.
+func (r *Registry) migrate(hook stepHook) error {
 	ctx := context.Background()
 	var v int
 	if err := r.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
@@ -233,22 +271,82 @@ func (r *Registry) migrate() error {
 		// Version 2 adds the table for files a revision lists but has not
 		// fetched yet.
 		pendingSchema,
+		// Version 3 makes a repository's type part of its identity.
+		typesSchema,
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
+	// One connection for the whole migration: foreign keys are switched off
+	// on it, which SQLite allows only outside a transaction, so that
+	// rebuilding a table does not cascade to the rows that point at it.
+	// The check at the end proves nothing was left pointing nowhere. The
+	// connection gets its foreign keys back before it returns to the pool,
+	// or it is discarded.
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("prepare the schema upgrade: %w", err)
+	}
+	restored := false
+	defer func() {
+		if !restored {
+			// A connection whose foreign keys could not be turned back on
+			// must not be used again.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+	if err := migrateSteps(ctx, conn, v, steps[:], hook); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("finish the schema upgrade: %w", err)
+	}
+	restored = true
+	return nil
+}
+
+// migrateSteps runs the steps that take a database from version from to
+// schemaVersion, and records the new version, in one transaction on conn.
+func migrateSteps(ctx context.Context, conn *sql.Conn, from int, steps []string, hook stepHook) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for from := v; from < schemaVersion; from++ {
-		if _, err := tx.ExecContext(ctx, steps[from]); err != nil {
-			return fmt.Errorf("upgrade schema to version %d: %w", from+1, err)
+	for v := from; v < schemaVersion; v++ {
+		if _, err := tx.ExecContext(ctx, steps[v]); err != nil {
+			return fmt.Errorf("upgrade schema to version %d: %w", v+1, err)
 		}
+		if hook != nil {
+			if err := hook(v + 1); err != nil {
+				return fmt.Errorf("upgrade schema to version %d: %w", v+1, err)
+			}
+		}
+	}
+	dangling, err := anyRows(ctx, tx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("check the upgraded schema: %w", err)
+	}
+	if dangling {
+		return errors.New("upgrading the schema would leave rows pointing at nothing; the database was left as it was")
 	}
 	// A pragma takes no bound parameter; the value is this package's constant.
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// anyRows reports whether query returns at least one row.
+func anyRows(ctx context.Context, tx *sql.Tx, query string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	found := rows.Next()
+	return found, rows.Err()
 }
 
 // clock reads the time once, as the value and as the text stored for it,

@@ -71,6 +71,40 @@ The tables of `registry.db` are `repos`, `commits` (revisions), `files`
 [Pull-through caching](#pull-through-caching)), `refs`, `blobs` (what is
 stored, and when it was last written or asked about) and `tokens`.
 
+### Models and datasets
+
+A repository is a model or a dataset, and its type is part of its
+identity: `repos` is unique on `(type, name)`, so a model `acme/x` and a
+dataset `acme/x` are two repositories, with their own revisions, refs and
+files. Everything below the repository (revisions, refs, files, pending
+files, blobs) is the same for both. Blobs are shared: a file that a model
+and a dataset both contain is stored once, and deleting either leaves it
+for the other.
+
+Inside `internal/registry` a repository is addressed by its *key*, the
+path the Hub gives it in URLs: `acme/x` for the model and
+`datasets/acme/x` for the dataset (`registry.RepoKey`). A key of two
+segments is always a model, so a model whose namespace is literally
+`datasets`, recorded before that namespace was reserved, still has its
+own key. The type itself is a typed value, `registry.RepoType`, whose
+values on the wire and in the database are `model` and `dataset`;
+documents leave it out for a model, so model documents read as they
+always have.
+
+### Schema versions
+
+The database records its layout in SQLite's `user_version`, and opening
+it brings an older one up to date before anything reads it. Version 1 is
+the original layout, version 2 adds `pending_files`, and version 3 adds a
+repository's type: SQLite cannot change which columns a table is unique
+on, so `repos` is rebuilt, every row copied with its id and made a model.
+All the steps and the new version number are one transaction, run with
+foreign keys off on that connection (or dropping the old table would
+delete every revision) and checked with `PRAGMA foreign_key_check` before
+it commits. An upgrade that is interrupted leaves the database at its old
+version, and the next start upgrades it again. A database written by a
+newer version is refused.
+
 ## Content-addressed storage
 
 Every file's bytes are stored once, under the SHA-256 of the content. A

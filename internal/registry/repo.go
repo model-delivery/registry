@@ -33,6 +33,70 @@ const (
 	KindTag    RefKind = "tag"
 )
 
+// RepoType is what kind of repository a repository is. It is part of a
+// repository's identity: a model and a dataset of the same name are two
+// repositories.
+type RepoType string
+
+// Repository types. The zero value means a model, as it does on the Hub.
+const (
+	TypeModel   RepoType = "model"
+	TypeDataset RepoType = "dataset"
+)
+
+// datasetKeyPrefix is how the key of a dataset begins: the segment the Hub
+// puts before a dataset's id in its URLs.
+const datasetKeyPrefix = "datasets/"
+
+// ParseRepoType reads a repository type as a request or a flag names it.
+// The empty string is a model.
+func ParseRepoType(s string) (RepoType, error) {
+	switch RepoType(s) {
+	case "", TypeModel:
+		return TypeModel, nil
+	case TypeDataset:
+		return TypeDataset, nil
+	}
+	return "", fmt.Errorf("%w: repository type must be model or dataset, not %q", ErrInvalid, s)
+}
+
+// IsZero reports whether t is a model, so that a document leaves the type
+// out for models (encoding/json's omitzero) and is unchanged for them.
+func (t RepoType) IsZero() bool { return t == "" || t == TypeModel }
+
+// OrModel is t, or TypeModel when t is empty.
+func (t RepoType) OrModel() RepoType {
+	if t == "" {
+		return TypeModel
+	}
+	return t
+}
+
+// RepoKey is how this package addresses a repository: the name of a model,
+// and "datasets/" and the name of a dataset. That is the path the Hub gives
+// each in its URLs, and it keeps a model and a dataset of the same name
+// apart. Every method that takes a repository name takes its key.
+//
+// name must be a valid repository name (ValidateRepoName); a name of more
+// than two segments would read as another key.
+func RepoKey(t RepoType, name string) string {
+	if t == TypeDataset {
+		return datasetKeyPrefix + name
+	}
+	return name
+}
+
+// SplitRepoKey is the inverse of RepoKey. A key of two segments is a model,
+// even one whose namespace is "datasets" (a model recorded before that
+// namespace was reserved); "datasets/" followed by two segments is a
+// dataset.
+func SplitRepoKey(key string) (RepoType, string) {
+	if rest, ok := strings.CutPrefix(key, datasetKeyPrefix); ok && strings.Count(rest, "/") == 1 {
+		return TypeDataset, rest
+	}
+	return TypeModel, key
+}
+
 // Limits on the names a revision records.
 const (
 	maxRefName = 200
@@ -43,14 +107,16 @@ var (
 	repoPart = `[A-Za-z0-9][A-Za-z0-9._-]{0,95}`
 	repoRe   = regexp.MustCompile(`^` + repoPart + `/` + repoPart + `$`)
 	shaRe    = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	// Top-level URL segments the server uses for itself.
-	reservedNamespaces = map[string]bool{"api": true, "ui": true, "static": true, "healthz": true, "metrics": true}
+	// Top-level URL segments the server uses for itself. "datasets" begins
+	// every dataset's address, as it does on the Hub.
+	reservedNamespaces = map[string]bool{"api": true, "ui": true, "static": true, "healthz": true, "metrics": true, "datasets": true}
 )
 
 // IsSHA reports whether s is a full revision id.
 func IsSHA(s string) bool { return shaRe.MatchString(s) }
 
-// ValidateRepoName checks a "namespace/name" identifier.
+// ValidateRepoName checks a "namespace/name" identifier, the name of a
+// repository of either type.
 func ValidateRepoName(name string) error {
 	if !repoRe.MatchString(name) || strings.Contains(name, "..") {
 		return fmt.Errorf("%w: repository must be namespace/name using letters, digits, '.', '_' or '-'", ErrInvalid)
@@ -59,6 +125,14 @@ func ValidateRepoName(name string) error {
 		return fmt.Errorf("%w: namespace %q is reserved", ErrInvalid, ns)
 	}
 	return nil
+}
+
+// ValidateRepoKey checks a repository key (RepoKey): the name it holds must
+// be valid. A model recorded in the "datasets" namespace before it was
+// reserved fails, so it can be read and deleted but not added to.
+func ValidateRepoKey(key string) error {
+	_, name := SplitRepoKey(key)
+	return ValidateRepoName(name)
 }
 
 // ValidateRefName checks a branch or tag name.
@@ -97,19 +171,26 @@ func ValidatePath(p string) error {
 	return nil
 }
 
-// Repo is a model repository.
+// Repo is a repository: a model or a dataset.
 type Repo struct {
-	ID        int64     `json:"-"`
-	Name      string    `json:"name"`
+	ID   int64  `json:"-"`
+	Name string `json:"name"`
+	// Type is absent from the document for a model.
+	Type      RepoType  `json:"type,omitzero"`
 	Upstream  string    `json:"upstream,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// Key is the repository's key (RepoKey).
+func (r Repo) Key() string { return RepoKey(r.Type, r.Name) }
+
 // Commit is one immutable revision of a repository.
 type Commit struct {
-	ID           int64     `json:"-"`
-	RepoID       int64     `json:"-"`
-	Repo         string    `json:"repo"`
+	ID     int64  `json:"-"`
+	RepoID int64  `json:"-"`
+	Repo   string `json:"repo"`
+	// RepoType is the type of Repo; absent from the document for a model.
+	RepoType     RepoType  `json:"repo_type,omitzero"`
 	SHA          string    `json:"sha"`
 	Parent       string    `json:"parent,omitempty"`
 	Message      string    `json:"message,omitempty"`
@@ -117,6 +198,9 @@ type Commit struct {
 	UpstreamInfo string    `json:"-"`
 	CreatedAt    time.Time `json:"created_at"`
 }
+
+// Key is the key (RepoKey) of the repository the revision belongs to.
+func (c Commit) Key() string { return RepoKey(c.RepoType, c.Repo) }
 
 // File is one file in a revision.
 type File struct {
@@ -158,14 +242,14 @@ func treeDigest(sorted []File) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-const commitCols = `SELECT c.id, c.repo_id, r.name, c.sha, c.parent, c.message, c.source, c.upstream_info, c.created_at
+const commitCols = `SELECT c.id, c.repo_id, r.name, r.type, c.sha, c.parent, c.message, c.source, c.upstream_info, c.created_at
 	FROM commits c JOIN repos r ON r.id = c.repo_id`
 
 type rowScanner interface{ Scan(...any) error }
 
 func scanCommit(row rowScanner, c *Commit) (bool, error) {
 	var created string
-	err := row.Scan(&c.ID, &c.RepoID, &c.Repo, &c.SHA, &c.Parent, &c.Message, &c.Source, &c.UpstreamInfo, &created)
+	err := row.Scan(&c.ID, &c.RepoID, &c.Repo, &c.RepoType, &c.SHA, &c.Parent, &c.Message, &c.Source, &c.UpstreamInfo, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -195,14 +279,15 @@ func queryFiles(ctx context.Context, q dbtx, commitID int64) ([]File, error) {
 	return out, rows.Err()
 }
 
-// GetRepo looks a repository up by name.
-func (r *Registry) GetRepo(ctx context.Context, name string) (Repo, error) {
+// GetRepo looks a repository up by its key (RepoKey).
+func (r *Registry) GetRepo(ctx context.Context, key string) (Repo, error) {
+	typ, name := SplitRepoKey(key)
 	var repo Repo
 	var created string
-	err := r.db.QueryRowContext(ctx, "SELECT id, name, upstream, created_at FROM repos WHERE name = ?", name).
-		Scan(&repo.ID, &repo.Name, &repo.Upstream, &created)
+	err := r.db.QueryRowContext(ctx, "SELECT id, name, type, upstream, created_at FROM repos WHERE type = ? AND name = ?", typ, name).
+		Scan(&repo.ID, &repo.Name, &repo.Type, &repo.Upstream, &created)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Repo{}, fmt.Errorf("%w: %s", ErrRepoNotFound, name)
+		return Repo{}, fmt.Errorf("%w: %s", ErrRepoNotFound, key)
 	}
 	if err != nil {
 		return Repo{}, err
@@ -306,7 +391,7 @@ type CommitSummary struct {
 
 // Commits lists a repository's revisions, newest first.
 func (r *Registry) Commits(ctx context.Context, repo Repo) ([]CommitSummary, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT c.id, c.repo_id, r.name, c.sha, c.parent, c.message, c.source, c.upstream_info, c.created_at,
+	rows, err := r.db.QueryContext(ctx, `SELECT c.id, c.repo_id, r.name, r.type, c.sha, c.parent, c.message, c.source, c.upstream_info, c.created_at,
 		(SELECT COUNT(*) FROM files f WHERE f.commit_id = c.id) + (SELECT COUNT(*) FROM pending_files p WHERE p.commit_id = c.id),
 		(SELECT COALESCE(SUM(size), 0) FROM files f WHERE f.commit_id = c.id) + (SELECT COALESCE(SUM(size), 0) FROM pending_files p WHERE p.commit_id = c.id)
 		FROM commits c JOIN repos r ON r.id = c.repo_id WHERE c.repo_id = ? ORDER BY c.id DESC`, repo.ID)
@@ -318,7 +403,7 @@ func (r *Registry) Commits(ctx context.Context, repo Repo) ([]CommitSummary, err
 	for rows.Next() {
 		var s CommitSummary
 		var created string
-		if err := rows.Scan(&s.ID, &s.RepoID, &s.Repo, &s.SHA, &s.Parent, &s.Message, &s.Source, &s.UpstreamInfo, &created, &s.Files, &s.Bytes); err != nil {
+		if err := rows.Scan(&s.ID, &s.RepoID, &s.Repo, &s.RepoType, &s.SHA, &s.Parent, &s.Message, &s.Source, &s.UpstreamInfo, &created, &s.Files, &s.Bytes); err != nil {
 			return nil, err
 		}
 		if s.CreatedAt, err = parseTime(created); err != nil {
@@ -338,13 +423,14 @@ type RepoSummary struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-// ListRepos returns every repository by name.
+// ListRepos returns every repository, models and datasets, by name, a model
+// before the dataset of the same name.
 //
 // The totals are computed for all repositories in one pass over the
 // revisions and one over the files, not once per repository: this listing
 // is what the home page and an anonymous API call run.
 func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT r.id, r.name, r.upstream, r.created_at,
+	rows, err := r.db.QueryContext(ctx, `SELECT r.id, r.name, r.type, r.upstream, r.created_at,
 		COALESCE(rev.n, 0), COALESCE(held.bytes, 0), COALESCE(rev.latest, r.created_at)
 		FROM repos r
 		LEFT JOIN (SELECT repo_id, COUNT(*) AS n, MAX(created_at) AS latest FROM commits GROUP BY repo_id) rev
@@ -353,7 +439,7 @@ func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
 			FROM (SELECT DISTINCT c.repo_id, f.sha256 FROM files f JOIN commits c ON c.id = f.commit_id) d
 			JOIN blobs b ON b.sha256 = d.sha256 GROUP BY d.repo_id) held
 			ON held.repo_id = r.id
-		ORDER BY r.name`)
+		ORDER BY r.name, r.type = 'dataset'`)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +448,7 @@ func (r *Registry) ListRepos(ctx context.Context) ([]RepoSummary, error) {
 	for rows.Next() {
 		var s RepoSummary
 		var created, updated string
-		if err := rows.Scan(&s.ID, &s.Name, &s.Upstream, &created, &s.Revisions, &s.StoredBytes, &updated); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Type, &s.Upstream, &created, &s.Revisions, &s.StoredBytes, &updated); err != nil {
 			return nil, err
 		}
 		if s.CreatedAt, err = parseTime(created); err != nil {
@@ -415,14 +501,16 @@ func (r *Registry) DeleteRepo(ctx context.Context, name string) (GCResult, error
 	return r.dropUnreferenced(ctx, digests, r.stamp(), true)
 }
 
-// CreateRepo records an empty repository, so it exists before its first
-// revision. It reports whether the repository was created by this call.
-func (r *Registry) CreateRepo(ctx context.Context, name string) (bool, error) {
-	if err := ValidateRepoName(name); err != nil {
+// CreateRepo records an empty repository, named by its key, so it exists
+// before its first revision. It reports whether the repository was created
+// by this call.
+func (r *Registry) CreateRepo(ctx context.Context, key string) (bool, error) {
+	if err := ValidateRepoKey(key); err != nil {
 		return false, err
 	}
+	typ, name := SplitRepoKey(key)
 	res, err := r.db.ExecContext(ctx,
-		"INSERT INTO repos (name, upstream, created_at) VALUES (?, '', ?) ON CONFLICT (name) DO NOTHING", name, r.stamp())
+		"INSERT INTO repos (type, name, upstream, created_at) VALUES (?, ?, '', ?) ON CONFLICT (type, name) DO NOTHING", typ, name, r.stamp())
 	if err != nil {
 		return false, err
 	}

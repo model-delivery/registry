@@ -229,8 +229,8 @@ func TestUpgradeFromSchemaVersion1(t *testing.T) {
 	}
 	defer func() { _ = r.Close() }()
 	var v int
-	if err := r.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil || v != 2 {
-		t.Fatalf("schema version = %d (%v), want 2", v, err)
+	if err := r.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil || v != schemaVersion {
+		t.Fatalf("schema version = %d (%v), want %d", v, err, schemaVersion)
 	}
 	c, err := r.Resolve(ctx, "acme/old", "main")
 	if err != nil {

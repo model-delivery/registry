@@ -92,6 +92,18 @@ are exercised), `task build`, `task docker`.
   removed is counted as freed.
 - **All SQL stays in `internal/registry`.** That is what keeps a second
   metadata backend a contained change.
+- **A repository's type is part of its identity.** A model and a dataset
+  of the same name are two repositories. `internal/registry` addresses a
+  repository by its key (`registry.RepoKey`: `ns/name`, or
+  `datasets/ns/name`); every query on `repos` names both the type and the
+  name. Outside it, a type travels as `registry.RepoType`, never a bare
+  string, and models and datasets go through the same code with the type
+  as a parameter: no second copy of a route, handler or command for
+  datasets.
+- **A schema change is one more migration step** (`migrate` in
+  `registry.go`), run in the same transaction as the others and the new
+  version number, and it gets a test that opens a database written in the
+  previous layout (`TestUpgradeFromSchemaVersion2` is the pattern).
 - **Revisions are immutable.** A revision's id and what it lists (each
   path with its size and digest) never change; new content is a new
   revision; only refs move, and tags never move. Never update or delete a

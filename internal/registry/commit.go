@@ -28,6 +28,8 @@ type dbtx interface {
 
 // CommitInput describes a revision to record.
 type CommitInput struct {
+	// Repo is the repository's key (RepoKey): its name, with "datasets/"
+	// before it for a dataset.
 	Repo string
 	// Branch to move to the new revision. Empty records the revision only.
 	Branch string
@@ -58,7 +60,7 @@ type CommitInput struct {
 
 // validate checks the names in the input, before anything is read.
 func (in *CommitInput) validate() error {
-	if err := ValidateRepoName(in.Repo); err != nil {
+	if err := ValidateRepoKey(in.Repo); err != nil {
 		return err
 	}
 	if err := validateTarget(in.Branch, in.Tags); err != nil {
@@ -107,7 +109,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 	defer func() { _ = tx.Rollback() }()
 	at, now := r.clock()
 
-	repoID, err := upsertRepo(ctx, tx, repoUpsert{name: in.Repo, upstream: in.Upstream, now: now})
+	repoID, err := upsertRepo(ctx, tx, repoUpsert{key: in.Repo, upstream: in.Upstream, now: now})
 	if err != nil {
 		return Commit{}, err
 	}
@@ -128,8 +130,9 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 	}
 	tree := treeDigest(files)
 
-	c := Commit{RepoID: repoID, Repo: in.Repo, Parent: parent.sha, Message: in.Message, Source: in.Source,
+	c := Commit{RepoID: repoID, Parent: parent.sha, Message: in.Message, Source: in.Source,
 		UpstreamInfo: in.UpstreamInfo, CreatedAt: at}
+	c.RepoType, c.Repo = SplitRepoKey(in.Repo)
 	c.SHA = in.SHA
 	switch {
 	case c.SHA == "" && parent.id != 0 && tree == parent.tree:
@@ -160,7 +163,7 @@ func (r *Registry) Commit(ctx context.Context, in CommitInput) (Commit, error) {
 
 // repoUpsert is what upsertRepo needs to know.
 type repoUpsert struct {
-	name string
+	key string // RepoKey
 	// upstream, when set, is recorded as where the repository comes from.
 	upstream string
 	// onlyFromUpstream refuses, with ErrLocalRepo, a repository that exists
@@ -174,10 +177,11 @@ type repoUpsert struct {
 func upsertRepo(ctx context.Context, tx dbtx, in repoUpsert) (int64, error) {
 	var id int64
 	var held string
-	err := tx.QueryRowContext(ctx, "SELECT id, upstream FROM repos WHERE name = ?", in.name).Scan(&id, &held)
+	typ, name := SplitRepoKey(in.key)
+	err := tx.QueryRowContext(ctx, "SELECT id, upstream FROM repos WHERE type = ? AND name = ?", typ, name).Scan(&id, &held)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := tx.ExecContext(ctx, "INSERT INTO repos (name, upstream, created_at) VALUES (?, ?, ?)", in.name, in.upstream, in.now)
+		res, err := tx.ExecContext(ctx, "INSERT INTO repos (type, name, upstream, created_at) VALUES (?, ?, ?, ?)", typ, name, in.upstream, in.now)
 		if err != nil {
 			return 0, err
 		}
@@ -187,7 +191,7 @@ func upsertRepo(ctx context.Context, tx dbtx, in repoUpsert) (int64, error) {
 	case in.onlyFromUpstream && held == "":
 		// Checked inside the transaction, so a repository created by a push
 		// between the caller's lookup and this one is still left alone.
-		return 0, fmt.Errorf("%w: %s", ErrLocalRepo, in.name)
+		return 0, fmt.Errorf("%w: %s", ErrLocalRepo, in.key)
 	case in.upstream != "":
 		if _, err := tx.ExecContext(ctx, "UPDATE repos SET upstream = ? WHERE id = ?", in.upstream, id); err != nil {
 			return 0, err

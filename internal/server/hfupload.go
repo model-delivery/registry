@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -330,7 +331,7 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 		if errors.As(err, new(*http.MaxBytesError)) {
 			hfError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 				"the commit is larger than %s in total: split the upload into several commits (upload_large_folder does), or send the larger files through the large-file upload, which this limit does not count",
-				humanBytes(s.maxCommitBytes())))
+				kit.HumanBytes(s.maxCommitBytes())))
 			return
 		}
 		if errors.Is(err, errLineTooLong) {

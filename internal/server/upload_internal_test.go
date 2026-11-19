@@ -5,8 +5,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -35,8 +34,7 @@ func TestSignedUploadEnforcesTheSizeLimit(t *testing.T) {
 	s := &Server{reg: reg, cfg: Config{MaxBlobBytes: 100}, log: slog.New(slog.DiscardHandler), uploadKey: newUploadKey()}
 
 	content := strings.Repeat("x", 101)
-	sum := sha256.Sum256([]byte(content))
-	oid := hex.EncodeToString(sum[:])
+	oid := kit.SHA256Hex(content)
 	expires := time.Now().Add(time.Hour).Unix()
 	target := fmt.Sprintf("/api/lfs/upload/%s?size=%d&expires=%d&token=ci&signature=%s", oid, len(content), expires, s.signUpload(oid, int64(len(content)), expires, "ci"))
 	req := httptest.NewRequest(http.MethodPut, target, strings.NewReader(content))

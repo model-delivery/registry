@@ -11,10 +11,10 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -29,27 +29,18 @@ func staticFS() fs.FS {
 	return sub
 }
 
-// shortSHALen is how much of a revision id the pages show.
-const shortSHALen = 12
-
 var uiFuncs = template.FuncMap{
-	"bytes":   humanBytes,
-	"short":   func(s string) string { return s[:min(len(s), shortSHALen)] },
+	"bytes":   kit.HumanBytes,
+	"short":   kit.Short,
 	"date":    func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04 UTC") },
-	"repoURL": func(name string) string { return "/ui/repo/" + escapeRepo(name) },
+	"repoURL": repoPage,
 	"fileURL": func(repo, sha, p string) string {
-		segs := strings.Split(p, "/")
-		for i, s := range segs {
-			segs[i] = url.PathEscape(s)
-		}
-		return "/" + escapeRepo(repo) + "/resolve/" + sha + "/" + strings.Join(segs, "/")
+		return "/" + kit.EscapePath(repo) + "/resolve/" + sha + "/" + kit.EscapePath(p)
 	},
 }
 
-func escapeRepo(name string) string {
-	ns, n, _ := strings.Cut(name, "/")
-	return url.PathEscape(ns) + "/" + url.PathEscape(n)
-}
+// repoPage is the address of a repository's page in the web UI.
+func repoPage(name string) string { return "/ui/repo/" + kit.EscapePath(name) }
 
 var uiPages = func() map[string]*template.Template {
 	out := map[string]*template.Template{}
@@ -59,19 +50,6 @@ var uiPages = func() map[string]*template.Template {
 	}
 	return out
 }()
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}
 
 // ago says how long before now t was, in words.
 func ago(now, t time.Time) string {
@@ -218,7 +196,7 @@ func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	name := repoParam(r)
 	// Typing the name guards against deleting the wrong repository.
 	if s.formValue(w, r, "confirm") != name {
-		http.Redirect(w, r, "/ui/repo/"+escapeRepo(name)+"?notice="+noticeNotDeleted, http.StatusSeeOther)
+		http.Redirect(w, r, repoPage(name)+"?notice="+noticeNotDeleted, http.StatusSeeOther)
 		return
 	}
 	res, err := s.reg.DeleteRepo(r.Context(), name)

@@ -18,6 +18,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // DefaultEndpoint is the hub mirrored from unless configured otherwise.
@@ -345,11 +347,7 @@ func (u *Upstream) tree(ctx context.Context, repo, sha string) ([]Entry, error) 
 // open streams a file's content. If the connection drops part-way the
 // returned reader reconnects and continues from where it stopped.
 func (u *Upstream) open(ctx context.Context, repo, sha, path string) io.ReadCloser {
-	segs := strings.Split(path, "/")
-	for i, s := range segs {
-		segs[i] = url.PathEscape(s)
-	}
-	fileURL := u.endpoint() + "/" + repo + "/resolve/" + sha + "/" + strings.Join(segs, "/")
+	fileURL := u.endpoint() + "/" + repo + "/resolve/" + sha + "/" + kit.EscapePath(path)
 	return &resumeReader{ctx: ctx, open: func(offset int64) (io.ReadCloser, error) {
 		h := http.Header{"Accept-Encoding": {"identity"}}
 		if offset > 0 {

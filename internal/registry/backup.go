@@ -16,6 +16,7 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/datadir"
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // Backups protect the metadata database: the only record of which stored
@@ -380,42 +381,28 @@ func fetchBackup(ctx context.Context, from blob.Archive, name, path string) (str
 		return "", err
 	}
 	defer func() { _ = rc.Close() }()
-	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // a path the caller chose.
-	if err != nil {
+	if _, err := kit.WriteNewFile(path, rc); err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(out, rc); err != nil {
-		_ = out.Close()
-		_ = os.Remove(path)
-		return "", err
-	}
-	return name, out.Close()
+	return name, nil
 }
 
+// restoringSuffix names the file a snapshot is copied into before it takes
+// the database's place. The name is fixed, so what an interrupted restore
+// left is overwritten by the next one.
+const restoringSuffix = ".restoring"
+
+// copyFile puts a copy of src at dst, which holds all of it or is untouched.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src) //nolint:gosec // a snapshot path the operator named.
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	tmp := dst + ".restoring"
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // inside the data directory.
+	out, err := os.OpenFile(dst+restoringSuffix, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // inside the data directory.
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, dst)
+	_, err = kit.InstallFile(out, dst, in)
+	return err
 }

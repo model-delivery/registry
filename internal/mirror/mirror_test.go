@@ -6,7 +6,6 @@ package mirror
 import (
 	"context"
 	"crypto/sha1" //nolint:gosec // git blob ids are SHA-1 by definition.
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -86,15 +86,10 @@ func (h *hub) listing() []map[string]any {
 	for i, p := range paths {
 		out[i] = map[string]any{"type": "file", "path": p, "size": len(h.files[p]), "oid": gitBlobID(h.files[p])}
 		if h.lfs[p] {
-			out[i]["lfs"] = map[string]any{"oid": sha256Hex(h.files[p]), "size": len(h.files[p])}
+			out[i]["lfs"] = map[string]any{"oid": kit.SHA256Hex(h.files[p]), "size": len(h.files[p])}
 		}
 	}
 	return out
-}
-
-func sha256Hex(content string) string {
-	sum := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(sum[:])
 }
 
 func openRegistry(t *testing.T) *registry.Registry {

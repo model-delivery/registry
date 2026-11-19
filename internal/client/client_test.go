@@ -5,8 +5,6 @@ package client
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,17 +13,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // The server package tests the client against a real registry. These tests
 // use a registry that misbehaves, which a real one cannot be made to do.
 
 const revisionID = "2222222222222222222222222222222222222222"
-
-func digestOf(content string) string {
-	sum := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(sum[:])
-}
 
 // lyingRegistry lists one file of acme/tiny as listed describes it, and
 // answers a download of it by calling send.
@@ -82,7 +77,7 @@ func TestPullStopsAtTheListedSize(t *testing.T) {
 	t.Run("a registry that sends more than it listed is cut off", func(t *testing.T) {
 		t.Parallel()
 		var sent atomic.Int64
-		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: digestOf(content), LFS: true}, endless(&sent))
+		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: kit.SHA256Hex(content), LFS: true}, endless(&sent))
 		dir := t.TempDir()
 		_, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil)
 		if err == nil || !strings.Contains(err.Error(), "more data than the size it lists") || !strings.Contains(err.Error(), "model.bin") {
@@ -100,7 +95,7 @@ func TestPullStopsAtTheListedSize(t *testing.T) {
 	t.Run("also when resuming a partial download", func(t *testing.T) {
 		t.Parallel()
 		var sent atomic.Int64
-		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: digestOf(content), LFS: true},
+		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: kit.SHA256Hex(content), LFS: true},
 			func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusPartialContent)
 				endless(&sent)(w, r)
@@ -132,7 +127,7 @@ func TestPullStopsAtTheListedSize(t *testing.T) {
 
 	t.Run("exactly the listed size is accepted", func(t *testing.T) {
 		t.Parallel()
-		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: digestOf(content), LFS: true},
+		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: kit.SHA256Hex(content), LFS: true},
 			func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(content)) })
 		dir := t.TempDir()
 		if _, err := cl.Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
@@ -145,7 +140,7 @@ func TestPullStopsAtTheListedSize(t *testing.T) {
 
 	t.Run("fewer bytes than listed still fails the integrity check", func(t *testing.T) {
 		t.Parallel()
-		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: digestOf(content), LFS: true},
+		cl := lyingRegistry(t, File{Path: "model.bin", Size: int64(len(content)), SHA256: kit.SHA256Hex(content), LFS: true},
 			func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(content[:5])) })
 		if _, err := cl.Pull(ctx, "acme/tiny", "main", t.TempDir(), nil); err == nil || !strings.Contains(err.Error(), "integrity check failed") {
 			t.Fatalf("got %v", err)

@@ -5,8 +5,6 @@ package registry
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // A push stores its files, or is told they are already stored, and then
@@ -137,11 +136,6 @@ func TestDeleteRepoSparesBlobsAWriterIsAboutToReference(t *testing.T) {
 			t.Fatalf("gc after the grace period removed %+v, %v; want the spared file", res, err)
 		}
 	})
-}
-
-func sha256Of(content string) string {
-	sum := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(sum[:])
 }
 
 // stuckStore is a store that cannot remove the blobs it is told to.
@@ -374,7 +368,7 @@ func TestRemovalRacingAPushOfTheSameDigest(t *testing.T) {
 					}
 					digest = info.SHA256
 				} else {
-					info, ok, err := r.TouchBlob(ctx, sha256Of(content))
+					info, ok, err := r.TouchBlob(ctx, kit.SHA256Hex(content))
 					if err != nil {
 						t.Errorf("round %d: ask: %v", i, err)
 						return

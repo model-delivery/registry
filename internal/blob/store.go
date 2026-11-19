@@ -8,7 +8,6 @@ package blob
 
 import (
 	"context"
-	"crypto/sha1" //nolint:gosec // git blob ids are SHA-1 by definition; integrity rests on SHA-256.
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/datadir"
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // ErrMismatch reports that received bytes did not match what was expected.
@@ -216,7 +216,7 @@ func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (pat
 	if want.Size >= 0 {
 		// The git blob id covers a header naming the length, so it can only be
 		// computed in the same pass when the length is known up front.
-		hGit = gitHasher(want.Size)
+		hGit = kit.GitBlobHasher(want.Size)
 		writers = append(writers, hGit)
 		src = io.LimitReader(r, want.Size+1)
 	}
@@ -231,7 +231,7 @@ func stageToFile(ctx context.Context, dir string, r io.Reader, want Expect) (pat
 		return path, Info{}, fmt.Errorf("flush blob: %w", err)
 	}
 	if hGit == nil {
-		hGit = gitHasher(n)
+		hGit = kit.GitBlobHasher(n)
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			return path, Info{}, fmt.Errorf("rewind blob: %w", err)
 		}
@@ -291,13 +291,6 @@ func (s *FS) Delete(_ context.Context, digest string) error {
 		return fmt.Errorf("fs: delete %s: %w", digest, err)
 	}
 	return nil
-}
-
-// gitHasher returns a SHA-1 primed with the git blob header for size bytes.
-func gitHasher(size int64) hash.Hash {
-	h := sha1.New() //nolint:gosec // see import note.
-	fmt.Fprintf(h, "blob %d\x00", size)
-	return h
 }
 
 // ctxReader stops a long copy when its context ends.

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
+
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // Archive keeps metadata backups next to the blobs: in the data directory
@@ -89,19 +91,8 @@ func (s *FS) putArchive(name, localPath string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := io.Copy(tmp, src); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), s.archivePath(name))
+	_, err = kit.InstallFile(tmp, s.archivePath(name), src)
+	return err
 }
 
 // ListArchives lists stored backups, oldest first.

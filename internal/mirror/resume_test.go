@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -150,7 +151,7 @@ func TestDownloadResumesAfterADroppedConnection(t *testing.T) {
 		if err != nil || res.DownloadedBytes != int64(len(content)) {
 			t.Fatalf("mirror = %+v, %v", res, err)
 		}
-		rc, size, err := reg.OpenBlob(ctx, sha256Hex(content))
+		rc, size, err := reg.OpenBlob(ctx, kit.SHA256Hex(content))
 		if err != nil || size != int64(len(content)) {
 			t.Fatalf("stored blob: %d bytes, %v", size, err)
 		}
@@ -281,8 +282,8 @@ func TestTreeFollowsEveryPageOfAListing(t *testing.T) {
 			// For an LFS file the entry's own size and oid are the pointer's;
 			// the content's are under "lfs".
 			all = append(all, entry{"type": "file", "path": path, "oid": strings.Repeat("a", 40), "size": 130,
-				"lfs": entry{"oid": sha256Hex(content), "size": len(content)}})
-			want = append(want, Entry{Path: path, Size: int64(len(content)), OID: strings.Repeat("a", 40), LFSSHA256: sha256Hex(content)})
+				"lfs": entry{"oid": kit.SHA256Hex(content), "size": len(content)}})
+			want = append(want, Entry{Path: path, Size: int64(len(content)), OID: strings.Repeat("a", 40), LFSSHA256: kit.SHA256Hex(content)})
 		}
 	}
 
@@ -353,7 +354,7 @@ func TestTreeFollowsEveryPageOfAListing(t *testing.T) {
 	}
 	for _, e := range want {
 		f, ok := byPath[e.Path]
-		if !ok || f.Size != e.Size || f.SHA256 != sha256Hex(files[e.Path]) || f.LFS != (e.LFSSHA256 != "") {
+		if !ok || f.Size != e.Size || f.SHA256 != kit.SHA256Hex(files[e.Path]) || f.LFS != (e.LFSSHA256 != "") {
 			t.Errorf("%s recorded as %+v (found %v)", e.Path, f, ok)
 		}
 	}

@@ -237,7 +237,7 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 2 && r.Method == http.MethodGet:
 		// A hub-style link. It only points at the repository page, which is
 		// gated, and says nothing about whether the repository exists.
-		http.Redirect(w, r, "/ui/repo/"+url.PathEscape(segs[0])+"/"+url.PathEscape(segs[1]), http.StatusFound)
+		http.Redirect(w, r, "/ui/repo/"+url.PathEscape(segs[0])+"/"+url.PathEscape(segs[1]), http.StatusFound) // each segment may itself hold an encoded slash
 	default:
 		http.NotFound(w, r)
 	}

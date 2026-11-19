@@ -9,7 +9,6 @@ package registry
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/datadir"
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // Errors callers can match with errors.Is.
@@ -618,8 +618,7 @@ type Token struct {
 }
 
 func hashToken(secret string) string {
-	sum := sha256.Sum256([]byte(secret))
-	return hex.EncodeToString(sum[:])
+	return kit.SHA256Hex(secret)
 }
 
 // CreateToken mints a token and returns its secret, which is shown once.

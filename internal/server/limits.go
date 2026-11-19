@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // Bounds on what a request may send. File transfers have no time limit and,
@@ -175,5 +177,5 @@ func (s *Server) blobTooLarge(size int64) (bool, error) {
 func (s *Server) blobLimitError() error {
 	return errTooLarge{fmt.Sprintf(
 		"this file is larger than the %s this registry accepts in one file (REGISTRY_MAX_BLOB_BYTES is %d): ask the registry's operator to raise that setting",
-		humanBytes(s.cfg.MaxBlobBytes), s.cfg.MaxBlobBytes)}
+		kit.HumanBytes(s.cfg.MaxBlobBytes), s.cfg.MaxBlobBytes)}
 }

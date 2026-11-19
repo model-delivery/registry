@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
 )
@@ -71,7 +72,7 @@ type errFileTooLarge struct {
 
 func (e errFileTooLarge) Error() string {
 	return fmt.Sprintf("%s is %s, more than this registry fetches on demand (REGISTRY_PULL_THROUGH_MAX_FILE_BYTES is %d): "+
-		"raise that setting, or fetch the file ahead of time with `modelctl mirror %s`", e.path, humanBytes(e.size), e.limit, e.repo)
+		"raise that setting, or fetch the file ahead of time with `modelctl mirror %s`", e.path, kit.HumanBytes(e.size), e.limit, e.repo)
 }
 
 const (

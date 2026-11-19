@@ -24,12 +24,8 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/blob/blobtest"
+	"github.com/model-delivery/registry/internal/kit"
 )
-
-func digest(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
 
 // Known git blob ids, from `git hash-object`.
 const (
@@ -150,10 +146,10 @@ func TestStageVerifies(t *testing.T) {
 		wantErr bool
 	}{
 		{"no expectations", hello, blob.Expect{Size: -1}, false},
-		{"all correct", hello, blob.Expect{SHA256: digest(hello), GitOID: gitOIDHello, Size: 6}, false},
+		{"all correct", hello, blob.Expect{SHA256: kit.SHA256Hex(hello), GitOID: gitOIDHello, Size: 6}, false},
 		{"git id checked without a known size", hello, blob.Expect{GitOID: gitOIDHello, Size: -1}, false},
 		{"empty file", nil, blob.Expect{GitOID: gitOIDEmpty, Size: 0}, false},
-		{"wrong sha256", hello, blob.Expect{SHA256: digest([]byte("other")), Size: -1}, true},
+		{"wrong sha256", hello, blob.Expect{SHA256: kit.SHA256Hex([]byte("other")), Size: -1}, true},
 		{"wrong git id", hello, blob.Expect{GitOID: gitOIDEmpty, Size: -1}, true},
 		{"shorter than declared", hello, blob.Expect{Size: 7}, true},
 		{"longer than declared", hello, blob.Expect{Size: 5}, true},
@@ -170,7 +166,7 @@ func TestStageVerifies(t *testing.T) {
 					if n := stagedFiles(t, staging); n != 0 {
 						t.Fatalf("rejected upload left %d staging files", n)
 					}
-					if _, _, err := store.Open(ctx, digest(tc.data)); !errors.Is(err, blob.ErrNotFound) {
+					if _, _, err := store.Open(ctx, kit.SHA256Hex(tc.data)); !errors.Is(err, blob.ErrNotFound) {
 						t.Fatalf("rejected upload is readable: %v", err)
 					}
 					return
@@ -180,7 +176,7 @@ func TestStageVerifies(t *testing.T) {
 				}
 				defer st.Discard()
 				info := st.Info()
-				if info.SHA256 != digest(tc.data) || info.Size != int64(len(tc.data)) {
+				if info.SHA256 != kit.SHA256Hex(tc.data) || info.Size != int64(len(tc.data)) {
 					t.Fatalf("info = %+v", info)
 				}
 				// Not visible until published.
@@ -217,7 +213,7 @@ func TestOpenReportsSizeAndSeeks(t *testing.T) {
 		if err := st.Publish(ctx); err != nil {
 			t.Fatal(err)
 		}
-		f, size, err := store.Open(ctx, digest(data))
+		f, size, err := store.Open(ctx, kit.SHA256Hex(data))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,7 +314,7 @@ func TestConcurrentIdenticalUploadsStoreOneCopy(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				st, err := store.Stage(ctx, bytes.NewReader(data), blob.Expect{SHA256: digest(data), Size: int64(len(data))})
+				st, err := store.Stage(ctx, bytes.NewReader(data), blob.Expect{SHA256: kit.SHA256Hex(data), Size: int64(len(data))})
 				if err == nil {
 					err = st.Publish(ctx)
 				}
@@ -335,7 +331,7 @@ func TestConcurrentIdenticalUploadsStoreOneCopy(t *testing.T) {
 		if n := stagedFiles(t, staging); n != 0 {
 			t.Fatalf("%d staging files left after identical uploads", n)
 		}
-		if got := readAll(t, store, digest(data)); !bytes.Equal(got, data) {
+		if got := readAll(t, store, kit.SHA256Hex(data)); !bytes.Equal(got, data) {
 			t.Fatal("stored copy differs from the upload")
 		}
 	})
@@ -360,7 +356,7 @@ func TestDelete(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	eachBackend(t, func(t *testing.T, store blob.Store, _ string) {
-		if err := store.Delete(ctx, digest([]byte("never stored"))); err != nil {
+		if err := store.Delete(ctx, kit.SHA256Hex([]byte("never stored"))); err != nil {
 			t.Fatalf("deleting an absent blob: %v", err)
 		}
 		data := []byte("to be removed")
@@ -371,10 +367,10 @@ func TestDelete(t *testing.T) {
 		if err := st.Publish(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.Delete(ctx, digest(data)); err != nil {
+		if err := store.Delete(ctx, kit.SHA256Hex(data)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := store.Open(ctx, digest(data)); !errors.Is(err, blob.ErrNotFound) {
+		if _, _, err := store.Open(ctx, kit.SHA256Hex(data)); !errors.Is(err, blob.ErrNotFound) {
 			t.Fatalf("deleted blob is still readable: %v", err)
 		}
 	})
@@ -418,7 +414,7 @@ func TestCheck(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	data := []byte(strings.Repeat("model weights ", 20000)) // larger than one read
-	d := digest(data)
+	d := kit.SHA256Hex(data)
 	size := int64(len(data))
 
 	for _, b := range damageables {
@@ -456,7 +452,7 @@ func TestCheck(t *testing.T) {
 			flipped[len(flipped)/2] ^= 0x01
 			overwrite(d, flipped)
 			err := blob.Check(ctx, store, d, size)
-			if !errors.Is(err, blob.ErrMismatch) || !strings.Contains(err.Error(), digest(flipped)) {
+			if !errors.Is(err, blob.ErrMismatch) || !strings.Contains(err.Error(), kit.SHA256Hex(flipped)) {
 				t.Fatalf("a blob with one byte changed: %v, want ErrMismatch naming what it hashes to now", err)
 			}
 			// Cut short.
@@ -546,7 +542,7 @@ func TestFilesystemStoresBlobsByDigest(t *testing.T) {
 	if err := st.Publish(ctx); err != nil {
 		t.Fatal(err)
 	}
-	d := digest(data)
+	d := kit.SHA256Hex(data)
 	if _, err := os.Stat(filepath.Join(root, "blobs", "sha256", d[:2], d)); err != nil {
 		t.Fatalf("blob is not at its digest path: %v", err)
 	}
@@ -569,7 +565,7 @@ func TestS3StoresObjectsByDigestUnderPrefix(t *testing.T) {
 	if err := st.Publish(ctx); err != nil {
 		t.Fatal(err)
 	}
-	d := digest(data)
+	d := kit.SHA256Hex(data)
 	want := "registry/sha256/" + d[:2] + "/" + d
 	if keys := fake.Keys(t); len(keys) != 1 || keys[0] != want {
 		t.Fatalf("bucket keys = %v, want [%s]", keys, want)
@@ -588,7 +584,7 @@ func TestS3PresignedURLDownloadsWithoutCredentials(t *testing.T) {
 	if err := st.Publish(ctx); err != nil {
 		t.Fatal(err)
 	}
-	u, err := store.PresignGet(ctx, digest(data), time.Minute)
+	u, err := store.PresignGet(ctx, kit.SHA256Hex(data), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

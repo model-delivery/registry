@@ -248,7 +248,7 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	// token comes back as a proper HTTP error.
 	plan, err := mirror.Prepare(r.Context(), up, req.Repo, req.Revision)
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, upstreamFailure(err))
 		return
 	}
 
@@ -283,6 +283,20 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("mirror complete", "repo", res.Repo, "sha", res.SHA, "files", res.Files,
 		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", s.now().Sub(started).Round(time.Millisecond))
+}
+
+// upstreamFailure marks a failure to reach or read the upstream, of a kind
+// that has no status of its own (it could not be reached, it answered with
+// an error, its answer made no sense), so that a mirror request answers it
+// as pull-through does: 502 with the reason. An error that already has a
+// status (not found upstream, access denied, a bad name in the request)
+// keeps it, and a failure that is not the upstream's stays the registry's
+// own.
+func upstreamFailure(err error) error {
+	if status, _ := statusFor(err); status == http.StatusInternalServerError && mirror.FromUpstream(err) {
+		return errUpstream{err}
+	}
+	return err
 }
 
 // mirrorFailure logs why a mirror failed and returns what its client is

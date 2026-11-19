@@ -46,16 +46,14 @@ export T=md_your_token
 | `409` | The request conflicts with what is recorded: a tag that already names another revision, a branch name that is a tag, a token name that is taken, or a commit onto a branch whose revision still has files that were never fetched (see `pending` below). Nothing is changed. |
 | `413` | A file larger than `REGISTRY_MAX_BLOB_BYTES`. |
 | `500` | The registry itself failed, for example its disk or database. The body says only `internal error`; the server's log has the reason. |
-| `502` | The upstream hub is at fault. Mirroring answers this when the upstream denies access or redirects somewhere the registry does not follow. Looking up a revision with pull-through on answers it for any upstream failure: unreachable, an error answer, access denied. The body says which. |
+| `502` | The upstream hub is at fault: it cannot be reached, it answered with an error or with something that is not a hub's answer, it denies access, or it redirects somewhere the registry does not follow. Mirroring answers this, and so does looking up a revision with pull-through on. The body says which. |
 | `503` | The registry is fetching as much from the upstream as it will at once, or is shutting down. `Retry-After` says when to try again. |
 
-A failure of the registry's own while it fetches from the upstream is a
-`500`, not a `502`: before v0.3.1 both were reported as `502`.
-
-One case is not what the table suggests: a mirror request whose upstream
-cannot be reached at all, or answers with a server error, is `500` with
-`internal error`, where a pull-through lookup in the same situation is
-`502` with the reason.
+Two of these changed in v0.3.1. A failure of the registry's own while it
+fetches from the upstream is a `500`; before, it was reported as `502`. A
+mirror request whose upstream cannot be reached, or answers with a server
+error, is a `502` with the reason; before, it was `500` with
+`internal error`.
 
 ## Repositories
 
@@ -188,10 +186,10 @@ curl -N -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json
 | `revision` | Branch, tag or revision id. Default `main`. |
 | `upstream_token` | Token for the upstream hub, for private or gated repositories. Used for this request only and not stored. |
 
-If the upstream refuses, the response is an ordinary error: `404` for a
-repository or revision it does not have, `502` when it denies access (see
-[Statuses](#statuses) for an upstream that cannot be reached). Otherwise it
-is `200` with a stream of JSON lines:
+If the upstream cannot provide the revision, the response is an ordinary
+error: `404` for a repository or revision it does not have, `502` when it
+denies access, cannot be reached or answers with an error. Otherwise it is
+`200` with a stream of JSON lines:
 
 ```json
 {"event":"start","repo":"hf-internal-testing/tiny-random-bert","sha":"f171d7baecaf37b5da5a3616d8833b9969753535","files":10,"bytes":28183891}

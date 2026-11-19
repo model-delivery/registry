@@ -536,11 +536,17 @@ func (r *Registry) dropUnreferenced(ctx context.Context, digests []string, cutof
 			return nil
 		}()
 		if err != nil && firstErr == nil {
-			firstErr = err
+			firstErr = fmt.Errorf("%w: %w", ErrBlobsNotFreed, err)
 		}
 	}
 	return res, firstErr
 }
+
+// ErrBlobsNotFreed reports that an operation was carried out and that
+// some of the blobs it left unreferenced could not then be removed. The
+// result returned with it stands: for DeleteRepo, the repository is
+// deleted. What is left behind is wasted space, never a dangling reference.
+var ErrBlobsNotFreed = errors.New("some stored files could not be removed")
 
 // forget removes the record of a blob that is unreferenced and not newer
 // than cutoff, and returns its size. The check is part of the statement

@@ -17,7 +17,7 @@ on:
   workflow_call:
     inputs:
       mirror-from-huggingface:
-        description: Also mirror a real model from huggingface.co. Off for pull requests, so an outage there cannot fail someone's unrelated change.
+        description: Also mirror a real model and real datasets from huggingface.co. Off for pull requests, so an outage there cannot fail someone's unrelated change.
         type: boolean
         default: false
 
@@ -98,11 +98,13 @@ jobs:
       - run: pip install huggingface_hub datasets
       - name: The real client against the registry (no network)
         run: go test -tags=integration -count=1 -v ./test/e2e/
-      - name: Mirror a real model from huggingface.co, and pull one file through
+      # The dataset tests read two datasets of under 1 MB each, from
+      # huggingface.co and through the registry, in about 40 seconds.
+      - name: Mirror a real model and real datasets from huggingface.co, and pull through
         if: inputs.mirror-from-huggingface
         env:
           REGISTRY_E2E_NETWORK: "1"
-        run: go test -tags=integration -count=1 -v -run 'TestMirrorFromHuggingFace|TestPullThroughOneFileFromHuggingFace' ./test/e2e/
+        run: go test -tags=integration -count=1 -v -run 'TestMirrorFromHuggingFace|TestPullThroughOneFileFromHuggingFace|TestMirrorDatasetFromHuggingFace|TestPullThroughDatasetFromHuggingFace' ./test/e2e/
 
   s3:
     name: Real S3-compatible storage

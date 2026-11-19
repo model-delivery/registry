@@ -60,7 +60,7 @@ tasks:
     cmd: go test -tags=integration -count=1 ./test/e2e/
 
   test:e2e:network:
-    desc: Also mirror a real model from huggingface.co (needs the network)
+    desc: Also mirror a real model and real datasets from huggingface.co (needs the network)
     env:
       REGISTRY_E2E_NETWORK: "1"
     cmd: go test -tags=integration -count=1 -v ./test/e2e/

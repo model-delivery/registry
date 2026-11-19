@@ -263,7 +263,7 @@ and `datasets` Python libraries in CI (`test/e2e`).
 | `snapshot_download`, `hf_hub_download`, `hf download` | Supported |
 | `model_info`, `list_repo_tree`, `list_repo_files`, `list_repo_refs`, `get_paths_info` | Supported |
 | Datasets: the calls above with `repo_type="dataset"` (`--repo-type dataset`), `dataset_info`, uploads, mirroring and pull-through | Supported |
-| `load_dataset("org/name")` from a repository of csv, jsonl or parquet files | Supported for those layouts; others are expected to work but are not tested. The Hub's dataset viewer is not implemented, and the library falls back to the repository's files: see [Datasets](docs/compatibility.md#datasets) |
+| `load_dataset("org/name")` from a repository of csv, jsonl or parquet files | Supported for split files at the top (csv, jsonl, parquet) and for config directories of parquet files declared in the dataset card, as `push_to_hub` writes them; both tested on datasets mirrored from huggingface.co (`rotten_tomatoes`, `mbpp`) and by pull-through, giving the same splits and rows as huggingface.co. Other layouts are expected to work but are not tested. The Hub's dataset viewer is not implemented and is not needed: the library reads the repository's files. See [Datasets](docs/compatibility.md#datasets) |
 | Branches, tags and pinned revision ids | Supported |
 | Private access with `HF_TOKEN` | Supported |
 | Uploading with `hf upload`, `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Supported, with one condition for large files: see Xet, below |

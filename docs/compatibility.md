@@ -90,7 +90,8 @@ With `huggingface_hub`, against a mirrored dataset with the upstream gone
 (`TestHubClientDatasetAgainstMirror`): `snapshot_download` and
 `hf_hub_download` with `repo_type="dataset"`, by branch and by revision
 id, including a file with a space in its name; `hf download --repo-type
-dataset`, a whole dataset and one file; `dataset_info`; `list_repo_tree`
+dataset`, a whole dataset and one file; `dataset_info` (with
+`files_metadata=True`, against huggingface.co: see below); `list_repo_tree`
 with and without `recursive`; `list_repo_refs`; `get_paths_info`; and the
 model of the same name beside it, with different content.
 
@@ -114,7 +115,43 @@ with no other argument on three mirrored datasets, with the upstream gone:
 | `train.jsonl` and `test.jsonl`, no `README.md` | `train` and `test` splits with the right rows |
 | `train.parquet` and `test.parquet`, no `README.md` | `train` and `test` splits with the right rows |
 
-These requests are what `load_dataset` made of the registry in that test:
+### Tested against huggingface.co
+
+Two public datasets with the two layouts most datasets on the Hub have
+are mirrored from the real huggingface.co and read through the registry,
+and every answer is compared with what the same script gets from
+huggingface.co directly (`TestMirrorDatasetFromHuggingFace`,
+`TestPullThroughDatasetFromHuggingFace`; they run with
+`REGISTRY_E2E_NETWORK=1`, `task test:e2e:network`):
+
+| Dataset | Layout |
+|---|---|
+| `cornell-movie-review-data/rotten_tomatoes` | `train.parquet`, `validation.parquet` and `test.parquet` at the top, and a dataset card that declares no configs |
+| `google-research-datasets/mbpp` | Two configs, `full` (the default) and `sanitized`, each a directory of parquet files named after their split (`full/train-00000-of-00001.parquet`, and a split called `prompt`), declared in the dataset card's YAML `configs`. This is how `push_to_hub` writes a dataset |
+
+Both are stored in Xet on huggingface.co; the registry fetches them over
+plain HTTP and serves them as any other file. For each, after
+`modelctl mirror --repo-type dataset`: the mirrored revision id is the
+Hub's commit id; `snapshot_download(repo_type="dataset")` gives the same
+files with the same SHA-256; `dataset_info(files_metadata=True)` the same
+id, revision and files with their sizes; `list_repo_tree` the same files,
+sizes and directories, recursive and at the top; and
+`load_dataset("<id>")` the same splits, row counts and columns as loading
+it from huggingface.co. With pull-through on and nothing mirrored,
+`load_dataset("google-research-datasets/mbpp")` gives the same splits,
+and the registry fetches the dataset card and the default config's files
+only, leaving the other config's listed and not fetched; and
+`hf_hub_download(repo_type="dataset")` of one file of
+`rotten_tomatoes` fetches that file only.
+
+`stanfordnlp/imdb` (one config, `plain_text`, three parquet files, 84 MB)
+was also mirrored and loaded this way, with the same splits and row
+counts as from huggingface.co; it is not part of the suite because of its
+size. Set `REGISTRY_E2E_DATASET=stanfordnlp/imdb` to add it, or any other
+dataset.
+
+These requests are what `load_dataset` made of the registry in the
+fake-hub test:
 `HEAD /datasets/{id}/resolve/main/README.md` (and, when that is not
 there, `GET /api/datasets/{id}` for the revision id); `HEAD` of
 `{name}.py` (a loading script, which `datasets` no longer runs) and of
@@ -144,15 +181,22 @@ domain should make sure `datasets-server.<registry host>` does not
 resolve to anything they do not run, since that host would receive the
 tokens of users who load datasets.
 
-So the viewer is not needed to load a dataset from its files. The three
-layouts above are tested; other layouts that `datasets` reads from a
-repository's own files (other formats it reads, `data/` folders, splits
-named in the dataset card) take the same requests and are expected to
-work, but are not tested. What cannot work: anything that relies on the
+So the viewer is not needed to load a dataset from its files. The layouts
+above are tested: split files at the top in csv, jsonl and parquet, and
+config directories of parquet files declared in the dataset card, the
+default config loaded by `load_dataset("<id>")`. Other layouts that
+`datasets` reads from a repository's own files (other formats, `data/`
+folders, a config named in the call) take the same requests and are
+expected to work, but are not tested. What cannot work: anything that relies on the
 viewer's conversion, such as reading the `refs/convert/parquet`
 revision, and datasets that need a loading script, which `datasets`
 5.2.0 refuses to run against any hub ("Dataset scripts are no longer
-supported").
+supported"). `load_dataset` in `datasets` 5.2.0 does not read the
+conversion: the code for it (`HubDatasetModuleFactoryWithParquetExport`)
+is still in the library but nothing calls it, and a repository with a
+loading script fails with the error above before the viewer is asked.
+So no dataset that `load_dataset` reads from huggingface.co needs the
+viewer to be read from the registry.
 
 ## Uploading
 

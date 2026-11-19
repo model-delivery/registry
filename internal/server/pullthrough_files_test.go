@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,7 +175,22 @@ func TestPullThroughConcurrentDownloadsOfOneFileShareOneFetch(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	hub.hold = make(chan struct{})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	// The registry under test, behind a handler that counts the requests
+	// that have reached it.
+	reg, err := registry.Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var arrived, downloadsAnswered atomic.Int64
+	handler := server.New(reg, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived.Add(1)
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		local.Close()
+		_ = reg.Close()
+	})
 
 	const clients = 12
 	var wg sync.WaitGroup
@@ -183,12 +200,15 @@ func TestPullThroughConcurrentDownloadsOfOneFileShareOneFetch(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// The same file by branch and by listing: all one revision.
-			path := "/acme/tiny/resolve/main/model.safetensors"
+			path, download := "/acme/tiny/resolve/main/model.safetensors", true
 			if i%3 == 2 {
-				path = "/api/models/acme/tiny/tree/main"
+				path, download = "/api/models/acme/tiny/tree/main", false
 			}
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, local.url+path, nil)
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, local.URL+path, nil)
 			resp, err := http.DefaultClient.Do(req)
+			if download {
+				downloadsAnswered.Add(1)
+			}
 			if err != nil {
 				statuses <- 0
 				return
@@ -197,12 +217,23 @@ func TestPullThroughConcurrentDownloadsOfOneFileShareOneFetch(t *testing.T) {
 			statuses <- resp.StatusCode
 		}()
 	}
-	// Let every download arrive while the upstream is still holding the file back.
-	deadline := time.Now().Add(5 * time.Second)
-	for hub.files.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// The upstream is released only once every request is inside the
+	// registry and the fetch has reached the upstream, which is holding the
+	// file back. No sleep stands in for that: a request that arrived after
+	// the fetch had finished would be served from storage and prove nothing
+	// about sharing one.
+	deadline := time.Now().Add(10 * time.Second)
+	for arrived.Load() < clients || hub.files.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d requests reached the registry and %d fetches reached the upstream", arrived.Load(), clients, hub.files.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(150 * time.Millisecond)
+	// Every download is in, the file cannot be served before it is fetched,
+	// and the fetch is held: so all of them are waiting, on that one fetch.
+	if got := downloadsAnswered.Load(); got != 0 {
+		t.Fatalf("%d downloads were answered while the upstream still held the file", got)
+	}
 	close(hub.hold)
 	wg.Wait()
 	close(statuses)

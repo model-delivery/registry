@@ -26,7 +26,7 @@ func TestPullQueueIsBounded(t *testing.T) {
 	ctx := context.Background()
 	p := newPuller(nil, nil, nil, 0, slog.New(slog.DiscardHandler))
 	release := make(chan struct{})
-	held := func(context.Context, *pullJob) { <-release }
+	held := func(context.Context) error { <-release; return nil }
 
 	// Fill every slot and every place in the queue.
 	const total = maxConcurrentPulls + maxWaitingPulls
@@ -35,7 +35,7 @@ func TestPullQueueIsBounded(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := p.share(ctx, fmt.Sprintf("job-%d", i), held); err != nil {
+			if err := p.share(ctx, fmt.Sprintf("job-%d", i), held); err != nil {
 				t.Errorf("job %d: %v", i, err)
 			}
 		}()
@@ -43,7 +43,7 @@ func TestPullQueueIsBounded(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		p.mu.Lock()
-		jobs, waiting := len(p.jobs), p.waiting
+		jobs, waiting := p.running, p.waiting
 		p.mu.Unlock()
 		if jobs == total && waiting == maxWaitingPulls {
 			break
@@ -55,20 +55,20 @@ func TestPullQueueIsBounded(t *testing.T) {
 	}
 
 	// One more distinct fetch is refused at once, without waiting.
-	if _, err := p.share(ctx, "one-too-many", held); !errors.Is(err, errPullBusy) {
+	if err := p.share(ctx, "one-too-many", held); !errors.Is(err, errPullBusy) {
 		t.Fatalf("got %v, want errPullBusy", err)
 	}
 	// A request for something already queued joins it, as before.
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	if _, err := p.share(short, "job-0", held); !errors.Is(err, context.DeadlineExceeded) {
+	if err := p.share(short, "job-0", held); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("joining a queued job: got %v, want it to wait", err)
 	}
 
 	close(release)
 	wg.Wait()
 	// With the queue drained, new fetches are accepted again.
-	if _, err := p.share(ctx, "afterwards", func(context.Context, *pullJob) {}); err != nil {
+	if err := p.share(ctx, "afterwards", func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("after the queue drained: %v", err)
 	}
 	p.mu.Lock()
@@ -103,7 +103,7 @@ func TestOverlongNamesAreNeitherLookedUpNorRemembered(t *testing.T) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.misses) != 0 || len(p.jobs) != 0 {
-		t.Fatalf("kept %d misses and %d jobs for a name that cannot exist", len(p.misses), len(p.jobs))
+	if len(p.misses) != 0 || p.running != 0 {
+		t.Fatalf("kept %d misses and %d jobs for a name that cannot exist", len(p.misses), p.running)
 	}
 }

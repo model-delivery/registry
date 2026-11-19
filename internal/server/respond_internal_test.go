@@ -229,7 +229,7 @@ func fillFileSlots(t *testing.T, p *puller) (release func()) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = p.share(context.Background(), fmt.Sprintf("file-%d", i), func(context.Context, *pullJob) { <-hold })
+			_ = p.share(context.Background(), fmt.Sprintf("file-%d", i), func(context.Context) error { <-hold; return nil })
 		}()
 	}
 	waitFor(t, p, "every file slot taken", func() bool { return len(p.slots) == maxConcurrentPulls && p.waiting == 0 })
@@ -247,7 +247,7 @@ func TestListingsDoNotWaitBehindFileFetches(t *testing.T) {
 	// A fifth file fetch waits.
 	fifth := make(chan error, 1)
 	go func() {
-		_, err := p.share(context.Background(), "file-waiting", func(context.Context, *pullJob) {})
+		err := p.share(context.Background(), "file-waiting", func(context.Context) error { return nil })
 		fifth <- err
 	}()
 	waitFor(t, p, "the fifth fetch queued", func() bool { return p.waiting == 1 })
@@ -256,7 +256,7 @@ func TestListingsDoNotWaitBehindFileFetches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ran := false
-	if _, err := p.shareListing(ctx, "acme/other@main", func(context.Context, *pullJob) { ran = true }); err != nil || !ran {
+	if _, err := p.shareListing(ctx, "acme/other@main", func(context.Context) (string, error) { ran = true; return "", nil }); err != nil || !ran {
 		t.Fatalf("a listing with every file slot busy: ran %v, %v", ran, err)
 	}
 	select {
@@ -277,9 +277,10 @@ func TestJobTimeoutStartsWhenTheJobDoes(t *testing.T) {
 	var allowed time.Duration
 	finished := make(chan error, 1)
 	go func() {
-		_, err := p.share(context.Background(), "queued", func(ctx context.Context, _ *pullJob) {
+		err := p.share(context.Background(), "queued", func(ctx context.Context) error {
 			deadline, _ := ctx.Deadline()
 			allowed = time.Until(deadline)
+			return nil
 		})
 		finished <- err
 	}()
@@ -306,15 +307,15 @@ func TestPullerStopsItsJobs(t *testing.T) {
 	results := make(chan error, maxConcurrentPulls+1)
 	for i := range maxConcurrentPulls + 1 {
 		go func() {
-			_, err := p.share(context.Background(), fmt.Sprintf("job-%d", i), func(ctx context.Context, job *pullJob) {
+			err := p.share(context.Background(), fmt.Sprintf("job-%d", i), func(ctx context.Context) error {
 				<-ctx.Done()
 				time.Sleep(50 * time.Millisecond) // slow to notice
-				job.err = fmt.Errorf("write blob: %w", ctx.Err())
+				return fmt.Errorf("write blob: %w", ctx.Err())
 			})
 			results <- err
 		}()
 	}
-	waitFor(t, p, "four running and one queued", func() bool { return len(p.jobs) == maxConcurrentPulls+1 && p.waiting == 1 })
+	waitFor(t, p, "four running and one queued", func() bool { return p.running == maxConcurrentPulls+1 && p.waiting == 1 })
 
 	// With nothing cancelled, wait gives up at its deadline and says so.
 	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -328,7 +329,7 @@ func TestPullerStopsItsJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.mu.Lock()
-	jobs, waiting := len(p.jobs), p.waiting
+	jobs, waiting := p.running, p.waiting
 	p.mu.Unlock()
 	if jobs != 0 || waiting != 0 || len(p.slots) != 0 {
 		t.Fatalf("after wait returned: %d jobs, %d waiting, %d slots held", jobs, waiting, len(p.slots))
@@ -340,10 +341,10 @@ func TestPullerStopsItsJobs(t *testing.T) {
 	}
 	// Nothing starts afterwards.
 	started := false
-	if _, err := p.share(context.Background(), "late", func(context.Context, *pullJob) { started = true }); !errors.Is(err, errShuttingDown) || started {
+	if err := p.share(context.Background(), "late", func(context.Context) error { started = true; return nil }); !errors.Is(err, errShuttingDown) || started {
 		t.Fatalf("a job after the stop: started %v, %v", started, err)
 	}
-	if _, err := p.shareListing(context.Background(), "late@main", func(context.Context, *pullJob) { started = true }); !errors.Is(err, errShuttingDown) || started {
+	if _, err := p.shareListing(context.Background(), "late@main", func(context.Context) (string, error) { started = true; return "", nil }); !errors.Is(err, errShuttingDown) || started {
 		t.Fatalf("a listing after the stop: started %v, %v", started, err)
 	}
 }

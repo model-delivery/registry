@@ -113,10 +113,15 @@ type puller struct {
 	ctx context.Context
 	now func() time.Time
 
-	mu      sync.Mutex
-	jobs    map[string]*pullJob
-	waiting int // jobs that do not hold a slot yet
-	misses  map[string]time.Time
+	mu sync.Mutex
+	// The jobs in progress, of each kind, by what they fetch. A file fetch
+	// yields nothing but success or failure; a listing yields the id the
+	// revision was stored under.
+	fileJobs    map[string]*pullJob[struct{}]
+	listingJobs map[string]*pullJob[string]
+	running     int // jobs of either kind that have not finished
+	waiting     int // of those, the ones that do not hold a slot yet
+	misses      map[string]time.Time
 	// closed is set when the server stops: no job starts after it.
 	closed bool
 	// drained is closed once closed is set and no job is left.
@@ -126,10 +131,13 @@ type puller struct {
 	listings chan struct{} // revision listings in progress
 }
 
-type pullJob struct {
-	done chan struct{}
-	repo string // for a revision: the id it was stored under
-	err  error
+// pullJob is one fetch in progress, shared by every request that wants
+// what it fetches. result and err are what its work returned; they are set
+// by the job's own goroutine before done is closed and are read only after.
+type pullJob[T any] struct {
+	done   chan struct{}
+	result T
+	err    error
 }
 
 // newPuller builds a coordinator whose jobs run until they finish. The
@@ -138,7 +146,8 @@ func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow [
 	return &puller{
 		reg: reg, upstream: upstream, allow: allow, maxFileBytes: maxFileBytes, log: log,
 		ctx: context.Background(), now: time.Now,
-		jobs: map[string]*pullJob{}, misses: map[string]time.Time{},
+		fileJobs: map[string]*pullJob[struct{}]{}, listingJobs: map[string]*pullJob[string]{},
+		misses:   map[string]time.Time{},
 		drained:  make(chan struct{}),
 		slots:    make(chan struct{}, maxConcurrentPulls),
 		listings: make(chan struct{}, maxConcurrentListings),
@@ -165,49 +174,68 @@ func (p *puller) allowed(repo string) bool {
 // as long as its own ctx lives. A new job is refused with errPullBusy while
 // maxWaitingPulls others are waiting for a slot; joining a job that already
 // exists is never refused.
-func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
-	return p.run(ctx, key, p.slots, work)
+func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context) error) error {
+	_, err := shareJob(ctx, p, p.fileJobs, p.slots, key, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, work(ctx)
+	})
+	return err
 }
 
 // shareListing is share for a revision listing, which takes its slot from
-// the listings' own pool.
-func (p *puller) shareListing(ctx context.Context, key string, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
-	return p.run(ctx, key, p.listings, work)
+// the listings' own pool and yields the id the revision is stored under.
+func (p *puller) shareListing(ctx context.Context, key string, work func(ctx context.Context) (string, error)) (string, error) {
+	return shareJob(ctx, p, p.listingJobs, p.listings, key, work)
 }
 
-func (p *puller) run(ctx context.Context, key string, pool chan struct{}, work func(ctx context.Context, job *pullJob)) (*pullJob, error) {
+// shareJob is what share and shareListing have in common: it joins the job
+// for key among jobs, or starts one that takes its slot from pool, and
+// waits for the result as long as ctx lives.
+func shareJob[T any](ctx context.Context, p *puller, jobs map[string]*pullJob[T], pool chan struct{}, key string, work func(ctx context.Context) (T, error)) (T, error) {
+	var none T
 	p.mu.Lock()
-	job := p.jobs[key]
+	job := jobs[key]
 	if job == nil {
 		switch {
 		case p.closed:
 			p.mu.Unlock()
-			return nil, errShuttingDown
+			return none, errShuttingDown
 		case p.waiting >= maxWaitingPulls:
 			p.mu.Unlock()
-			return nil, errPullBusy
+			return none, errPullBusy
 		}
 		p.waiting++
-		job = &pullJob{done: make(chan struct{})}
-		p.jobs[key] = job
+		p.running++
+		job = &pullJob[T]{done: make(chan struct{})}
+		jobs[key] = job
 		// Deliberately not the request's context: the fetch must outlive the
 		// request that started it (see the note at the top of this file).
-		go p.do(key, job, pool, work)
+		go func() {
+			job.err = p.do(pool, func(ctx context.Context) (err error) {
+				job.result, err = work(ctx)
+				return err
+			})
+			p.finish(func() {
+				delete(jobs, key)
+				close(job.done)
+			})
+		}()
 	}
 	p.mu.Unlock()
 
 	select {
 	case <-job.done:
-		return job, job.err
+		return job.result, job.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return none, ctx.Err()
 	}
 }
 
-// do is one job's goroutine: wait for a slot in pool, run work, and take
-// the job off the books.
-func (p *puller) do(key string, job *pullJob, pool chan struct{}, work func(ctx context.Context, job *pullJob)) {
-	defer p.finish(key, job)
+// do is the body of a job's goroutine: wait for a slot in pool, then run
+// work on the server's lifetime with the job's time limit.
+//
+// TestServeStopsItsOwnWorkBeforeTheRegistryCloses finds the jobs still
+// running by this method's name in their stacks; rename it there too.
+func (p *puller) do(pool chan struct{}, work func(ctx context.Context) error) error {
 	select {
 	case pool <- struct{}{}:
 		defer func() { <-pool }()
@@ -217,28 +245,30 @@ func (p *puller) do(key string, job *pullJob, pool chan struct{}, work func(ctx 
 	p.waiting--
 	p.mu.Unlock()
 	if p.ctx.Err() != nil {
-		job.err = errShuttingDown
-		return
+		return errShuttingDown
 	}
 	// The time limit starts here, with the slot in hand: time spent queued
 	// behind other jobs does not count against this one.
 	ctx, cancel := context.WithTimeout(p.ctx, pullTimeout)
 	defer cancel()
-	work(ctx, job)
-	if job.err != nil && p.ctx.Err() != nil {
+	err := work(ctx)
+	if err != nil && p.ctx.Err() != nil {
 		// Whatever the work failed with, the reason is that the server stopped.
-		job.err = errShuttingDown
+		return errShuttingDown
 	}
+	return err
 }
 
-// finish forgets a job and releases whoever waits on it. It is the last
-// thing a job's goroutine does.
-func (p *puller) finish(key string, job *pullJob) {
+// finish takes a job off the books. forget removes it from its map and
+// releases whoever waits on it; it runs under the lock, so a request that
+// finds no job starts a new one and never joins one that has ended. It is
+// the last thing a job's goroutine does.
+func (p *puller) finish(forget func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.jobs, key)
-	close(job.done)
-	if p.closed && len(p.jobs) == 0 {
+	forget()
+	p.running--
+	if p.closed && p.running == 0 {
 		p.allGone.Do(func() { close(p.drained) })
 	}
 }
@@ -249,7 +279,7 @@ func (p *puller) finish(key string, job *pullJob) {
 func (p *puller) wait(ctx context.Context) error {
 	p.mu.Lock()
 	p.closed = true
-	left := len(p.jobs)
+	left := p.running
 	if left == 0 {
 		p.allGone.Do(func() { close(p.drained) })
 	}
@@ -280,17 +310,15 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 	}
 	p.mu.Unlock()
 
-	job, err := p.shareListing(ctx, key, func(ctx context.Context, job *pullJob) {
+	return p.shareListing(ctx, key, func(ctx context.Context) (string, error) {
 		// A request that missed locally just before another job recorded
 		// this revision arrives here after that job has gone. Look again
 		// before asking the upstream a second time.
 		if c, err := p.reg.Resolve(ctx, repo, rev); err == nil {
-			job.repo = c.Repo
-			return
+			return c.Repo, nil
 		}
 		plan, err := mirror.Prepare(ctx, p.upstream(), repo, rev)
 		if err != nil {
-			job.err = err
 			if errors.Is(err, mirror.ErrUpstreamNotFound) {
 				p.mu.Lock()
 				if len(p.misses) > maxRememberedMisses {
@@ -298,33 +326,27 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 				}
 				p.misses[key] = p.now().Add(missTTL)
 				p.mu.Unlock()
-				return
+				return "", err
 			}
 			p.log.Warn("pull-through could not resolve upstream", "repo", repo, "revision", rev, "error", err)
-			return
+			return "", err
 		}
 		// The upstream answers with its canonical id, which differs from
 		// what was asked for after a rename. The allow list covers the name
 		// the revision is stored under, not only the one in the request.
 		if plan.Info.ID != repo && !p.allowed(plan.Info.ID) {
-			job.err = fmt.Errorf("%w: %s is named %s upstream, which pull-through is not allowed to fetch",
+			return "", fmt.Errorf("%w: %s is named %s upstream, which pull-through is not allowed to fetch",
 				mirror.ErrUpstreamNotFound, repo, plan.Info.ID)
-			return
 		}
 		c, err := plan.RecordLazy(ctx, p.reg)
 		if err != nil {
-			job.err = err
 			p.log.Warn("pull-through could not record the revision", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
-			return
+			return "", err
 		}
-		job.repo = c.Repo
 		p.log.Info("pull-through recorded a revision; its files are fetched on demand", "repo", c.Repo, "revision", rev,
 			"sha", c.SHA, "files", len(plan.Entries), "bytes", plan.Bytes())
+		return c.Repo, nil
 	})
-	if err != nil {
-		return "", err
-	}
-	return job.repo, nil
 }
 
 // ensureFile fetches the content of one pending file of revision c.
@@ -339,17 +361,16 @@ func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.F
 	if p.maxFileBytes > 0 && f.Size > p.maxFileBytes {
 		return errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
 	}
-	_, err = p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context, job *pullJob) {
+	return p.share(ctx, c.Repo+"@"+c.SHA+":"+f.Path, func(ctx context.Context) error {
 		started := p.now()
 		if err := mirror.FetchFile(ctx, p.upstream(), p.reg, c, f); err != nil {
-			job.err = err
 			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
-			return
+			return err
 		}
 		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
 			"took", p.now().Sub(started).Round(time.Millisecond))
+		return nil
 	})
-	return err
 }
 
 // pullFailure says whose failure a pull-through job's error is, for the

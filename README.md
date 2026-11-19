@@ -291,6 +291,8 @@ Details, including the exact routes, are in
   registry.
 
 The [roadmap](docs/roadmap.md) says what is planned and in what order.
+[Alternatives](docs/alternatives.md) describes other open-source projects
+in this space and when one of them is the better choice.
 
 ## How it works
 

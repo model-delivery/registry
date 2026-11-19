@@ -1,14 +1,14 @@
 # Model Delivery Registry
 
-**A self-hosted registry for AI models that existing Hugging Face tools can download from.**
+**A self-hosted registry for AI models that existing Hugging Face tools can download from and upload to.**
 
 Your models. Your infrastructure. Your rules. Website: <https://model.delivery>
 
 Think of a Docker registry or Artifactory, built for model files. Mirror
 repositories from Hugging Face, or push your own, and serve them from a
 machine you control. Tools built on `huggingface_hub` (`transformers`,
-`diffusers`, the `hf` CLI and others) download from it after changing one
-environment variable:
+`diffusers`, the `hf` CLI and others) download from it, and upload to it,
+after changing one environment variable:
 
 ```bash
 export HF_ENDPOINT=http://localhost:8080
@@ -19,10 +19,11 @@ model files on disk. For larger deployments the model files can live in
 any S3-compatible bucket instead. It runs the same on a Raspberry Pi, a
 homelab box or a server.
 
-> **Status: early release.** The download path, mirroring, the CLI and the
-> web UI work and are tested against the real `huggingface_hub` library.
-> Read [what is not supported yet](#what-is-not-supported-yet) before
-> relying on it.
+> **Status: early release.** Downloading, uploading, mirroring, pull-through
+> caching, backups, the CLI and the web UI work. The Hugging Face
+> compatible routes are tested against the real `huggingface_hub` library.
+> Read [what is not supported yet](#what-is-not-supported-yet) and the
+> [compatibility table](#hugging-face-compatibility) before relying on it.
 
 ## Quick start
 
@@ -96,12 +97,14 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 |---|---|
 | **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id. Private and gated repositories work with your Hugging Face token. |
 | **Cache on demand** | Optionally, let the registry fetch from Hugging Face what it does not have: the file listing the first time a model is asked for, and each file the first time it is downloaded. Point your tools at the registry and it fills itself, one requested file at a time. |
-| **Serve** | Existing clients download through the Hugging Face compatible API, including resumable range requests. |
+| **Serve** | Existing clients download through the Hugging Face compatible API, including range requests. |
 | **Push and pull** | Store your own models: `modelctl push ./dir team/model`, `modelctl pull team/model`. |
+| **Upload** | Hugging Face tools upload to it as they would to the Hub: `hf upload team/model ./dir`, `upload_folder`, `create_commit`. See [the note on large files](#hugging-face-compatibility). |
 | **Version** | Every revision is immutable and addressed by id. Branches move, tags never do. |
 | **Verify** | Files are stored under the SHA-256 of their content and verified on the way in. Identical files are stored once, across revisions and repositories. `modelctl verify` re-checks everything in storage later, to find damage. |
 | **Store** | Local disk, or an S3-compatible object store. Verified against Cloudflare R2 and SeaweedFS (which CI runs on every change). It uses the standard S3 API, so AWS S3, Backblaze B2, Ceph and MinIO are expected to work but have not been tested. With S3, downloads can be redirected to signed bucket URLs so the bytes never pass through the registry. |
 | **Control access** | Access tokens with read, write and admin roles. Downloads can be open or require a token. |
+| **Back up** | The metadata database is snapshotted on a schedule or on demand, verified, and stored beside the model files; `modelctl restore` puts a snapshot back. |
 | **Browse** | A small web UI lists repositories, revisions, files and storage use. |
 
 ## Command line
@@ -230,21 +233,22 @@ puts one back. See [docs/operations.md](docs/operations.md#backup-and-restore).
 
 ## Hugging Face compatibility
 
-Tested against the real `huggingface_hub` Python library in CI.
+The rows marked "Supported" are run against the real `huggingface_hub`
+Python library in CI (`test/e2e`).
 
 | Capability | Status |
 |---|---|
 | `snapshot_download`, `hf_hub_download`, `hf download` | Supported |
 | `model_info`, `list_repo_tree`, `list_repo_files`, `list_repo_refs` | Supported |
 | Branches, tags and pinned revision ids | Supported |
-| Resuming interrupted downloads | Supported |
 | Private access with `HF_TOKEN` | Supported |
+| Uploading with `hf upload`, `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Supported, with one condition for large files: see Xet, below |
+| Range requests, which clients use to resume an interrupted download | Served and tested at the HTTP level; a resumed `huggingface_hub` download is not part of the client tests |
 | Libraries that download through `huggingface_hub` (`transformers`, `diffusers`, ...) | Expected to work; not individually tested yet |
-| Uploading with `hf upload`, `upload_file`, `upload_folder`, `create_commit` | Supported. Files over 10 MiB need `HF_HUB_DISABLE_XET=1` on the client, because the registry does not speak Xet |
+| Xet transfer | Not implemented. **Downloads** need nothing: the registry does not offer Xet, so clients download over plain HTTP. **Uploads** of files over 10 MiB need `HF_HUB_DISABLE_XET=1` on a client that has the `hf_xet` package, which `huggingface_hub` installs by default; such a client sends large files through Xet without asking the server. Smaller files upload without it |
 | Datasets and Spaces | Not supported |
 | Model search and listing (`list_models`) | Not supported |
 | `git clone` / git-lfs access | Not supported |
-| Xet accelerated transfer | Not used; clients fall back to plain HTTP |
 | Hub-only features (discussions, likes, inference, gating workflows) | Out of scope |
 
 Details, including the exact routes, are in
@@ -265,6 +269,9 @@ Details, including the exact routes, are in
 - **Repository ids are `namespace/name`**, and are case-sensitive.
 - **Uploads are not resumable.** An interrupted `modelctl push` re-sends the
   file it was in the middle of; files that finished are skipped.
+- **Large uploads from Hugging Face tools need one setting**,
+  `HF_HUB_DISABLE_XET=1`, because the registry does not speak Xet. See the
+  [compatibility table](#hugging-face-compatibility).
 - **No per-repository permissions.** A token's role applies to the whole
   registry.
 

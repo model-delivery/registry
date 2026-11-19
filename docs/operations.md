@@ -620,6 +620,21 @@ mirrored repositories only, the other way is to `modelctl delete` each
 repository that uses it, which removes the stored copy, and mirror them
 again.
 
+## Stopping the server
+
+`modelctl serve` stops on an interrupt or `SIGTERM`. It stops accepting
+requests, cancels the pull-through fetches in progress and a scheduled
+backup if one is running, and waits up to 30 seconds for those and for
+transfers in flight before it exits. A client that was waiting on a fetch
+is answered `503` with `Retry-After`; the fetch starts again on its next
+request. A backup that was cut short stores nothing.
+
+A transfer still running after 30 seconds is cut off. Uploads cut off this
+way leave nothing visible: the part received is cleared from `tmp/` at the
+next start. Give the process at least that long before it is killed (on
+Kubernetes, the default `terminationGracePeriodSeconds` of 30 is the
+minimum that makes sense; raise it a little).
+
 ## Upgrading
 
 Replace the binary or the image and restart. The database schema is

@@ -25,7 +25,7 @@ pin. The compatibility tests also need Python with `huggingface_hub`
 installed.
 
 ```bash
-task check      # format check, vet, lint, unit tests
+task check      # format check, vet, file headers, lint, unit tests, tidy modules
 task test:e2e   # run the real huggingface_hub client against the registry
 task run        # run a registry on http://localhost:8080 with data in ./data
 ```
@@ -50,7 +50,9 @@ Without Task: `go test ./...` and
   verified against its digest, and a failed operation must leave nothing
   half-visible.
 - **Docs move with the code.** Update the README, `docs/` and command help
-  in the same pull request.
+  in the same pull request. Two of these are checked: a test compares the
+  routes in `docs/api.md` with the ones the server registers, and another
+  holds `modelctl serve --help` to the list of settings.
 
 Code is formatted with `gofmt`. Keep comments about why, not what.
 
@@ -72,7 +74,8 @@ can find the one that ran from the event you caused:
 | `release-cut.yaml` | A maintainer presses **Cut release** | Picks the next version, tags `main`, starts `release.yaml` |
 | `quality.yaml` | Called by the three above | The checks themselves, in one place |
 
-The checks are: formatting, `go vet`, golangci-lint, govulncheck, unit
+The checks are: tidy module files, formatting, the copyright header on
+every Go file, `go vet`, golangci-lint, govulncheck, unit
 tests on Linux, macOS and Windows (with the race detector on Linux), the
 real `huggingface_hub` client against the registry, the storage tests
 against a real S3-compatible server, and a build-and-start of the

@@ -28,8 +28,19 @@ Knowing the design helps you deploy it safely.
   hub offers for them) for the small files it keeps in git.
 - Store access tokens only as SHA-256 hashes. A token is shown once, when
   created.
-- Require a token for every write, and optionally for every read.
+- Require a token for every write, and optionally for every read. The one
+  write that carries no token in the request is a large-file upload from a
+  Hugging Face client, which goes to a signed URL: the URL is issued to a
+  token with the write role, covers one file of one digest and size,
+  expires, and stops working when that token is revoked.
 - Refuse state-changing browser requests that come from another site.
+- Bound every request body that is not a file transfer, in size and in the
+  time the client has to send it. File transfers have no time limit, and
+  no size limit unless the operator sets one (`--max-blob-bytes`,
+  `--pull-through-max-file-bytes`).
+- Stop at start, with an error, on a setting it cannot read, rather than
+  run with a default the operator did not choose. `REGISTRY_REQUIRE_AUTH`
+  is the one that matters most here.
 - Fetch only from the upstream hub the operator configured. API callers
   cannot point it at other hosts, the upstream token is sent to that hub
   and nowhere else, and a redirect from the hub to a loopback or private

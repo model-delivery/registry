@@ -1,8 +1,8 @@
 # Hugging Face compatibility
 
 The registry implements the part of the Hugging Face Hub HTTP API that
-clients use to **download models**. It does not implement the whole Hub
-API, and this page lists exactly what is covered.
+clients use to **download and upload models**. It does not implement the
+whole Hub API, and this page lists exactly what is covered.
 
 Compatibility is checked in CI by running the real `huggingface_hub`
 Python library against the registry (`test/e2e`). The version tested is
@@ -38,13 +38,20 @@ registry you run.
 
 | Call | |
 |---|---|
-| `snapshot_download` | By branch, tag and revision id |
-| `hf_hub_download` | Including files in subdirectories and names with spaces |
+| `snapshot_download` | By branch, tag and revision id, including files in subdirectories and names with spaces |
+| `hf_hub_download` | One file, at a branch, tag or revision id, including one in a subdirectory |
+| `hf download` | The command: a whole repository, and one file at a tag |
 | `HfApi.model_info` | `sha` and `siblings` are the registry's; other fields are passed through from the upstream for mirrored models |
-| `HfApi.list_repo_files`, `list_repo_tree` | |
+| `HfApi.list_repo_files` | |
+| `HfApi.list_repo_tree` | With and without `recursive` |
 | `HfApi.list_repo_refs` | |
 | Reading with `HF_TOKEN` from a registry that requires a token | And being refused without one |
 | `create_repo`, `upload_file`, `upload_folder`, `create_commit` | Adding, replacing and deleting files. **Large files need `HF_HUB_DISABLE_XET=1`**; see [Uploading](#uploading) |
+| `hf upload` | The command: a folder, one file, and a folder to a new branch |
+
+All of these run with the `hf_xet` package installed, as a default
+installation has it. Downloads are unaffected by it; uploads are covered
+under [Uploading](#uploading).
 
 Libraries that fetch files through `huggingface_hub` (`transformers`,
 `diffusers`, `sentence-transformers` and others) use the calls above, so
@@ -112,8 +119,9 @@ What an upload does and does not do:
 | `POST /{repo}.git/info/lfs/objects/batch` | git-lfs batch API, `upload` operation, `basic` transfer. Returns a signed, expiring URL per object, or nothing for an object already stored |
 | `PUT /api/lfs/upload/{sha256}` | The signed URL. Accepts only the bytes it was issued for, for up to 12 hours, and only while the token that asked for it still exists and has the write role |
 | `POST /api/models/{repo}/commit/{branch}` | Line-delimited commit: `file`, `lfsFile`, `deletedFile`, `deletedFolder`. `412` if `parentCommit` is no longer the branch's revision |
-| `POST /api/models/{repo}/branch/{branch}` | |
+| `POST /api/models/{repo}/branch/{branch}` | Creates the branch from `startingPoint` (default `main`). On a repository with no revision yet it succeeds and creates nothing: the branch comes into being with its first commit |
 | `POST /api/validate-yaml` | Always accepts; the registry stores `README.md` as a file |
+| `GET /api/models/{repo}/xet-read-token/{revision}`, `xet-write-token` | Not Xet: a redirect to an address that answers `400` and whose path says to set `HF_HUB_DISABLE_XET=1`. See [Uploading](#uploading) |
 
 When the registry is configured to redirect downloads to S3, `resolve`
 answers `302` with `Location` (a signed bucket URL), `X-Linked-Etag`,

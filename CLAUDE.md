@@ -5,8 +5,9 @@ Context for AI assistants working in this repository.
 ## What this is
 
 Model Delivery Registry: a self-hosted registry for AI model files that
-Hugging Face clients can download from. One Go binary (`modelctl`), SQLite
-for metadata, a content-addressed file store on disk. Apache 2.0.
+Hugging Face clients can download from and upload to. One Go binary
+(`modelctl`), SQLite for metadata, and a content-addressed file store on
+local disk or in an S3-compatible bucket. Apache 2.0.
 
 Read `docs/architecture.md` before changing anything structural, and
 `docs/compatibility.md` before touching a Hugging Face compatible route.
@@ -15,18 +16,40 @@ Read `docs/architecture.md` before changing anything structural, and
 
 - `cmd/modelctl` — entry point; everything else is in `internal/`.
 - `internal/blob` — content-addressed store. Files are named by SHA-256.
-  Two backends, `FS` and `S3`, behind one interface. `store_test.go` runs
-  the same contract against both; a new backend joins that list.
-  `blobtest` is an in-memory S3 for tests.
+  Two backends, `FS` (`store.go`) and `S3` (`s3.go`), behind one interface.
+  `store_test.go` runs the same contract against both; a new backend joins
+  that list. `archive.go` keeps metadata backups beside the blobs, and
+  `check.go` re-reads a blob against its digest. `blobtest` is an in-memory
+  S3 for tests.
 - `internal/datadir` — the names of the files and directories in the data
   directory, and clearing `tmp/` at server start. Nothing else joins those
   names itself.
-- `internal/registry` — repositories, immutable revisions, refs, tokens,
-  and metadata backup and restore (`backup.go`).
-- `internal/mirror` — imports a revision from an upstream hub.
-- `internal/server` — HTTP: `hf.go` (Hugging Face routes), `api.go`
-  (`/api/v1`), `ui.go` plus `templates/` and `static/` (web UI).
-- `internal/client`, `internal/cli` — Go client and the command line.
+- `internal/registry` — repositories, immutable revisions, refs and tokens:
+  `registry.go` (opening, blobs, garbage collection, tokens), `repo.go`
+  (reading), `commit.go` (recording a revision), `pending.go` (files listed
+  from upstream and not fetched yet), `backup.go` (metadata backup and
+  restore), `verify.go` (re-checking every stored file).
+- `internal/mirror` — imports a revision from an upstream hub: `mirror.go`
+  (the plan and its execution), `upstream.go` (the hub's API, resumed
+  downloads), `guard.go` (where the upstream may send the registry).
+- `internal/server` — HTTP. `server.go` has the route table, the access
+  gate and the error writers. Then one file per surface: `hf.go` (Hugging
+  Face download routes), `hfupload.go` (Hugging Face upload routes),
+  `pullthrough.go` (fetching from upstream on demand), `api.go` and
+  `backup.go` (`/api/v1`), `ui.go` plus `templates/` and `static/` (web
+  UI), `limits.go` (bounds on request bodies).
+- `internal/client` — the Go client for `/api/v1`. It shares only the HTTP
+  API with the server and imports no other package here but `internal/kit`.
+- `internal/cli` — the command line: `serve.go` (the server and its
+  settings), `cli.go`, `backup.go` and `verify.go` (the client commands,
+  each a call on `internal/client`, and `restore`, which works on a data
+  directory with the registry stopped).
+- `internal/kit` — the few helpers more than one package needs (showing a
+  size, escaping a path for a URL, the git blob id, writing a file
+  atomically). Standard library only. A helper moves here when a second
+  package needs it, not before.
+- `internal/regtest` — helpers for tests: a registry served over HTTP,
+  `modelctl serve` on a free port, the fake-S3 environment. Test code only.
 - `test/e2e` — runs the real `huggingface_hub` Python library against the
   registry. Build tag `integration`.
 
@@ -38,10 +61,10 @@ Read `docs/architecture.md` before changing anything structural, and
 
 ## Commands
 
-Use the Taskfile: `task check` (format, vet, lint, unit tests), `task test:e2e`
-(needs Python with `huggingface_hub`), `task test:s3` (real S3 server in
-Docker; the only place multipart uploads are exercised), `task build`,
-`task docker`.
+Use the Taskfile: `task check` (format, vet, headers, lint, unit tests,
+tidy modules), `task test:e2e` (needs Python with `huggingface_hub`),
+`task test:s3` (real S3 server in Docker; the only place multipart uploads
+are exercised), `task build`, `task docker`.
 
 ## Rules that are easy to break
 
@@ -57,18 +80,28 @@ Docker; the only place multipart uploads are exercised), `task build`,
   delete.
 - **All SQL stays in `internal/registry`.** That is what keeps a second
   metadata backend a contained change.
-- **Revisions are immutable.** Never update a `commits` or `files` row.
-  New content is a new revision; only refs move, and tags never move.
+- **Revisions are immutable.** A revision's id and what it lists (each
+  path with its size and digest) never change; new content is a new
+  revision; only refs move, and tags never move. Never update or delete a
+  `files` row, and never change a `commits` row, with one exception that
+  changes neither of those things: a revision that pull-through recorded
+  from an upstream listing has its files in `pending_files` until they are
+  fetched. `fulfil` (`pending.go`) then inserts the file's `files` row, the
+  only place one is written for a revision that already exists, and when
+  none is left pending `sealIfComplete` sets `commits.tree`, once. Do not
+  add another write to an existing revision.
 - **A failed operation leaves nothing half-visible.** Recording a revision
   is one transaction. A mirror records nothing unless every file verified.
 - **`files` rows always point at stored, verified content.** A file that
   pull-through has listed but not fetched is a row in `pending_files`, and
-  moves to `files` only through `fulfil` (`pending.go`; `Registry.Fulfil`
-  for one file, `Registry.CompleteRevision` for the rest of a revision in
-  one transaction), after its content matched its digest. Never insert into `files` for content that is not stored, and
-  never serve a pending file's content.
+  moves to `files` only through `fulfil` (`Registry.Fulfil` for one file,
+  `Registry.CompleteRevision` for the rest of a revision in one
+  transaction), after its content matched its digest. Never insert into
+  `files` for content that is not stored, and never serve a pending file's
+  content.
 - **Stream, never buffer.** Model files are many gigabytes. No
-  `io.ReadAll` on file content, in the server or the client.
+  `io.ReadAll` on file content, in the server or the client. The few
+  `io.ReadAll` calls there are read metadata through an `io.LimitReader`.
 - **The upstream host comes from server configuration only**, never from a
   request. What the upstream answers is trusted less than its address:
   every upstream request goes through `Upstream.get`, which follows
@@ -98,15 +131,41 @@ Docker; the only place multipart uploads are exercised), `task build`,
   is the only place a role is compared: a handler never checks one itself.
   A new route registered any other way is a bug; `TestAccessControl` is
   where to add the case.
+- **Whose failure it is decides what a client is told.** A failure of the
+  registry's own (its disk, its database) is `500`, logged in full, and
+  described to the client no further. A failure the upstream caused is
+  `502` with the reason, for mirror and pull-through alike; only what
+  `mirror.FromUpstream` vouches for is reported that way. An error value
+  is answered through `Server.fail` (registry API) or `Server.hfFail`
+  (Hugging Face routes), which apply this; `writeError` and `hfError` are
+  for fixed messages only.
 - **Work that outlives a request runs on the server's lifetime**, never on
   `context.Background()`. Pull-through jobs do (`puller.ctx`), and
   `Server.Shutdown` cancels and waits for them; `serve` in
   `internal/cli/serve.go` waits for that and for the backup loop before the
   registry is closed. `TestServeStopsItsOwnWorkBeforeTheRegistryCloses` is
   where a new kind of background work joins.
+- **A client command is one call on `internal/client`.** It builds no
+  path and decodes no response itself; a new request is a new typed method
+  there, with a named result. `--json` prints the registry's document as
+  it arrived (the result's `Raw`), so do not re-encode a result for it.
+- **Every server setting has a flag and an environment variable**, the
+  variable being the flag's default, unless it is a secret. Secrets (the
+  admin token, the upstream token, the S3 keys) are read from the
+  environment only. A value that cannot be read stops the server with a
+  usage error naming the setting; never fall back to a default in silence.
+  `TestServeHelpListsEverySetting` is where a new setting joins, and the
+  table in the README.
+- **`docs/api.md` lists every `/api/v1` route**, and nothing else.
+  `TestAPIDocumentMatchesTheRoutes` fails when a route is added, renamed
+  or removed without the document following.
 - **Compatibility claims need a real-client test.** If the README or
   `docs/compatibility.md` says a `huggingface_hub` call works, `test/e2e`
   must exercise it.
+- **A test that needs a clock or a schedule supplies it.** Hand the code
+  under test its clock or its ticks (`server.Config.Now`, the tick channel
+  of `runBackups`) and wait on what it does, rather than sleeping until it
+  has probably happened. `TestScheduledBackupsRunAndPrune` is the pattern.
 - `go test ./...` must pass with no network, no Python and no Docker.
 
 ## Ownership
@@ -119,7 +178,7 @@ checks it and CI runs it. Keep the year a file was first written; do not bump it
 
 Standard library first. Runtime dependencies are the pure-Go SQLite driver
 and the minio-go S3 client; neither needs cgo, which keeps the binary easy
-to cross-compile. The
+to cross-compile. (`gofakes3` is in `go.mod` for tests only.) The
 web UI is server-rendered templates with no JavaScript and no build step.
 Errors shown to users say what to do next. Docs change in the same commit
 as the behaviour they describe.

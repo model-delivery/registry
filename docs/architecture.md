@@ -1,48 +1,71 @@
 # Architecture
 
 The registry is one Go process and one data directory. There is no
-database server, queue, or second service to run.
+database server, queue, or second service to run. The one thing that can
+live outside the data directory is the model files themselves, which can
+be kept in an S3-compatible bucket instead of on local disk.
 
 ```
               huggingface_hub, transformers, hf CLI        modelctl          browser
                              |                                |                 |
                              v                                v                 v
-        +---------------------------------------------------------------------------+
-        |  internal/server      one HTTP handler                                    |
-        |    hf.go    Hugging Face compatible routes   /api/models/...  /.../resolve |
-        |    api.go   registry REST API                /api/v1/...                   |
-        |    ui.go    web UI                           /  /ui/...                    |
-        +---------------------------------------------------------------------------+
+        +------------------------------------------------------------------------------+
+        |  internal/server      one HTTP handler                                       |
+        |    server.go       the route table, the access gate, how errors are written  |
+        |    hf.go           Hugging Face downloads    /api/models/...  /.../resolve   |
+        |    hfupload.go     Hugging Face uploads      preupload, lfs batch, commit    |
+        |    pullthrough.go  fetching from upstream what a client asks for             |
+        |    api.go          registry REST API         /api/v1/...                     |
+        |    backup.go       metadata backups          /api/v1/backups...              |
+        |    ui.go           web UI                    /  /ui/...                      |
+        |    limits.go       bounds on the size and time of request bodies             |
+        +------------------------------------------------------------------------------+
                              |                                |
                              v                                v
         +-------------------------------------+   +------------------------------+
         |  internal/registry                  |   |  internal/mirror             |
         |  repositories, revisions, refs,     |<--|  reads an upstream hub,      |
-        |  tokens (SQLite)                    |   |  verifies, records a revision|
+        |  tokens, backups, verify (SQLite)   |   |  verifies, records a revision|
         +-------------------------------------+   +------------------------------+
                              |
                              v
         +-------------------------------------+
         |  internal/blob                      |
-        |  content-addressed file store       |
+        |  content-addressed file store,      |
+        |  on local disk or in an S3 bucket   |
         +-------------------------------------+
 ```
 
 `internal/cli` is the `modelctl` command line and `internal/client` is the
-Go client it uses. The server never calls the client; they share only the
-HTTP API.
+Go client it uses: each client command is one call on the client. The
+server never calls the client; they share only the HTTP API.
+
+Three small packages sit beside these. `internal/datadir` is the one place
+that names the files and directories of the data directory. `internal/kit`
+holds the few helpers more than one package needs and imports only the
+standard library, which is what lets the client use it. `internal/regtest`
+is test helpers.
 
 ## Data directory
 
 ```
 data/
-  registry.db              SQLite: repositories, revisions, files, refs, tokens
+  registry.db              SQLite: repositories, revisions, files, pending files,
+                           refs, tokens (and its write-ahead log beside it)
   blobs/sha256/ab/abcd...  one file per unique content, named by its SHA-256
-  tmp/                     uploads in progress
+  backups/registry-*.db    metadata backups
+  tmp/                     uploads being received, snapshots being taken
 ```
 
-With S3 storage, `blobs/` is absent: the same `sha256/ab/abcd...` names are
-object keys in the bucket. `registry.db` and `tmp/` stay local.
+With S3 storage, `blobs/` and `backups/` are absent: the same
+`sha256/ab/abcd...` and `backups/...` names are object keys in the bucket.
+`registry.db` and `tmp/` stay local.
+
+The tables of `registry.db` are `repos`, `commits` (revisions), `files`
+(one row per file of a revision, pointing at a blob), `pending_files`
+(files a revision lists whose content has not been fetched; see
+[Pull-through caching](#pull-through-caching)), `refs`, `blobs` (what is
+stored, and when it was last written or asked about) and `tokens`.
 
 ## Content-addressed storage
 
@@ -94,7 +117,12 @@ traffic. The registry still checks the caller's access before it signs.
 ## Revisions and refs
 
 A **revision** is immutable: an id (40 hex characters), a list of files,
-and where it came from. It is never edited after it is recorded.
+and where it came from. Its id and what it lists (each path, with its size
+and digest) never change after it is recorded. The one thing that happens
+to a recorded revision is that a file pull-through listed for it, and had
+not fetched, gets fetched: its row moves from `pending_files` to `files`
+(see [Pull-through caching](#pull-through-caching)). No file of a revision
+is ever replaced or removed.
 
 - A mirrored revision keeps the id it has upstream, so pinning a revision
   id works identically against Hugging Face and against the registry.
@@ -112,6 +140,39 @@ database enforces that with a foreign key.
 
 Pushing content identical to the branch's current revision does not create
 a new revision.
+
+## Uploads
+
+A revision is recorded from files that are already stored, so every way of
+uploading has the same two steps: store the files, each verified against
+its SHA-256, then record a revision that names them. A file the registry
+already stores is not sent again.
+
+- **`modelctl push`** uses the registry's own API: `PUT /api/v1/blobs/{sha256}`
+  for each file it does not find with `HEAD`, then
+  `POST /api/v1/repos/{repo}/commits`.
+- **Hugging Face clients** (`hf upload`, `upload_file`, `upload_folder`,
+  `create_commit`) drive the steps the Hub defines, in `hfupload.go`. The
+  client asks, per file, how to send it (`preupload`). Files up to 10 MiB
+  travel inside the commit request, base64-encoded, one JSON line each.
+  Larger files use the git-lfs batch protocol: the client names each file
+  by its SHA-256 and the registry answers with a signed URL to `PUT` it
+  to, or says it is already stored. Then the commit request records the
+  revision, merged onto the branch's current files. If the client named
+  the revision it started from and the branch has moved since, the commit
+  is refused with `412`.
+
+The signed upload URL is the one route that takes model content without a
+token in the request, because clients send to it as they would to a hub's
+object store. The URL itself is the grant: it is signed with a key made at
+server start, names the digest, the size and the token it was issued to,
+expires after twelve hours, and stops working when that token is revoked
+or loses the write role. What arrives is still verified against the
+digest.
+
+Clients with the `hf_xet` package send large files through the Hub's Xet
+protocol, which the registry does not speak; `docs/compatibility.md` says
+what that means for users.
 
 ## Mirroring
 
@@ -255,6 +316,56 @@ a blob through `blob.Store.Open` and so works the same on every backend;
 at a time and holding no lock, and `POST /api/v1/verify` streams the
 results.
 
+## Metadata backups
+
+The database is the only record of which stored files make up which
+revision, so the registry backs it up itself (`registry/backup.go`). Model
+files are not copied: they are already stored under their digests and
+never change.
+
+A backup is a snapshot taken with SQLite's `VACUUM INTO` while the
+registry keeps serving, which gives a consistent copy from one read
+transaction. The snapshot is written to `tmp/`, checked (SQLite's
+integrity check, and that it is a registry database of a schema this
+version reads), and only then stored through `blob.Archive`, the four
+methods every storage backend has for keeping named files beside the
+blobs: under `backups/` in the data directory, or under `backups/` in the
+bucket. With object storage that puts the backup off the server's disk.
+Backups are named by time; the oldest beyond the number to keep are
+removed after the new one is stored, never before.
+
+Three things take one: the schedule in `modelctl serve` (a loop that takes
+a backup on each tick of a ticker), `POST /api/v1/backups`, and
+`GET /api/v1/backups/snapshot`, which streams a fresh snapshot to the
+caller instead of storing it.
+
+Restoring is done with the registry stopped (`modelctl restore`), or by
+`modelctl serve` itself at start when it is told to and finds no database.
+The snapshot is verified again before it replaces anything, a database
+that is already there is put aside with its write-ahead log rather than
+overwritten, and a failed restore puts it back.
+
+## Background work and shutdown
+
+Two things in the server process are not requests: pull-through fetches,
+which outlive the request that started them, and the scheduled-backup
+loop. Each has an owner that stops it. `Server.Shutdown` cancels every
+fetch and returns when the last has ended; the backup loop runs on a
+context that `modelctl serve` cancels. On a signal, `serve` stops taking
+requests, cancels both, and waits for requests in flight, the fetches and
+a backup in progress, up to thirty seconds, before it closes the
+registry. Nothing is started on a context that nobody cancels.
+
+## Request limits
+
+Model files are large and their transfers long, so a file transfer has no
+time limit and, unless the operator sets one, no size limit. Every other
+request body is small and is held to that: `limits.go` bounds the size of
+JSON bodies and forms and gives the client thirty seconds to send them,
+and a request that announces a body to a route that reads none is not
+waited on for longer than that. The list of routes that count as file
+transfers is one function, `isFileTransfer`.
+
 ## Deleting and garbage collection
 
 Deleting a repository removes its revisions and then removes the blobs that
@@ -282,13 +393,21 @@ token has one role:
 | Role | Allows |
 |---|---|
 | `read` | Download and browse |
-| `write` | The above, plus push and mirror |
-| `admin` | The above, plus delete, garbage-collect and manage tokens |
+| `write` | The above, plus push, upload and mirror |
+| `admin` | The above, plus delete, garbage-collect, verify, back up and manage tokens |
 
 Reading is open to anyone unless the server runs with `--require-auth`.
 Writing always needs a token. The web UI signs in with the same tokens,
 held in an `HttpOnly`, `SameSite=Strict` cookie, and state-changing
 requests from other origins are refused.
+
+The token a request carries is looked up once, before any handler runs.
+Every route is registered with the role it needs, through one gate that
+compares roles and answers a refusal in the style of the surface it guards
+(the registry API's JSON, a Hugging Face client's headers, or the sign-in
+page). The few routes that ask for no role say why where they are
+registered: the health check, whoami, signing in, and the signed upload
+URL described under [Uploads](#uploads).
 
 ## Extension points
 
@@ -302,14 +421,25 @@ plugin system; each is a small interface or a single function.
 - **Authorization**: every route is registered through `Server.gate` with
   the role it needs, and the gate is the only place a role is compared.
   Finer-grained rules replace that one check.
-- **Audit**: every state change goes through a handful of handlers in
-  `api.go` that already log what changed.
+- **Audit**: there is no audit trail beyond the server's log. The handlers
+  that change what the registry records each log one line saying what
+  changed: a revision recorded (`api.go`, `hfupload.go`), a repository
+  created (`hfupload.go`) or deleted (`api.go`, `ui.go`), a mirror
+  completed, garbage collected, a token created or revoked (`api.go`), a
+  backup stored or a snapshot downloaded (`backup.go`). Pull-through logs
+  each revision it records and each file it fetches (`pullthrough.go`),
+  and the scheduled-backup loop logs each backup (`internal/cli/serve.go`).
+  Two changes are not logged: storing a file that no revision names yet,
+  and creating a branch through the Hugging Face route. An audit log would
+  start from these lines.
 
 ## What it deliberately is not
 
 No microservices, no message broker, no Kubernetes dependency, no separate
 database. One process against one data directory. Running two processes
-against the same directory is not supported.
+against the same directory is not supported, and neither is pointing two
+registries at one bucket and prefix: each would remove files the other
+still refers to.
 
 Metadata is SQLite on purpose. It is small (one row per file per revision)
 and SQLite serves it comfortably on one node, with nothing to operate. What

@@ -1,7 +1,9 @@
 # REST API
 
-The registry's own API lives under `/api/v1`. `modelctl` uses nothing else
-for administration. The Hugging Face compatible routes are described in
+The registry's own API lives under `/api/v1`. `modelctl` uses it for
+everything except the content of files it pulls, which it downloads from
+the same `resolve` route Hugging Face clients use. That route and the
+other Hugging Face compatible ones are described in
 [compatibility.md](compatibility.md).
 
 ## Conventions
@@ -77,9 +79,11 @@ distinct file once.
 
 `GET /api/v1/repos/{namespace}/{name}` (read)
 
-Returns its refs (`name`, `kind` of `branch` or `tag`, `sha`) and its
-revisions, newest first (`sha`, `parent`, `message`, `source` of `push` or
-`mirror`, `files`, `bytes`, `created_at`).
+Returns the repository's `name`, `upstream` (if it was mirrored) and
+`created_at`, with its `refs` (`name`, `kind` of `branch` or `tag`, `sha`,
+`updated_at`) and its `revisions`, newest first (`repo`, `sha`, `parent`,
+`message`, `source` of `push` or `mirror`, `files`, `bytes`, `created_at`;
+`parent` and `message` are absent when empty).
 
 ### Inspect a revision
 
@@ -139,7 +143,8 @@ has does not need to be uploaded.
 
 The body is the raw bytes. The upload is accepted only if the body hashes
 to the digest in the URL; otherwise it is rejected with `400` and nothing
-is stored. Uploading a file that is already stored succeeds.
+is stored. Uploading a file that is already stored succeeds. The answer is
+`201` with `{"sha256": "...", "size": 1234}`.
 
 ```bash
 SHA=$(sha256sum model.bin | cut -d' ' -f1)
@@ -217,7 +222,7 @@ All `admin`.
 | | |
 |---|---|
 | `GET /api/v1/tokens` | List tokens: `name`, `role`, `created_at`. Secrets are never returned. |
-| `POST /api/v1/tokens` | Body `{"name": "ci", "role": "write"}`. Returns the token secret, once. |
+| `POST /api/v1/tokens` | Body `{"name": "ci", "role": "write"}`. Answers `201` with `name`, `role` and `token`: the secret, which is shown this once and not kept. |
 | `DELETE /api/v1/tokens/{name}` | Revoke. Answers `204` with no body. |
 
 ## Backups

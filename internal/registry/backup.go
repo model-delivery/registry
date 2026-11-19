@@ -233,6 +233,12 @@ type BackupResult struct {
 // not be followed by the removal of old ones is a result, with PruneErr
 // set.
 func (r *Registry) Backup(ctx context.Context, keep int) (BackupResult, error) {
+	res, err := r.backup(ctx, keep)
+	r.noteBackup(res, err)
+	return res, err
+}
+
+func (r *Registry) backup(ctx context.Context, keep int) (BackupResult, error) {
 	// One at a time: a backup's name is chosen from the names already
 	// stored, and two choosing at once would choose the same one.
 	r.backupMu.Lock()

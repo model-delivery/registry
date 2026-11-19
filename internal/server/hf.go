@@ -278,6 +278,11 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		h.Set("Cache-Control", "no-cache")
 	}
 
+	// A download is a GET. It is a cache hit when the content is stored as
+	// the request arrives, and a miss when it has to be fetched first.
+	if r.Method == http.MethodGet && !f.Pending {
+		s.m.downloadHit.Inc()
+	}
 	if f.Pending {
 		// The revision lists this file but its content has not been fetched.
 		if r.Method == http.MethodHead {
@@ -299,6 +304,7 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		// it arrives; otherwise, and whenever the fetch ends before a byte
 		// could be sent, the request waits for the fetch and is answered
 		// from its result.
+		s.m.downloadMiss.Inc()
 		var err error
 		if start, streamed := s.streamFrom(r, f); streamed {
 			var job *pullJob[struct{}]
@@ -357,6 +363,9 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 			h.Set("X-Linked-Size", strconv.FormatInt(f.Size, 10))
 			h.Set("Location", location)
 			h.Set("Cache-Control", "no-store") // the signed URL expires
+			if r.Method == http.MethodGet {
+				s.m.downloadRedirects.Inc()
+			}
 			w.WriteHeader(http.StatusFound)
 			return
 		}
@@ -379,8 +388,8 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 	h.Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(filePath)))
 	h.Set("X-Content-Type-Options", "nosniff")
 	// ServeContent handles HEAD, Range, If-Range and If-None-Match, and
-	// streams straight from the file.
-	http.ServeContent(w, r, "", time.Time{}, content)
+	// streams straight from the file. The bytes it sends are counted.
+	http.ServeContent(&countedWriter{ResponseWriter: w, sent: s.m.bytesFromStore}, r, "", time.Time{}, content)
 }
 
 func (s *Server) hfWhoami(w http.ResponseWriter, r *http.Request) {

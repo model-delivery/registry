@@ -20,6 +20,7 @@ be kept in an S3-compatible bucket instead of on local disk.
         |    backup.go       metadata backups          /api/v1/backups...              |
         |    ui.go           web UI                    /  /ui/...                      |
         |    limits.go       bounds on the size and time of request bodies             |
+        |    metrics.go      what all of the above did, counted        /metrics        |
         +------------------------------------------------------------------------------+
                              |                                |
                              v                                v
@@ -41,11 +42,13 @@ be kept in an S3-compatible bucket instead of on local disk.
 Go client it uses: each client command is one call on the client. The
 server never calls the client; they share only the HTTP API.
 
-Three small packages sit beside these. `internal/datadir` is the one place
+Four small packages sit beside these. `internal/datadir` is the one place
 that names the files and directories of the data directory. `internal/kit`
 holds the few helpers more than one package needs and imports only the
-standard library, which is what lets the client use it. `internal/regtest`
-is test helpers.
+standard library, which is what lets the client use it. `internal/metrics`
+keeps counters, gauges and histograms and writes them in the Prometheus
+text format; it too is standard library only (see [Metrics](#metrics)).
+`internal/regtest` is test helpers.
 
 ## Data directory
 
@@ -434,6 +437,47 @@ context that `modelctl serve` cancels. On a signal, `serve` stops taking
 requests, cancels both, and waits for requests in flight, the fetches and
 a backup in progress, up to thirty seconds, before it closes the
 registry. Nothing is started on a context that nobody cancels.
+
+## Metrics
+
+`GET /metrics` reports what the registry is doing in the Prometheus text
+format. It is registered through the access gate with the read role, like
+browsing.
+
+The format is written by `internal/metrics`, a small package with no
+dependency: a metric is declared with its labels and *every value each
+label can take*, and a value that was not declared is not counted. That is
+what makes two promises structural, not a matter of care at each call
+site: nothing from a request (a repository, a path, a token's name, an
+address) can become a label value, and the output cannot grow while the
+process runs. Counting is one atomic operation on a handle the caller
+looked up once; a handle that was never made counts nothing, so code that
+counts does not depend on metrics having been set up.
+
+`internal/server/metrics.go` declares every metric and is the only place
+that knows their names. There are three ways a value gets there:
+
+- **Counted where it happens.** A handler or the pull-through coordinator
+  adds to a counter at the point it already logs: a file stored from an
+  upload, a fetch started and how it ended, a response sent from a fetch
+  in flight. Bytes are counted once per write of up to 256 KiB, never per
+  byte.
+- **Counted around every request.** The outermost handler notes each
+  request's class of route (decided from the method and the shape of the
+  path), its method and the class of its status, and times the routes that
+  are not transfers. The writer it hands down passes everything through to
+  the server's own, including `ReadFrom`, so a file is still sent the way
+  it was; `http.MaxBytesReader` is given the server's own writer
+  (`baseWriter`), because it tells the server to close the connection
+  through a method no wrapper can forward.
+- **Read when asked.** What the registry holds is one query over the
+  database (`Registry.Totals`), made at most every fifteen seconds
+  however often the endpoint is read. How backups and verify runs have
+  gone is kept by the registry itself, in memory (`Registry.Activity`),
+  so that scheduled backups, which the server's handlers never see, are
+  counted with the ones asked for over the API. The newest stored backup
+  is looked up once, so the age of the last backup is right after a
+  restart. A scrape never lists or reads stored files.
 
 ## Request limits
 

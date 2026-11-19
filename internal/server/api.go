@@ -132,8 +132,15 @@ func (s *Server) apiCommit(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.m.commits.With(sourcePush).Inc()
 	s.log.Info("revision recorded", "repo", c.Repo, "sha", c.SHA, "branch", req.Branch)
 	writeJSON(w, http.StatusCreated, c)
+}
+
+// uploaded counts a file that an upload sent and the registry stored.
+func (s *Server) uploaded(info blob.Info) {
+	s.m.uploadBlobs.Inc()
+	s.m.uploadBytes.Add(info.Size)
 }
 
 // freed is the answer to an operation that removes stored files: what was
@@ -221,7 +228,7 @@ func (s *Server) apiPutBlob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// A body sent without a declared length is cut off at the limit.
-		body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBlobBytes)
+		body = http.MaxBytesReader(baseWriter(w), r.Body, s.cfg.MaxBlobBytes)
 	}
 	// The body is streamed to disk and hashed as it arrives; the upload is
 	// rejected unless it hashes to the digest in the URL.
@@ -233,6 +240,7 @@ func (s *Server) apiPutBlob(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.uploaded(info)
 	writeJSON(w, http.StatusCreated, map[string]any{"sha256": info.SHA256, "size": info.Size})
 }
 
@@ -288,13 +296,18 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	// The last event Execute sends on success is the "done" line.
+	s.m.mirrorsStarted.Inc()
 	res, err := plan.Execute(r.Context(), s.reg, mirror.DefaultConcurrency, func(e mirror.Event) { events <- e })
 	close(events)
 	<-done
 	if err != nil {
+		s.m.mirrors.With(outcomeFailed).Inc()
 		emit(mirror.Event{Event: mirror.EventError, Error: s.mirrorFailure(plan, err)})
 		return
 	}
+	s.m.mirrors.With(outcomeSucceeded).Inc()
+	s.m.mirrorBytes.Add(res.DownloadedBytes)
+	s.m.commits.With(sourceMirror).Inc()
 	s.log.Info("mirror complete", "repo", res.Repo, "sha", res.SHA, "files", res.Files,
 		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", s.now().Sub(started).Round(time.Millisecond))
 }

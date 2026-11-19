@@ -294,23 +294,27 @@ func (p *Plan) RecordLazy(ctx context.Context, reg *registry.Registry) (registry
 // FetchFile fetches the content of one pending file of revision c from up,
 // verifies it against the digest recorded for it, and marks it stored.
 func FetchFile(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File) error {
-	return FetchFileFollowed(ctx, up, reg, c, f, nil)
+	_, err := FetchFileFollowed(ctx, up, reg, c, f, nil)
+	return err
 }
 
 // FetchFileFollowed is FetchFile with a tail on the download, so the
 // caller's readers can follow the bytes while they arrive (blob.Tail says
 // what such a reader may rely on). The tail is used only if the content has
 // to be downloaded; ending it is the caller's business either way.
-func FetchFileFollowed(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File, tail *blob.Tail) error {
+//
+// downloaded reports whether the content came from the upstream now, and
+// not from a blob the registry already stored.
+func FetchFileFollowed(ctx context.Context, up *Upstream, reg *registry.Registry, c registry.Commit, f registry.File, tail *blob.Tail) (downloaded bool, err error) {
 	e := Entry{Path: f.Path, Size: f.Size, OID: f.GitOID}
 	if f.LFS {
 		e.LFSSHA256 = f.SHA256
 	}
-	got, _, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e, tail)
+	got, downloaded, err := ensureBlob(ctx, up, reg, c.Repo, c.SHA, e, tail)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return reg.Fulfil(ctx, c, f.Path, got.SHA256)
+	return downloaded, reg.Fulfil(ctx, c, f.Path, got.SHA256)
 }
 
 // ensureBlob makes sure one upstream file's bytes are stored, downloading

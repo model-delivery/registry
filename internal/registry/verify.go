@@ -71,6 +71,16 @@ func (r *Registry) BlobTotals(ctx context.Context) (blobs int, bytes int64, err 
 // under way (by garbage collection or a delete) is passed over, not
 // reported as missing.
 func (r *Registry) Verify(ctx context.Context, report func(BlobCheck)) (VerifyResult, error) {
+	found := map[string]int{}
+	res, err := r.verify(ctx, func(c BlobCheck) {
+		found[c.Status]++
+		report(c)
+	})
+	r.noteVerify(found, err)
+	return res, err
+}
+
+func (r *Registry) verify(ctx context.Context, report func(BlobCheck)) (VerifyResult, error) {
 	var res VerifyResult
 	after := ""
 	for {

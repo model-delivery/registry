@@ -14,6 +14,7 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/metrics"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
 )
@@ -123,6 +124,8 @@ type puller struct {
 	// Server.Shutdown. It is never a request's.
 	ctx context.Context
 	now func() time.Time
+	// m counts what the coordinator does; its zero value counts nothing.
+	m pullMetrics
 
 	mu sync.Mutex
 	// The jobs in progress, of each kind, by what they fetch. A file fetch
@@ -161,6 +164,11 @@ type pullJob[T any] struct {
 	// ended, when set, is called with the job's error once its work is
 	// over, before anyone waiting on done is released.
 	ended func(err error)
+	// started and finished, when set, count the job: started when it is
+	// taken on, which a request that joins an existing job does not do
+	// again, and finished with how it ended.
+	started  *metrics.Counter
+	finished func(err error)
 }
 
 // newJob returns a job that has not started.
@@ -213,7 +221,7 @@ func (p *puller) allowed(repo string) bool {
 // maxWaitingPulls others are waiting for a slot; joining a job that already
 // exists is never refused.
 func (p *puller) share(ctx context.Context, key string, work func(ctx context.Context) error) error {
-	_, err := shareJob(ctx, p, p.fileJobs, p.slots, key, func(ctx context.Context) (struct{}, error) {
+	_, err := shareJob(ctx, p, p.fileJobs, p.slots, key, newJob[struct{}](), func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, work(ctx)
 	})
 	return err
@@ -222,14 +230,17 @@ func (p *puller) share(ctx context.Context, key string, work func(ctx context.Co
 // shareListing is share for a revision listing, which takes its slot from
 // the listings' own pool and yields the id the revision is stored under.
 func (p *puller) shareListing(ctx context.Context, key string, work func(ctx context.Context) (string, error)) (string, error) {
-	return shareJob(ctx, p, p.listingJobs, p.listings, key, work)
+	fresh := newJob[string]()
+	fresh.started = p.m.listingsStarted
+	fresh.finished = func(err error) { p.m.listings.With(pullOutcome(err, true)).Inc() }
+	return shareJob(ctx, p, p.listingJobs, p.listings, key, fresh, work)
 }
 
 // shareJob is what share and shareListing have in common: it joins the job
-// for key among jobs, or starts one that takes its slot from pool, and
-// waits for the result as long as ctx lives.
-func shareJob[T any](ctx context.Context, p *puller, jobs map[string]*pullJob[T], pool chan struct{}, key string, work func(ctx context.Context) (T, error)) (T, error) {
-	job, err := joinJob(p, jobs, pool, key, newJob[T](), work)
+// for key among jobs, or starts fresh as that job, taking its slot from
+// pool, and waits for the result as long as ctx lives.
+func shareJob[T any](ctx context.Context, p *puller, jobs map[string]*pullJob[T], pool chan struct{}, key string, fresh *pullJob[T], work func(ctx context.Context) (T, error)) (T, error) {
+	job, err := joinJob(p, jobs, pool, key, fresh, work)
 	if err != nil {
 		var none T
 		return none, err
@@ -250,12 +261,14 @@ func joinJob[T any](p *puller, jobs map[string]*pullJob[T], pool chan struct{}, 
 	case p.closed:
 		return nil, errShuttingDown
 	case p.waiting >= maxWaitingPulls:
+		p.m.queueFull.Inc()
 		return nil, errPullBusy
 	}
 	p.waiting++
 	p.running++
 	job := fresh
 	jobs[key] = job
+	job.started.Inc()
 	// Deliberately not the request's context: the fetch must outlive the
 	// request that started it (see the note at the top of this file).
 	go func() {
@@ -265,6 +278,9 @@ func joinJob[T any](p *puller, jobs map[string]*pullJob[T], pool chan struct{}, 
 		})
 		if job.ended != nil {
 			job.ended(job.err)
+		}
+		if job.finished != nil {
+			job.finished(job.err)
 		}
 		p.finish(func() {
 			delete(jobs, key)
@@ -387,6 +403,7 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 			p.log.Warn("pull-through could not record the revision", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
 			return "", err
 		}
+		p.m.recorded.Inc()
 		p.log.Info("pull-through recorded a revision; its files are fetched on demand", "repo", c.Repo, "revision", rev,
 			"sha", c.SHA, "files", len(plan.Entries), "bytes", plan.Bytes())
 		return c.Repo, nil
@@ -419,6 +436,8 @@ func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.Fi
 		return nil, errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
 	}
 	job := newJob[struct{}]()
+	job.started = p.m.fetchesStarted
+	job.finished = func(err error) { p.m.fetches.With(pullOutcome(err, false)).Inc() }
 	if p.stream {
 		job.tail = blob.NewTail()
 		job.ended = func(err error) {
@@ -432,9 +451,13 @@ func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.Fi
 	}
 	return joinJob(p, p.fileJobs, p.slots, c.Repo+"@"+c.SHA+":"+f.Path, job, func(ctx context.Context) (struct{}, error) {
 		started := p.now()
-		if err := mirror.FetchFileFollowed(ctx, p.upstream(), p.reg, c, f, job.tail); err != nil {
+		downloaded, err := mirror.FetchFileFollowed(ctx, p.upstream(), p.reg, c, f, job.tail)
+		if err != nil {
 			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
 			return struct{}{}, err
+		}
+		if downloaded {
+			p.m.fetchedBytes.Add(f.Size)
 		}
 		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
 			"took", p.now().Sub(started).Round(time.Millisecond))

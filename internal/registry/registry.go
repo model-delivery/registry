@@ -122,7 +122,10 @@ type Registry struct {
 	// lastBackup is the name of the last backup this process stored, which
 	// the next one's name has to follow. backupMu guards it.
 	lastBackup string
-	now        func() time.Time
+	// activity is what backups and verify runs have done since the process
+	// started (see Activity).
+	activity activity
+	now      func() time.Time
 	// dir holds the database and scratch space.
 	dir datadir.Dir
 }

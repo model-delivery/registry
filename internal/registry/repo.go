@@ -44,7 +44,7 @@ var (
 	repoRe   = regexp.MustCompile(`^` + repoPart + `/` + repoPart + `$`)
 	shaRe    = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	// Top-level URL segments the server uses for itself.
-	reservedNamespaces = map[string]bool{"api": true, "ui": true, "static": true, "healthz": true}
+	reservedNamespaces = map[string]bool{"api": true, "ui": true, "static": true, "healthz": true, "metrics": true}
 )
 
 // IsSHA reports whether s is a full revision id.

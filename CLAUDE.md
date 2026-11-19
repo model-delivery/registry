@@ -39,7 +39,11 @@ Read `docs/architecture.md` before changing anything structural, and
   `pullthrough.go` (fetching from upstream on demand), `stream.go`
   (sending a file to clients while it is fetched), `api.go` and
   `backup.go` (`/api/v1`), `ui.go` plus `templates/` and `static/` (web
-  UI), `limits.go` (bounds on request bodies).
+  UI), `limits.go` (bounds on request bodies), `metrics.go` (every metric
+  of `GET /metrics`, and the handler that counts requests).
+- `internal/metrics` — counters, gauges and histograms written in the
+  Prometheus text format. Standard library only; it knows nothing about
+  the registry.
 - `internal/client` — the Go client for `/api/v1`. It shares only the HTTP
   API with the server and imports no other package here but `internal/kit`.
 - `internal/cli` — the command line: `serve.go` (the server and its
@@ -192,6 +196,18 @@ are exercised), `task build`, `task docker`.
 - **`docs/api.md` lists every `/api/v1` route**, and nothing else.
   `TestAPIDocumentMatchesTheRoutes` fails when a route is added, renamed
   or removed without the document following.
+- **No metric is labelled by anything a request carries.** Not a
+  repository, revision, path, token name or address: the metrics must not
+  leak the catalogue or grow with it. A label is declared with all of its
+  values (`metrics.L`), and `internal/metrics` does not count a value
+  that was not declared, so a label's values are constants in
+  `server/metrics.go`. Counting is an atomic add on a handle looked up
+  beforehand, never a lock or a lookup per byte, and never changes an
+  answer: a handler's `ResponseWriter` may be wrapped, so
+  `http.MaxBytesReader` is given `baseWriter(w)`. A new metric gets a row
+  in the table in `docs/operations.md` (`TestEveryMetricIsDocumented`),
+  and `TestMetricsCountWhatTheRegistryDoes` is where what it counts is
+  checked.
 - **Compatibility claims need a real-client test.** If the README or
   `docs/compatibility.md` says a `huggingface_hub` call works, `test/e2e`
   must exercise it.

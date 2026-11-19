@@ -105,6 +105,7 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 | **Store** | Local disk, or an S3-compatible object store. Verified against Cloudflare R2 and SeaweedFS (which CI runs on every change). It uses the standard S3 API, so AWS S3, Backblaze B2, Ceph and MinIO are expected to work but have not been tested. With S3, downloads can be redirected to signed bucket URLs so the bytes never pass through the registry. |
 | **Control access** | Access tokens with read, write and admin roles. Downloads can be open or require a token. |
 | **Back up** | The metadata database is snapshotted on a schedule or on demand, verified, and stored beside the model files; `modelctl restore` puts a snapshot back. |
+| **Monitor** | `GET /metrics` reports, for Prometheus, the cache hit ratio, upstream failures, what is stored and pending, and the age of the last backup. No metric names a repository or a file. |
 | **Browse** | A small web UI lists repositories, revisions, files and storage use. |
 
 ## Command line
@@ -235,6 +236,15 @@ directory across, or `modelctl pull` there and `modelctl push` inside.
 verified snapshot of its metadata next to the model files on that
 schedule; `modelctl backup` takes one on demand and `modelctl restore`
 puts one back. See [docs/operations.md](docs/operations.md#backup-and-restore).
+
+**Monitoring.** `GET /metrics` is a Prometheus endpoint; nothing has to be
+turned on. It follows read access: open when downloads are open, and with
+`--require-auth` it needs a token with the `read` role, which Prometheus
+sends as a bearer token. The metrics, a scrape configuration and alerts
+for a backup that is too old, a failing upstream and a full fetch queue
+are in [docs/operations.md](docs/operations.md#monitoring). A namespace
+called `metrics` cannot be used for repositories, like `api`, `ui`,
+`static` and `healthz`.
 
 ## Hugging Face compatibility
 

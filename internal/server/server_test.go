@@ -272,6 +272,15 @@ func TestAccessControl(t *testing.T) {
 		{"private: read token downloads", private, http.MethodGet, "/acme/tiny/resolve/main/config.json", read, "", 200},
 		{"private: read token lists", private, http.MethodGet, "/api/v1/repos", read, "", 200},
 
+		// The metrics follow read access, as browsing does: they say how much
+		// the registry holds and how busy it is.
+		{"open: anonymous metrics", open, http.MethodGet, "/metrics", none, "", 200},
+		{"open: unknown token still reads metrics", open, http.MethodGet, "/metrics", foreign, "", 200},
+		{"private: anonymous metrics", private, http.MethodGet, "/metrics", none, "", 401},
+		{"private: unknown token metrics", private, http.MethodGet, "/metrics", foreign, "", 401},
+		{"private: read token metrics", private, http.MethodGet, "/metrics", read, "", 200},
+		{"private: admin token metrics", private, http.MethodGet, "/metrics", admin, "", 200},
+
 		// Backups contain every token hash: admins only, open registry or not.
 		{"open: anonymous backup list", open, http.MethodGet, "/api/v1/backups", none, "", 401},
 		{"open: write token backup list", open, http.MethodGet, "/api/v1/backups", write, "", 403},

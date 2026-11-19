@@ -292,10 +292,12 @@ func (s *Server) hfLFSUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// Streamed to storage and hashed on the way; rejected unless it is
 	// exactly the bytes the URL was issued for.
-	if _, err := s.reg.PutBlob(r.Context(), r.Body, blob.Expect{SHA256: oid, Size: size}); err != nil {
+	info, err := s.reg.PutBlob(r.Context(), r.Body, blob.Expect{SHA256: oid, Size: size})
+	if err != nil {
 		s.hfFail(w, r, err)
 		return
 	}
+	s.uploaded(info)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -320,7 +322,7 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 	}
 	in := registry.CommitInput{Repo: repo, Branch: rev, Source: registry.SourcePush, Merge: true}
 	// Each line is bounded below; this bounds how many there can be.
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxCommitBytes())
+	r.Body = http.MaxBytesReader(baseWriter(w), r.Body, s.maxCommitBytes())
 	br := bufio.NewReaderSize(r.Body, commitReadBuffer)
 	sawHeader := false
 	for {
@@ -371,6 +373,7 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 		s.hfFail(w, r, err)
 		return
 	}
+	s.m.commits.With(sourcePush).Inc()
 	s.log.Info("revision recorded", "repo", c.Repo, "sha", c.SHA, "branch", rev, "via", "hugging face upload")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":    true,
@@ -425,6 +428,7 @@ func (s *Server) applyCommitLine(ctx context.Context, in *registry.CommitInput, 
 		if err != nil {
 			return err
 		}
+		s.uploaded(info)
 		// A file sent inline is recorded the way the Hub records a file
 		// kept in git: not as an LFS file, so clients identify it by its
 		// git blob id. The id is not given here; Registry.Commit takes it

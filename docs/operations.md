@@ -518,8 +518,11 @@ Versions before v0.4.0 wrote `_10` there, and a later backup in a second
 whose first had been removed took the plain name again, was listed as the
 oldest, and left one backup more than the keep count. Backups with the
 older names are listed, restored and removed like any other, in the order
-they were taken. A failed backup is logged as an error and the schedule carries on;
-alert on `scheduled metadata backup failed`. A backup that was stored but
+they were taken.
+
+A failed backup is logged as an error and the schedule carries on; alert
+on the age of the last backup (see [Monitoring](#monitoring)), or on the
+log line `scheduled metadata backup failed`. A backup that was stored but
 could not be followed by the removal of old ones is not a failure: it is
 logged as a warning (`old backups beyond the number to keep could not be
 removed`), and `modelctl backup now` prints the warning.
@@ -717,6 +720,143 @@ content the registry already has a record of. For a file that belongs to
 mirrored repositories only, the other way is to `modelctl delete` each
 repository that uses it, which removes the stored copy, and mirror them
 again.
+
+## Monitoring
+
+`GET /metrics` answers in the Prometheus text format: what the cache is
+doing, how the upstream is behaving, how much is stored, and whether
+backups are being taken. Nothing has to be turned on.
+
+**Access.** The endpoint follows read access, like browsing: it is open
+when downloads are open, and with `--require-auth` it needs a token with
+at least the `read` role, sent as a bearer token. Make one for the
+scraper:
+
+```bash
+modelctl token create prometheus --role read
+```
+
+```yaml
+scrape_configs:
+  - job_name: model-registry
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["models.example.com:8080"]
+    # Only with --require-auth:
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/model-registry.token
+```
+
+**What the metrics never say.** No label is taken from a request: there
+is no repository, revision, file path, token name or client address
+anywhere in the output. Labels have a few fixed values each (a class of
+route, a method, a class of status, an outcome, the storage backend), so
+the output tells a reader how much the registry holds and how busy it is,
+not what it holds, and it does not grow with the number of models.
+
+**How to read them.**
+
+- Counters count since the server started, and start again from zero at a
+  restart, as Prometheus expects.
+- The counts of what the registry holds (`modelregistry_repositories`,
+  `modelregistry_revisions`, `modelregistry_storage_blobs`,
+  `modelregistry_storage_bytes`, `modelregistry_pending_files`,
+  `modelregistry_pending_bytes`) come from one query over the metadata
+  database, made at most every 15 seconds however often the endpoint is
+  read. Storage is never listed or read for a scrape, so a scrape costs the
+  same with a bucket of any size.
+- `modelregistry_backup_last_success_timestamp_seconds` is right from the
+  first scrape after a restart: until this process has taken a backup, it
+  is the time of the newest backup in storage. It is `0` when there is no
+  backup at all.
+- The verify metrics describe runs since the server started and are `0`
+  until one has finished; they are not kept across a restart.
+
+| Metric | Type | Labels | What it is |
+|---|---|---|---|
+| `modelregistry_build_info` | gauge | `version` | Always `1`; the label is the running version. |
+| `modelregistry_process_start_time_seconds` | gauge | | When the server started (Unix time). |
+| `modelregistry_http_requests_total` | counter | `route`, `method`, `code` | Requests answered. `route` is one of `download` (a file of a revision), `upload` (a request whose body is model content), `api` (`/api/v1`), `task` (the API requests that last as long as their job: mirror, verify, snapshot download), `hf` (Hugging Face metadata and upload steps), `ui`, `probe` (`/healthz` and `/metrics`), `other`. `method` is `GET`, `HEAD`, `POST`, `PUT`, `DELETE` or `other`. `code` is `1xx` to `5xx`. A series appears once a request of its kind has been answered. |
+| `modelregistry_http_requests_in_flight` | gauge | | Requests being answered now, the scrape among them. |
+| `modelregistry_http_request_duration_seconds` | histogram | `route` | How long requests took, for the routes `api`, `hf`, `ui`, `probe` and `other`. Transfers (`download`, `upload`) and `task` requests are not timed: they last as long as the file or the job. |
+| `modelregistry_download_requests_total` | counter | `cache` | `GET` requests for a file: `hit` when its content was already stored, `miss` when it had to be fetched from the upstream first (whether or not the fetch then succeeded). `HEAD` requests are not counted. |
+| `modelregistry_download_redirects_total` | counter | | `GET` requests answered with a redirect to the object store (`--s3-redirect`). They are hits too. |
+| `modelregistry_download_bytes_total` | counter | `source` | File content the registry itself sent: `store` from storage, `fetch` from a pull-through fetch still in flight. Redirected downloads send none. |
+| `modelregistry_pullthrough_listings_started_total` | counter | | Lookups of a revision's file listing upstream, started. |
+| `modelregistry_pullthrough_listings_total` | counter | `outcome` | Listing lookups finished: `succeeded`, `not_found` (the upstream does not have it, or it may not be recorded here), `upstream` (the upstream failed), `local` (the registry failed), `cancelled` (the server was stopping). |
+| `modelregistry_pullthrough_fetches_started_total` | counter | | File fetches started. Requests for a file already being fetched join that fetch and start none. |
+| `modelregistry_pullthrough_fetches_total` | counter | `outcome` | File fetches finished: `succeeded`, `upstream` (unreachable, an error answer, a file it no longer has), `verification` (the content did not match its digest or size), `local` (the registry failed, for example a full disk), `cancelled` (the server was stopping). |
+| `modelregistry_pullthrough_fetched_bytes_total` | counter | | Bytes downloaded from the upstream by fetches that succeeded. |
+| `modelregistry_pullthrough_fetches_in_flight` | gauge | | Pull-through jobs running now (file fetches and listing lookups). At most four file fetches run at once. |
+| `modelregistry_pullthrough_fetches_waiting` | gauge | | Jobs waiting for a slot; at most 64. |
+| `modelregistry_pullthrough_queue_full_total` | counter | | Requests answered `503` because that queue was full. |
+| `modelregistry_pullthrough_streams_started_total` | counter | | Responses that began sending a file while it was still being fetched. |
+| `modelregistry_pullthrough_streams_aborted_total` | counter | | Such responses cut off because the fetch failed, the content did not verify, or the server stopped. |
+| `modelregistry_pullthrough_distrusted_files` | gauge | | Files whose streamed fetch failed after bytes were sent; see [the first download](#the-first-download-of-a-file). Back to `0` at a restart. |
+| `modelregistry_upload_blobs_total` | counter | | Files received from uploads (`modelctl push`, Hugging Face clients) and stored. |
+| `modelregistry_upload_bytes_total` | counter | | Their bytes. |
+| `modelregistry_commits_total` | counter | `source` | Requests that recorded a revision: `push` (the registry API and Hugging Face uploads), `mirror`, `pull_through` (a listing recorded on demand). |
+| `modelregistry_mirrors_started_total` | counter | | Mirror requests that began copying a revision. |
+| `modelregistry_mirrors_total` | counter | `outcome` | Mirrors finished: `succeeded` or `failed`. |
+| `modelregistry_mirror_fetched_bytes_total` | counter | | Bytes downloaded from the upstream by mirrors that succeeded. |
+| `modelregistry_repositories` | gauge | | Repositories held. |
+| `modelregistry_revisions` | gauge | | Revisions recorded, over all repositories. |
+| `modelregistry_storage_blobs` | gauge | `backend` | Stored files, each distinct content once. `backend` is `filesystem` or `s3` (`other` is never seen outside tests). |
+| `modelregistry_storage_bytes` | gauge | `backend` | Their total size: what the registry takes up in storage. |
+| `modelregistry_pending_files` | gauge | | Files that revisions list and that have not been fetched from the upstream. |
+| `modelregistry_pending_bytes` | gauge | | Their total size: what fetching everything listed would add. |
+| `modelregistry_backup_last_success_timestamp_seconds` | gauge | | When the newest metadata backup was stored (Unix time); `0` with none. |
+| `modelregistry_backup_last_size_bytes` | gauge | | Its size. |
+| `modelregistry_backups_total` | counter | `outcome` | Backups attempted, scheduled and on demand: `succeeded` or `failed`. |
+| `modelregistry_backup_prune_failures_total` | counter | | Backups that were stored and could not be followed by the removal of old ones. |
+| `modelregistry_verify_last_run_timestamp_seconds` | gauge | | When the last `modelctl verify` run that checked every file finished (Unix time). |
+| `modelregistry_verify_last_run_blobs` | gauge | `status` | What that run found: files that were `ok`, `missing`, `damaged`, `unreadable`. |
+| `modelregistry_verify_runs_total` | counter | `outcome` | Verify runs: `succeeded` (every file was checked, whatever was found) or `failed` (the run stopped early). |
+
+**The cache hit ratio** is the share of downloads that did not need the
+upstream:
+
+```promql
+sum(rate(modelregistry_download_requests_total{cache="hit"}[1h]))
+  / sum(rate(modelregistry_download_requests_total[1h]))
+```
+
+A registry that only serves what was pushed or mirrored to it sits at 1.
+With pull-through it starts low and rises as the models your clients use
+are fetched; `modelregistry_pending_bytes` falling to a floor says the
+same thing from the other side.
+
+**Alerts worth having.**
+
+```yaml
+groups:
+  - name: model-registry
+    rules:
+      # No backup for two intervals (here, hourly backups). It also fires
+      # when there is no backup at all, since the timestamp is then 0.
+      - alert: RegistryBackupTooOld
+        expr: time() - modelregistry_backup_last_success_timestamp_seconds > 2 * 3600
+        for: 10m
+      # More than one fetch in ten is failing because of the upstream.
+      - alert: RegistryUpstreamFailing
+        expr: |
+          sum(rate(modelregistry_pullthrough_fetches_total{outcome=~"upstream|verification"}[15m]))
+            / sum(rate(modelregistry_pullthrough_fetches_total[15m])) > 0.1
+        for: 15m
+      # Clients are being turned away because fetches are queued up.
+      - alert: RegistryFetchQueueFull
+        expr: increase(modelregistry_pullthrough_queue_full_total[10m]) > 0
+```
+
+Three more that cost nothing to add: `modelregistry_verify_last_run_blobs{status!="ok"} > 0`
+(a verify run found damage), `increase(modelregistry_pullthrough_fetches_total{outcome="local"}[15m]) > 0`
+(the registry itself cannot store what it fetches, usually a full disk),
+and `increase(modelregistry_backups_total{outcome="failed"}[1h]) > 0`.
+
+The metrics do not replace the log. A failure is counted by kind; which
+repository and file it was, and the upstream's reason, are in the log
+line of that failure.
 
 ## Stopping the server
 

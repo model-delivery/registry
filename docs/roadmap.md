@@ -27,7 +27,6 @@ of dates. Issues and pull requests that move an item forward are welcome.
   running more than one needs.
 - **OIDC sign-in** for the web UI.
 - **Per-repository permissions.**
-- **Metrics endpoint** for Prometheus.
 - **More in the web UI:** rendered model cards, mirror from the browser,
   token management.
 

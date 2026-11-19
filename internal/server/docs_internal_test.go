@@ -27,7 +27,7 @@ var (
 func sameRoute(route string) string { return pathParameter.ReplaceAllString(route, "{}") }
 
 // docs/api.md is the reference for the registry's own API: everything
-// under /api/v1, and the health check. Every such route the server
+// under /api/v1, the health check and the metrics. Every such route the server
 // registers is in the document, and every route the document names is
 // registered. A route added, renamed or removed fails here until the
 // document follows.
@@ -50,7 +50,7 @@ func TestAPIDocumentMatchesTheRoutes(t *testing.T) {
 	registered := map[string]bool{}
 	for _, pattern := range s.patterns {
 		_, path, _ := strings.Cut(pattern, " ")
-		if strings.HasPrefix(path, "/api/v1/") || path == "/healthz" {
+		if strings.HasPrefix(path, "/api/v1/") || path == "/healthz" || path == "/metrics" {
 			registered[sameRoute(pattern)] = true
 		}
 	}

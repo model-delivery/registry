@@ -75,6 +75,26 @@ type Presigner interface {
 	PresignGet(ctx context.Context, sha256 string, ttl time.Duration) (string, error)
 }
 
+// The kinds of store, as Kind names them.
+const (
+	KindFilesystem = "filesystem"
+	KindS3         = "s3"
+	KindOther      = "other"
+)
+
+// Kind names the backend a store is: KindFilesystem, KindS3, or KindOther
+// for anything else, such as a store wrapped by a test. A new backend joins
+// here.
+func Kind(s Store) string {
+	switch s.(type) {
+	case *FS:
+		return KindFilesystem
+	case *S3:
+		return KindS3
+	}
+	return KindOther
+}
+
 // blobKey is the path of a blob relative to a store's root:
 // sha256/<first two hex>/<digest>.
 func blobKey(digest string) (string, error) {

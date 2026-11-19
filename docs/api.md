@@ -249,6 +249,7 @@ address still works and answers the same; new clients should use
 | `POST /api/v1/gc` (admin) | Remove stored files no revision references and that are more than an hour old. Returns what was freed, as `{"blobs": 3, "bytes": 28183891}`, with a `warning` string when some files could not be removed from storage. Those are not counted, and the next run tries them again. |
 | `POST /api/v1/verify` (admin) | Re-read every stored file and check it against its digest. See below. |
 | `GET /healthz` | `{"status": "ok", "version": "..."}`. No authentication. |
+| `GET /metrics` (read) | What the registry is doing, in the Prometheus text format (`text/plain; version=0.0.4`), not JSON. Like every `read` route it is open unless the server runs with `--require-auth`; a scraper then sends a token as a bearer token. [operations.md](operations.md#monitoring) lists the metrics. |
 
 ### Check stored files
 

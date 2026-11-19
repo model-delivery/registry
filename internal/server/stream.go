@@ -160,6 +160,7 @@ func (s *Server) serveWhileFetching(w http.ResponseWriter, r *http.Request, job 
 		status = http.StatusPartialContent
 	}
 	w.WriteHeader(status)
+	s.m.pull.streamsStarted.Inc()
 
 	flusher := http.NewResponseController(w)
 	buf := make([]byte, streamChunk)
@@ -188,6 +189,7 @@ func (s *Server) serveWhileFetching(w http.ResponseWriter, r *http.Request, job 
 				return true // the client left
 			}
 			off += int64(n)
+			s.m.bytesFromFetch.Add(int64(n)) // once for each piece of up to streamChunk
 		}
 		if err != nil && n == 0 {
 			s.abortStream(r, job, c, f, off-start, err)
@@ -202,6 +204,7 @@ func (s *Server) serveWhileFetching(w http.ResponseWriter, r *http.Request, job 
 // the response being completed, so the client sees a transfer cut short of
 // the length it was given.
 func (s *Server) abortStream(r *http.Request, job *pullJob[struct{}], c registry.Commit, f registry.File, sent int64, cause error) {
+	s.m.pull.streamsAborted.Inc()
 	if errors.Is(cause, blob.ErrTailEnded) {
 		// The fetch's own error is the reason. It is set by the time the tail
 		// ends, and readable once the job is done, which is a moment later.

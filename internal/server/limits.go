@@ -119,7 +119,7 @@ func isFileTransfer(r *http.Request) bool {
 func (s *Server) smallBody(w http.ResponseWriter, r *http.Request, limit int64, read func(body io.ReadCloser) error) error {
 	rc := http.NewResponseController(w)
 	timed := rc.SetReadDeadline(time.Now().Add(s.bodyTimeout())) == nil
-	body := http.MaxBytesReader(w, r.Body, limit)
+	body := http.MaxBytesReader(baseWriter(w), r.Body, limit)
 	err := read(body)
 	_, rest := io.Copy(io.Discard, body)
 	if rest == nil && timed {

@@ -101,6 +101,9 @@ type Server struct {
 	// start and never stored, so a restart invalidates URLs in flight; the
 	// client then asks for new ones.
 	uploadKey []byte
+	// m is what GET /metrics reports (metrics.go). Its zero value counts
+	// nothing.
+	m serverMetrics
 }
 
 // New builds the server. The result is the http.Handler to serve.
@@ -115,10 +118,12 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	// started on it, never on a request's context and never on none.
 	lifetime, stop := context.WithCancel(context.Background())
 	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, stop: stop, uploadKey: newUploadKey()}
+	s.m.declare(cfg.Version, s.now())
 	if cfg.PullThrough {
 		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.PullThroughMaxFileBytes, cfg.Logger)
 		s.puller.ctx, s.puller.now = lifetime, s.now
 		s.puller.stream = !cfg.PullThroughNoStream
+		s.puller.m = s.m.pull
 	}
 
 	// Every route is registered with the access it needs: gate, with a role
@@ -133,6 +138,10 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	handle("GET /healthz", public(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": cfg.Version})
 	}))
+	// What the registry is doing, for Prometheus (metrics.go). It follows
+	// read access, as browsing does: counts of what is stored say how much
+	// a private registry holds. A scraper sends a token as a bearer token.
+	handle("GET /metrics", s.gate(registry.RoleRead, asAPI, s.serveMetrics))
 
 	// Registry API.
 	api := func(minimum registry.Role, h http.HandlerFunc) http.Handler { return s.gate(minimum, asAPI, h) }
@@ -200,7 +209,8 @@ func New(reg *registry.Registry, cfg Config) *Server {
 
 	// Browsers may only make state-changing requests from our own pages.
 	// Non-browser clients (the CLI, Python libraries) are unaffected.
-	s.handler = s.guardBodies(http.NewCrossOriginProtection().Handler(s.identify(mux)))
+	// Outermost, every request is counted (metrics.go), whatever becomes of it.
+	s.handler = s.instrument(s.guardBodies(http.NewCrossOriginProtection().Handler(s.identify(mux))))
 	return s
 }
 

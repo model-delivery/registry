@@ -509,12 +509,13 @@ func TestClientOptionsComeFromFlagThenEnvironment(t *testing.T) {
 		if code, out, errOut := reg.run(t, nil, "list"); code != 0 || !strings.Contains(out, "No repositories yet") {
 			t.Fatalf("with MODELCTL_ENDPOINT: code %d %q %q", code, out, errOut)
 		}
-		// Neither: the default, which the error names. (Nothing is assumed to
-		// listen there, and nothing needs to: either outcome names it.)
-		var out, errOut bytes.Buffer
-		code := Run(context.Background(), []string{"token", "list"}, &out, &errOut, func(string) string { return "" })
-		if code == 0 || (!strings.Contains(errOut.String(), "http://localhost:8080") && !strings.Contains(errOut.String(), "MODELCTL_TOKEN")) {
-			t.Fatalf("with nothing set: code %d, stderr %q", code, errOut.String())
+		// Neither: the default. Looked at without sending anything there.
+		c := newClientCommand(&env{stderr: io.Discard, getenv: func(string) string { return "" }}, "list", "list")
+		if _, err := c.parse(nil, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.client(); got.Endpoint != "http://localhost:8080" || got.Token != "" {
+			t.Fatalf("with nothing set: endpoint %q, token %q", got.Endpoint, got.Token)
 		}
 	})
 

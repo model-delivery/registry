@@ -390,10 +390,12 @@ it, from the same fetch or from storage.
 `REGISTRY_PULL_THROUGH_STREAM=false`) restores the strict behaviour: the
 registry hands a file to a client only once all of it is stored and
 verified, without exception. The first download of a large file then
-sends nothing until the fetch is complete, clients with short timeouts
-give up and report an error (`huggingface_hub` raises a read timeout),
-the fetch carries on regardless, and a retry once it has finished is
-served at once.
+sends nothing until the fetch is complete, so a client's first request
+times out. Older clients then give up and report an error
+(`huggingface_hub` 1.24.0 raises a read timeout); recent ones
+(`huggingface_hub` 2.4.0) retry a few times and succeed if the fetch
+finishes meanwhile. The fetch carries on regardless, and a retry once it
+has finished is served at once.
 
 **Your own repositories are never filled from upstream.** Pull-through
 looks upstream for two kinds of repository only: one the registry does not

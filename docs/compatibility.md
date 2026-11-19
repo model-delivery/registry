@@ -5,9 +5,10 @@ clients use to **download and upload models**. It does not implement the
 whole Hub API, and this page lists exactly what is covered.
 
 Compatibility is checked in CI by running the real `huggingface_hub`
-Python library against the registry (`test/e2e`). The version tested is
-whatever `pip install huggingface_hub` installs on the day; it was 1.24.0
-when this was written.
+Python library against the registry (`test/e2e`). CI installs the latest
+release on the day. The suite was last run locally against
+`huggingface_hub` 2.4.0. Where a client's behaviour differs between
+versions in a way that matters here, this page says so.
 
 ## Using it
 
@@ -184,13 +185,17 @@ saying so; it does not pretend to succeed.
   (ten seconds between bytes for `huggingface_hub`), that request times
   out. The fetch carries on; download again, or fetch everything ahead of
   time with `modelctl mirror`.
-- **With `--pull-through-stream=false` the first download of a large file
-  can time out.** The registry then hands over a file only once it has
-  fetched and verified all of it, and `huggingface_hub` raises a read
-  timeout (tested in `test/e2e`). The fetch carries on after the client
-  gives up; run the download again when it has finished. Listings and
-  file metadata answer immediately, and small files (tested in
-  `test/e2e`, including against huggingface.co) arrive within the
+- **With `--pull-through-stream=false` the first request for a large
+  file can time out.** The registry then hands over a file only once it
+  has fetched and verified all of it, so the client's first request gets
+  nothing within its timeout (tested in `test/e2e`). What happens next
+  depends on the client's version: `huggingface_hub` 1.24.0 gives up with
+  a read timeout, and you run the download again once the fetch has
+  finished; recent versions (2.4.0, and from about 1.31 on) retry a
+  timed-out download a few times by themselves and succeed if the fetch
+  finishes within those retries. The fetch carries on either way.
+  Listings and file metadata answer immediately, and small files (tested
+  in `test/e2e`, including against huggingface.co) arrive within the
   timeout.
 - **Model cards are not rendered.** `README.md` is stored and served like
   any other file.

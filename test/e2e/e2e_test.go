@@ -15,12 +15,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +62,7 @@ const downloadPy = `
 import json, sys
 import huggingface_hub
 from huggingface_hub import snapshot_download, hf_hub_download, HfApi
+from huggingface_hub.hf_api import RepoFile, RepoFolder
 
 repo, revision, one_file = sys.argv[1], sys.argv[2], sys.argv[3]
 snapshot = snapshot_download(repo, revision=revision)
@@ -67,6 +70,8 @@ single = hf_hub_download(repo, one_file, revision=revision)
 api = HfApi()
 info = api.model_info(repo, revision=revision)
 refs = api.list_repo_refs(repo)
+tree = list(api.list_repo_tree(repo, revision=revision, recursive=True))
+top = list(api.list_repo_tree(repo, revision=revision))
 print(json.dumps({
     "version": huggingface_hub.__version__,
     "snapshot": snapshot,
@@ -74,20 +79,28 @@ print(json.dumps({
     "sha": info.sha,
     "siblings": sorted(s.rfilename for s in info.siblings),
     "listed": sorted(api.list_repo_files(repo, revision=revision)),
+    "tree_files": {e.path: e.size for e in tree if isinstance(e, RepoFile)},
+    "tree_folders": sorted(e.path for e in tree if isinstance(e, RepoFolder)),
+    "top_level": sorted(e.path for e in top),
     "branches": {b.name: b.target_commit for b in refs.branches},
     "tags": {t.name: t.target_commit for t in refs.tags},
 }))
 `
 
 type pyResult struct {
-	Version  string            `json:"version"`
-	Snapshot string            `json:"snapshot"`
-	Single   string            `json:"single"`
-	SHA      string            `json:"sha"`
-	Siblings []string          `json:"siblings"`
-	Listed   []string          `json:"listed"`
-	Branches map[string]string `json:"branches"`
-	Tags     map[string]string `json:"tags"`
+	Version  string   `json:"version"`
+	Snapshot string   `json:"snapshot"`
+	Single   string   `json:"single"`
+	SHA      string   `json:"sha"`
+	Siblings []string `json:"siblings"`
+	Listed   []string `json:"listed"`
+	// What list_repo_tree returned: with recursive=True, every file with its
+	// size and every directory; without, the entries at the top.
+	TreeFiles   map[string]int64  `json:"tree_files"`
+	TreeFolders []string          `json:"tree_folders"`
+	TopLevel    []string          `json:"top_level"`
+	Branches    map[string]string `json:"branches"`
+	Tags        map[string]string `json:"tags"`
 }
 
 // hfDownload runs the script with HF_ENDPOINT pointed at endpoint and a
@@ -179,14 +192,74 @@ func checkSnapshot(t *testing.T, in *regtest.Instance, repo, wantSHA string, res
 	if len(res.Siblings) != len(files) {
 		t.Errorf("client lists %d files, registry has %d", len(res.Siblings), len(files))
 	}
+	// list_repo_tree: every file with its size, every directory that holds
+	// one, and at the top level the first segment of each path.
+	folders, top := map[string]bool{}, map[string]bool{}
+	if len(res.TreeFiles) != len(files) {
+		t.Errorf("list_repo_tree returned %d files, registry has %d", len(res.TreeFiles), len(files))
+	}
 	for _, f := range files {
 		got := regtest.FileSHA256(t, filepath.Join(res.Snapshot, filepath.FromSlash(f.Path)))
 		if got != f.SHA256 {
 			t.Errorf("%s: downloaded sha256 %s, registry has %s", f.Path, got, f.SHA256)
 		}
+		if size, listed := res.TreeFiles[f.Path]; !listed || size != f.Size {
+			t.Errorf("%s: list_repo_tree says size %d (listed: %v), registry has %d", f.Path, size, listed, f.Size)
+		}
+		segs := strings.Split(f.Path, "/")
+		top[segs[0]] = true
+		for i := 1; i < len(segs); i++ {
+			folders[strings.Join(segs[:i], "/")] = true
+		}
+	}
+	if got, want := strings.Join(res.TreeFolders, ","), strings.Join(slices.Sorted(maps.Keys(folders)), ","); got != want {
+		t.Errorf("list_repo_tree directories: %s, want %s", got, want)
+	}
+	if got, want := strings.Join(res.TopLevel, ","), strings.Join(slices.Sorted(maps.Keys(top)), ","); got != want {
+		t.Errorf("list_repo_tree at the top level: %s, want %s", got, want)
 	}
 	if _, err := os.Stat(res.Single); err != nil {
 		t.Errorf("hf_hub_download result missing: %v", err)
+	}
+}
+
+// TestHfDownloadCommand runs the actual "hf download" command: a whole
+// repository, then one file at a tag.
+func TestHfDownloadCommand(t *testing.T) {
+	python(t)
+	files := map[string]string{
+		"config.json":         `{"model_type":"tiny"}`,
+		"model.safetensors":   strings.Repeat("\x00weights\xff", 200_000),
+		"tokenizer/vocab.txt": "a\nb\nc\n",
+	}
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
+	if _, err := client.New(in.URL, in.Write).Push(context.Background(), regtest.WriteTree(t, files), "team/own-model",
+		client.PushOptions{Branch: "main", Tags: []string{"v1.0"}}); err != nil {
+		t.Fatal(err)
+	}
+	hf := func(args ...string) {
+		t.Helper()
+		if _, stderr, err := runPython(t, in.URL, "", hfCommandPy, nil, args...); err != nil {
+			t.Fatalf("hf %s failed: %v\n%s", strings.Join(args, " "), err, tail(stderr, 12))
+		}
+	}
+
+	whole := t.TempDir()
+	hf("download", "team/own-model", "--local-dir", whole)
+	for p, want := range files {
+		got, err := os.ReadFile(filepath.Join(whole, filepath.FromSlash(p)))
+		if err != nil || string(got) != want {
+			t.Errorf("%s after hf download: %d bytes, %v; want the %d bytes pushed", p, len(got), err, len(want))
+		}
+	}
+
+	one := t.TempDir()
+	hf("download", "team/own-model", "tokenizer/vocab.txt", "--revision", "v1.0", "--local-dir", one)
+	if got, err := os.ReadFile(filepath.Join(one, "tokenizer", "vocab.txt")); err != nil || string(got) != files["tokenizer/vocab.txt"] {
+		t.Errorf("one file at a tag: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(one, "config.json")); !os.IsNotExist(err) {
+		t.Errorf("asking for one file fetched another: %v", err)
 	}
 }
 

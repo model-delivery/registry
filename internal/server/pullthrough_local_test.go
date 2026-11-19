@@ -13,7 +13,9 @@ import (
 	"testing"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -28,7 +30,7 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 	cfg := server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true}
 
 	t.Run("a pushed repository is never added to from upstream", func(t *testing.T) {
-		local := start(t, cfg)
+		local := regtest.Start(t, cfg)
 		mine := push(t, local, "acme/tiny", map[string]string{"config.json": "MINE"}, client.PushOptions{})
 		lookups, downloads := hub.lookups.Load(), hub.files.Load()
 
@@ -41,7 +43,7 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 			"/api/v1/repos/acme/tiny/revisions/dev",
 			"/api/v1/repos/acme/tiny/revisions/" + theirs.SHA,
 		} {
-			resp := do(t, http.MethodGet, local.url+path, "", nil, nil)
+			resp := do(t, http.MethodGet, local.URL+path, "", nil, nil)
 			if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != "RevisionNotFound" {
 				t.Errorf("%s: status %d code %q, want 404 RevisionNotFound", path, resp.StatusCode, resp.Header.Get("X-Error-Code"))
 			}
@@ -50,22 +52,22 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 			t.Errorf("the upstream was contacted for a repository that was pushed here: lookups %d -> %d, files %d -> %d",
 				lookups, hub.lookups.Load(), downloads, hub.files.Load())
 		}
-		repo, err := local.reg.GetRepo(ctx, "acme/tiny")
+		repo, err := local.Reg.GetRepo(ctx, "acme/tiny")
 		if err != nil || repo.Upstream != "" {
 			t.Fatalf("upstream = %q (%v), want it left empty", repo.Upstream, err)
 		}
-		refs, _ := local.reg.Refs(ctx, repo)
+		refs, _ := local.Reg.Refs(ctx, repo)
 		if len(refs) != 1 || refs[0].Name != "main" || refs[0].SHA != mine.SHA {
 			t.Fatalf("refs = %+v, want only main at %s", refs, mine.SHA)
 		}
-		if got := body(t, do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)); got != "MINE" {
+		if got := body(t, do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)); got != "MINE" {
 			t.Fatalf("main serves %q", got)
 		}
 	})
 
 	t.Run("nor is one an upload has created but not committed to yet", func(t *testing.T) {
-		local := start(t, cfg)
-		resp := do(t, http.MethodPost, local.url+"/api/repos/create", local.write,
+		local := regtest.Start(t, cfg)
+		resp := do(t, http.MethodPost, local.URL+"/api/repos/create", local.Write,
 			jsonBody(t, map[string]any{"name": "tiny", "organization": "acme"}), nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("create: %d", resp.StatusCode)
@@ -73,7 +75,7 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 		lookups := hub.lookups.Load()
 		// A reader asks for main before the upload's commit arrives.
 		for _, path := range []string{"/acme/tiny/resolve/main/config.json", "/api/models/acme/tiny/revision/main"} {
-			resp := do(t, http.MethodGet, local.url+path, "", nil, nil)
+			resp := do(t, http.MethodGet, local.URL+path, "", nil, nil)
 			if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != "RevisionNotFound" {
 				t.Fatalf("%s: status %d code %q", path, resp.StatusCode, resp.Header.Get("X-Error-Code"))
 			}
@@ -82,27 +84,27 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 			t.Fatal("the upstream was contacted for a repository that was created here")
 		}
 		// The upload then commits as if nothing had happened.
-		if status, out := commitTo(t, local, "acme/tiny", "main", local.write, header("first", ""), inlineFile("config.json", "MINE")); status != http.StatusOK {
+		if status, out := commitTo(t, local, "acme/tiny", "main", local.Write, header("first", ""), inlineFile("config.json", "MINE")); status != http.StatusOK {
 			t.Fatalf("commit: %d %s", status, out)
 		}
-		if got := body(t, do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)); got != "MINE" {
+		if got := body(t, do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)); got != "MINE" {
 			t.Fatalf("main serves %q", got)
 		}
-		if repo, err := local.reg.GetRepo(ctx, "acme/tiny"); err != nil || repo.Upstream != "" {
+		if repo, err := local.Reg.GetRepo(ctx, "acme/tiny"); err != nil || repo.Upstream != "" {
 			t.Fatalf("upstream = %q (%v), want it left empty", repo.Upstream, err)
 		}
 	})
 
 	t.Run("a listed file in a repository created here is not fetched", func(t *testing.T) {
 		// Data written before this rule existed could hold such a revision.
-		local := start(t, cfg)
+		local := regtest.Start(t, cfg)
 		push(t, local, "acme/tiny", map[string]string{"config.json": "MINE"}, client.PushOptions{})
-		if _, err := local.reg.CommitLazy(ctx, registry.LazyInput{Repo: "acme/tiny", SHA: theirs.SHA,
-			Files: []registry.File{{Path: "config.json", Size: int64(len("THEIRS")), SHA256: sha("THEIRS"), GitOID: strings.Repeat("a", 40), LFS: true}}}); err != nil {
+		if _, err := local.Reg.CommitLazy(ctx, registry.LazyInput{Repo: "acme/tiny", SHA: theirs.SHA,
+			Files: []registry.File{{Path: "config.json", Size: int64(len("THEIRS")), SHA256: kit.SHA256Hex("THEIRS"), GitOID: strings.Repeat("a", 40), LFS: true}}}); err != nil {
 			t.Fatal(err)
 		}
 		downloads := hub.files.Load()
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/"+theirs.SHA+"/config.json", "", nil, nil)
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/"+theirs.SHA+"/config.json", "", nil, nil)
 		if msg := body(t, resp); resp.StatusCode != http.StatusNotFound || !strings.Contains(msg, "modelctl mirror acme/tiny") {
 			t.Fatalf("status %d: %s", resp.StatusCode, msg)
 		}
@@ -112,9 +114,9 @@ func TestPullThroughLeavesLocalRepositoriesAlone(t *testing.T) {
 	})
 
 	t.Run("a repository that came from upstream still gains revisions", func(t *testing.T) {
-		local := start(t, cfg)
+		local := regtest.Start(t, cfg)
 		for rev, want := range map[string]string{"main": modelFiles["config.json"], "dev": "THEIRS"} {
-			resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/"+rev+"/config.json", "", nil, nil)
+			resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/"+rev+"/config.json", "", nil, nil)
 			if got := body(t, resp); resp.StatusCode != http.StatusOK || got != want {
 				t.Fatalf("%s: status %d body %q", rev, resp.StatusCode, got)
 			}
@@ -153,34 +155,34 @@ func TestPullThroughAppliesItsRulesToTheCanonicalName(t *testing.T) {
 	const path = "/api/models/acme/renamed/revision/main"
 
 	t.Run("stored under the canonical name when nothing forbids it", func(t *testing.T) {
-		local := start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
-		if resp := do(t, http.MethodGet, local.url+path, "", nil, nil); resp.StatusCode != http.StatusOK {
+		local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
+		if resp := do(t, http.MethodGet, local.URL+path, "", nil, nil); resp.StatusCode != http.StatusOK {
 			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 		}
-		if _, err := local.reg.GetRepo(ctx, "internal/model"); err != nil {
+		if _, err := local.Reg.GetRepo(ctx, "internal/model"); err != nil {
 			t.Fatalf("not stored under the canonical name: %v", err)
 		}
 	})
 	t.Run("refused when the allow list does not cover the canonical name", func(t *testing.T) {
-		local := start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true, PullThroughAllow: []string{"acme/*"}})
-		if resp := do(t, http.MethodGet, local.url+path, "", nil, nil); resp.StatusCode != http.StatusNotFound {
+		local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true, PullThroughAllow: []string{"acme/*"}})
+		if resp := do(t, http.MethodGet, local.URL+path, "", nil, nil); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status %d, want 404", resp.StatusCode)
 		}
-		if _, err := local.reg.GetRepo(ctx, "internal/model"); !errors.Is(err, registry.ErrRepoNotFound) {
+		if _, err := local.Reg.GetRepo(ctx, "internal/model"); !errors.Is(err, registry.ErrRepoNotFound) {
 			t.Fatalf("a repository outside the allow list was stored: %v", err)
 		}
 	})
 	t.Run("refused when the canonical name is a repository created here", func(t *testing.T) {
-		local := start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
+		local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
 		push(t, local, "internal/model", map[string]string{"config.json": "MINE"}, client.PushOptions{})
-		if resp := do(t, http.MethodGet, local.url+path, "", nil, nil); resp.StatusCode != http.StatusNotFound {
+		if resp := do(t, http.MethodGet, local.URL+path, "", nil, nil); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status %d, want 404", resp.StatusCode)
 		}
-		repo, err := local.reg.GetRepo(ctx, "internal/model")
+		repo, err := local.Reg.GetRepo(ctx, "internal/model")
 		if err != nil || repo.Upstream != "" {
 			t.Fatalf("upstream = %q (%v), want it left empty", repo.Upstream, err)
 		}
-		if revs, _ := local.reg.Commits(ctx, repo); len(revs) != 1 {
+		if revs, _ := local.Reg.Commits(ctx, repo); len(revs) != 1 {
 			t.Fatalf("%d revisions, want only the pushed one", len(revs))
 		}
 	})
@@ -189,7 +191,7 @@ func TestPullThroughAppliesItsRulesToTheCanonicalName(t *testing.T) {
 func TestPullThroughAsksUpstreamOnlyAboutValidRevisions(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 	for name, rev := range map[string]string{
 		"a space":            "not%20a%20ref",
 		"two dots":           "a..b",
@@ -197,7 +199,7 @@ func TestPullThroughAsksUpstreamOnlyAboutValidRevisions(t *testing.T) {
 		"a control char":     "main%0d%0aX",
 		"longer than a name": strings.Repeat("r", 300),
 	} {
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/"+rev+"/config.json", "", nil, nil)
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/"+rev+"/config.json", "", nil, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("%s: status %d, want 404", name, resp.StatusCode)
 		}
@@ -205,7 +207,7 @@ func TestPullThroughAsksUpstreamOnlyAboutValidRevisions(t *testing.T) {
 	if got := hub.lookups.Load(); got != 0 {
 		t.Fatalf("the upstream was asked %d times about revisions that cannot exist", got)
 	}
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("a valid revision: status %d", resp.StatusCode)
 	}
 }
@@ -224,9 +226,9 @@ func TestUpstreamErrorPagesAreNotRelayed(t *testing.T) {
 			next.ServeHTTP(w, r)
 		})
 	})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hubURL, PullThrough: true})
 
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 	msg := body(t, resp)
 	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(msg, "upstream returned 500") {
 		t.Fatalf("pull-through: status %d: %s", resp.StatusCode, msg)
@@ -235,7 +237,7 @@ func TestUpstreamErrorPagesAreNotRelayed(t *testing.T) {
 		t.Fatalf("pull-through relayed the upstream's error page: %s", msg)
 	}
 
-	resp = do(t, http.MethodPost, local.url+"/api/v1/mirror", local.write, jsonBody(t, map[string]any{"repo": "acme/tiny"}), nil)
+	resp = do(t, http.MethodPost, local.URL+"/api/v1/mirror", local.Write, jsonBody(t, map[string]any{"repo": "acme/tiny"}), nil)
 	if msg := body(t, resp); resp.StatusCode < 400 || strings.Contains(msg, "hunter2") {
 		t.Fatalf("mirror: status %d: %s", resp.StatusCode, msg)
 	}
@@ -244,17 +246,17 @@ func TestUpstreamErrorPagesAreNotRelayed(t *testing.T) {
 func TestPullThroughFileSizeLimit(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true, PullThroughMaxFileBytes: 100})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true, PullThroughMaxFileBytes: 100})
 
 	// A file under the limit is fetched as usual.
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("small file: status %d", resp.StatusCode)
 	}
 	// One over it is described, since that costs nothing, but not fetched.
-	if resp := do(t, http.MethodHead, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodHead, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("HEAD of a large file: status %d", resp.StatusCode)
 	}
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 	msg := body(t, resp)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("large file: status %d, want 403: %s", resp.StatusCode, msg)
@@ -268,10 +270,10 @@ func TestPullThroughFileSizeLimit(t *testing.T) {
 		t.Fatalf("upstream served %d files; only the small one should have been fetched", got)
 	}
 	// The command the error names does fetch it.
-	if _, err := client.New(local.url, local.write).Mirror(context.Background(), "acme/tiny", "main", "", nil); err != nil {
+	if _, err := client.New(local.URL, local.Write).Mirror(context.Background(), "acme/tiny", "main", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	resp = do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+	resp = do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["model.safetensors"] {
 		t.Fatalf("after mirror: status %d", resp.StatusCode)
 	}

@@ -6,88 +6,22 @@ package server_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/client"
-	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
-// instance is a registry served over HTTP for a test.
-type instance struct {
-	reg   *registry.Registry
-	url   string
-	admin string
-	read  string
-	write string
-}
-
-func start(t *testing.T, cfg server.Config) *instance {
-	t.Helper()
-	return startWith(t, cfg, nil)
-}
-
-// startWith is start with a chosen storage backend; nil means local files.
-func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
-	t.Helper()
-	reg, err := registry.Open(t.TempDir(), store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	in := &instance{reg: reg}
-	for role, dst := range map[registry.Role]*string{registry.RoleAdmin: &in.admin, registry.RoleWrite: &in.write, registry.RoleRead: &in.read} {
-		if *dst, err = reg.CreateToken(ctx, string(role), role); err != nil {
-			t.Fatal(err)
-		}
-	}
-	srv := httptest.NewServer(server.New(reg, cfg))
-	in.url = srv.URL
-	t.Cleanup(func() {
-		srv.Close()
-		_ = reg.Close()
-	})
-	return in
-}
-
-// httptestServer serves an existing registry a second time, with another
-// configuration, and returns its URL.
-func httptestServer(t *testing.T, reg *registry.Registry, cfg server.Config) string {
-	t.Helper()
-	srv := httptest.NewServer(server.New(reg, cfg))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-func writeTree(t *testing.T, files map[string]string) string {
-	t.Helper()
-	dir := t.TempDir()
-	for p, content := range files {
-		full := filepath.Join(dir, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return dir
-}
-
-func sha(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])
-}
+// The helpers every test here starts from (a registry served over HTTP, a
+// directory of files to push) are in internal/regtest.
 
 var modelFiles = map[string]string{
 	"config.json":         `{"model_type":"tiny"}`,
@@ -95,12 +29,12 @@ var modelFiles = map[string]string{
 	"tokenizer/vocab.txt": "a\nb\nc\n",
 }
 
-func push(t *testing.T, in *instance, repo string, files map[string]string, opt client.PushOptions) client.PushResult {
+func push(t *testing.T, in *regtest.Instance, repo string, files map[string]string, opt client.PushOptions) client.PushResult {
 	t.Helper()
 	if opt.Branch == "" {
 		opt.Branch = "main"
 	}
-	res, err := client.New(in.url, in.write).Push(context.Background(), writeTree(t, files), repo, opt)
+	res, err := client.New(in.URL, in.Write).Push(context.Background(), regtest.WriteTree(t, files), repo, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,12 +83,12 @@ func decode(t *testing.T, resp *http.Response, v any) {
 // depends on: revision lookup, file listing, and the resolve headers.
 func TestHuggingFaceDownloadSurface(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	pushed := push(t, in, "acme/tiny", modelFiles, client.PushOptions{Tags: []string{"v1"}})
 
 	t.Run("model info names the revision and files", func(t *testing.T) {
 		for _, path := range []string{"/api/models/acme/tiny", "/api/models/acme/tiny/revision/main", "/api/models/acme/tiny/revision/v1", "/api/models/acme/tiny/revision/" + pushed.SHA} {
-			resp := do(t, http.MethodGet, in.url+path, "", nil, nil)
+			resp := do(t, http.MethodGet, in.URL+path, "", nil, nil)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("%s: status %d", path, resp.StatusCode)
 			}
@@ -173,7 +107,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 	})
 
 	t.Run("tree lists files with digests and directories", func(t *testing.T) {
-		resp := do(t, http.MethodGet, in.url+"/api/models/acme/tiny/tree/"+pushed.SHA+"?recursive=True&expand=False", "", nil, nil)
+		resp := do(t, http.MethodGet, in.URL+"/api/models/acme/tiny/tree/"+pushed.SHA+"?recursive=True&expand=False", "", nil, nil)
 		var entries []struct {
 			Type string `json:"type"`
 			Path string `json:"path"`
@@ -193,7 +127,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 				continue
 			}
 			want := modelFiles[e.Path]
-			if e.Size != int64(len(want)) || e.LFS == nil || e.LFS.OID != sha(want) || e.LFS.PointerSize == 0 || len(e.OID) != 40 {
+			if e.Size != int64(len(want)) || e.LFS == nil || e.LFS.OID != kit.SHA256Hex(want) || e.LFS.PointerSize == 0 || len(e.OID) != 40 {
 				t.Errorf("entry %s = %+v (lfs %+v)", e.Path, e, e.LFS)
 			}
 		}
@@ -202,7 +136,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 		}
 
 		// Without recursive, only the top level is listed.
-		resp = do(t, http.MethodGet, in.url+"/api/models/acme/tiny/tree/main", "", nil, nil)
+		resp = do(t, http.MethodGet, in.URL+"/api/models/acme/tiny/tree/main", "", nil, nil)
 		decode(t, resp, &entries)
 		if len(entries) != 3 {
 			t.Fatalf("top-level listing has %d entries, want 3", len(entries))
@@ -210,7 +144,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 	})
 
 	t.Run("refs list branches and tags", func(t *testing.T) {
-		resp := do(t, http.MethodGet, in.url+"/api/models/acme/tiny/refs", "", nil, nil)
+		resp := do(t, http.MethodGet, in.URL+"/api/models/acme/tiny/refs", "", nil, nil)
 		var refs struct {
 			Branches, Tags []struct {
 				Name, TargetCommit string
@@ -223,14 +157,14 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 	})
 
 	want := modelFiles["model.safetensors"]
-	fileURL := in.url + "/acme/tiny/resolve/main/model.safetensors"
+	fileURL := in.URL + "/acme/tiny/resolve/main/model.safetensors"
 
 	t.Run("HEAD carries etag, size and revision", func(t *testing.T) {
 		resp := do(t, http.MethodHead, fileURL, "", nil, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status %d", resp.StatusCode)
 		}
-		if got := resp.Header.Get("ETag"); got != `"`+sha(want)+`"` {
+		if got := resp.Header.Get("ETag"); got != `"`+kit.SHA256Hex(want)+`"` {
 			t.Errorf("ETag = %s", got)
 		}
 		if got := resp.Header.Get("X-Repo-Commit"); got != pushed.SHA {
@@ -246,7 +180,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 
 	t.Run("GET returns the bytes", func(t *testing.T) {
 		for _, rev := range []string{"main", "v1", pushed.SHA} {
-			resp := do(t, http.MethodGet, in.url+"/acme/tiny/resolve/"+rev+"/tokenizer/vocab.txt", "", nil, nil)
+			resp := do(t, http.MethodGet, in.URL+"/acme/tiny/resolve/"+rev+"/tokenizer/vocab.txt", "", nil, nil)
 			if got := body(t, resp); got != modelFiles["tokenizer/vocab.txt"] {
 				t.Errorf("at %s got %q", rev, got)
 			}
@@ -276,7 +210,7 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 			{http.MethodGet, "/acme/tiny/resolve/" + strings.Repeat("0", 40) + "/config.json", "RevisionNotFound"},
 		}
 		for _, tc := range tests {
-			resp := do(t, tc.method, in.url+tc.path, "", nil, nil)
+			resp := do(t, tc.method, in.URL+tc.path, "", nil, nil)
 			if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != tc.code {
 				t.Errorf("%s %s = %d %q, want 404 %q", tc.method, tc.path, resp.StatusCode, resp.Header.Get("X-Error-Code"), tc.code)
 			}
@@ -285,11 +219,11 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 
 	t.Run("revisions with slashes resolve when encoded", func(t *testing.T) {
 		push(t, in, "acme/tiny", map[string]string{"x.txt": "pr"}, client.PushOptions{Branch: "refs/pr/1"})
-		resp := do(t, http.MethodGet, in.url+"/api/models/acme/tiny/revision/refs%2Fpr%2F1", "", nil, nil)
+		resp := do(t, http.MethodGet, in.URL+"/api/models/acme/tiny/revision/refs%2Fpr%2F1", "", nil, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("model info status %d", resp.StatusCode)
 		}
-		resp = do(t, http.MethodGet, in.url+"/acme/tiny/resolve/refs%2Fpr%2F1/x.txt", "", nil, nil)
+		resp = do(t, http.MethodGet, in.URL+"/acme/tiny/resolve/refs%2Fpr%2F1/x.txt", "", nil, nil)
 		if got := body(t, resp); got != "pr" {
 			t.Fatalf("got %q", got)
 		}
@@ -298,27 +232,27 @@ func TestHuggingFaceDownloadSurface(t *testing.T) {
 
 func TestAccessControl(t *testing.T) {
 	t.Parallel()
-	open := start(t, server.Config{AnonymousRead: true})
-	private := start(t, server.Config{AnonymousRead: false})
-	for _, in := range []*instance{open, private} {
+	open := regtest.Start(t, server.Config{AnonymousRead: true})
+	private := regtest.Start(t, server.Config{AnonymousRead: false})
+	for _, in := range []*regtest.Instance{open, private} {
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 	}
-	blobURL := "/api/v1/blobs/" + sha("new")
+	blobURL := "/api/v1/blobs/" + kit.SHA256Hex("new")
 
 	type attempt struct {
 		name   string
-		in     *instance
+		in     *regtest.Instance
 		method string
 		path   string
-		token  func(*instance) string
+		token  func(*regtest.Instance) string
 		body   string
 		want   int
 	}
-	none := func(*instance) string { return "" }
-	read := func(i *instance) string { return i.read }
-	write := func(i *instance) string { return i.write }
-	admin := func(i *instance) string { return i.admin }
-	foreign := func(*instance) string { return "hf_a_token_for_some_other_service" }
+	none := func(*regtest.Instance) string { return "" }
+	read := func(i *regtest.Instance) string { return i.Read }
+	write := func(i *regtest.Instance) string { return i.Write }
+	admin := func(i *regtest.Instance) string { return i.Admin }
+	foreign := func(*regtest.Instance) string { return "hf_a_token_for_some_other_service" }
 
 	tests := []attempt{
 		// Reading an open registry needs no token, and a token from another
@@ -420,8 +354,8 @@ func TestAccessControl(t *testing.T) {
 		{"private: anonymous large-file batch", private, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", none, `{"operation":"upload"}`, 401},
 		// The upload route is opened by a signed URL and by nothing else,
 		// whatever token comes with the request.
-		{"open: anonymous upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + sha("new"), none, "new", 403},
-		{"open: admin upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + sha("new"), admin, "new", 403},
+		{"open: anonymous upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + kit.SHA256Hex("new"), none, "new", 403},
+		{"open: admin upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + kit.SHA256Hex("new"), admin, "new", 403},
 
 		// The rest of the Hugging Face surface follows the read rule.
 		{"open: anonymous validate-yaml", open, http.MethodPost, "/api/validate-yaml", none, `{}`, 200},
@@ -441,7 +375,7 @@ func TestAccessControl(t *testing.T) {
 			if tc.body != "" {
 				rd = strings.NewReader(tc.body)
 			}
-			resp := do(t, tc.method, tc.in.url+tc.path, tc.token(tc.in), rd, nil)
+			resp := do(t, tc.method, tc.in.URL+tc.path, tc.token(tc.in), rd, nil)
 			if resp.StatusCode != tc.want {
 				t.Fatalf("status %d, want %d (%s)", resp.StatusCode, tc.want, body(t, resp))
 			}
@@ -449,17 +383,17 @@ func TestAccessControl(t *testing.T) {
 	}
 
 	// After all the refused attempts the repository is still there.
-	if _, err := open.reg.Resolve(context.Background(), "acme/tiny", "main"); err != nil {
+	if _, err := open.Reg.Resolve(context.Background(), "acme/tiny", "main"); err != nil {
 		t.Fatalf("repository damaged by refused requests: %v", err)
 	}
 }
 
 func TestTokenSecretsAreNeverListed(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
-	resp := do(t, http.MethodGet, in.url+"/api/v1/tokens", in.admin, nil, nil)
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
+	resp := do(t, http.MethodGet, in.URL+"/api/v1/tokens", in.Admin, nil, nil)
 	listing := body(t, resp)
-	for _, secret := range []string{in.admin, in.write, in.read} {
+	for _, secret := range []string{in.Admin, in.Write, in.Read} {
 		if strings.Contains(listing, secret) {
 			t.Fatal("token listing contains a token secret")
 		}
@@ -468,16 +402,16 @@ func TestTokenSecretsAreNeverListed(t *testing.T) {
 
 func TestUploadMustMatchItsDigest(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
-	wrong := sha("what the client claims")
-	resp := do(t, http.MethodPut, in.url+"/api/v1/blobs/"+wrong, in.write, strings.NewReader("what it actually sends"), nil)
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
+	wrong := kit.SHA256Hex("what the client claims")
+	resp := do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+wrong, in.Write, strings.NewReader("what it actually sends"), nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400", resp.StatusCode)
 	}
-	if _, ok, _ := in.reg.StatBlob(context.Background(), wrong); ok {
+	if _, ok, _ := in.Reg.StatBlob(context.Background(), wrong); ok {
 		t.Fatal("a blob was recorded under a digest it does not hash to")
 	}
-	resp = do(t, http.MethodPut, in.url+"/api/v1/blobs/not-a-digest", in.write, strings.NewReader("x"), nil)
+	resp = do(t, http.MethodPut, in.URL+"/api/v1/blobs/not-a-digest", in.Write, strings.NewReader("x"), nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed digest: status %d, want 400", resp.StatusCode)
 	}
@@ -485,7 +419,7 @@ func TestUploadMustMatchItsDigest(t *testing.T) {
 
 func TestPushPullRoundTrip(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	ctx := context.Background()
 	first := push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 
@@ -496,7 +430,7 @@ func TestPushPullRoundTrip(t *testing.T) {
 	}
 	changed["config.json"] = `{"model_type":"tiny","v":2}`
 	uploaded := map[string]bool{}
-	second, err := client.New(in.url, in.write).Push(ctx, writeTree(t, changed), "acme/tiny", client.PushOptions{
+	second, err := client.New(in.URL, in.Write).Push(ctx, regtest.WriteTree(t, changed), "acme/tiny", client.PushOptions{
 		Branch: "main", Progress: func(p string, _ int64, up bool) { uploaded[p] = up },
 	})
 	if err != nil {
@@ -506,7 +440,7 @@ func TestPushPullRoundTrip(t *testing.T) {
 		t.Fatalf("uploaded = %v, want only config.json", uploaded)
 	}
 
-	cl := client.New(in.url, "")
+	cl := client.New(in.URL, "")
 	for _, tc := range []struct {
 		rev   string
 		files map[string]string
@@ -556,20 +490,20 @@ func TestPushPullRoundTrip(t *testing.T) {
 
 func TestDeleteThenStorageIsFreed(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
-	resp := do(t, http.MethodDelete, in.url+"/api/v1/repos/acme/tiny", in.admin, nil, nil)
+	resp := do(t, http.MethodDelete, in.URL+"/api/v1/repos/acme/tiny", in.Admin, nil, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete status %d", resp.StatusCode)
 	}
-	st, err := in.reg.Stats(context.Background())
+	st, err := in.Reg.Stats(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Repos != 0 || st.Blobs != 0 || st.StoredBytes != 0 {
 		t.Fatalf("stats after delete = %+v, want empty", st)
 	}
-	resp = do(t, http.MethodHead, in.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+	resp = do(t, http.MethodHead, in.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("deleted repo still serves files: %d", resp.StatusCode)
 	}
@@ -577,26 +511,26 @@ func TestDeleteThenStorageIsFreed(t *testing.T) {
 
 func TestWebUI(t *testing.T) {
 	t.Parallel()
-	open := start(t, server.Config{AnonymousRead: true, Version: "test"})
-	private := start(t, server.Config{AnonymousRead: false})
-	for _, in := range []*instance{open, private} {
+	open := regtest.Start(t, server.Config{AnonymousRead: true, Version: "test"})
+	private := regtest.Start(t, server.Config{AnonymousRead: false})
+	for _, in := range []*regtest.Instance{open, private} {
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 	}
-	cookie := func(in *instance, token string) map[string]string {
+	cookie := func(in *regtest.Instance, token string) map[string]string {
 		return map[string]string{"Cookie": "md_token=" + token}
 	}
 
 	t.Run("home lists repositories", func(t *testing.T) {
-		resp := do(t, http.MethodGet, open.url+"/", "", nil, nil)
+		resp := do(t, http.MethodGet, open.URL+"/", "", nil, nil)
 		page := body(t, resp)
 		if resp.StatusCode != http.StatusOK || !strings.Contains(page, "acme/tiny") || !strings.Contains(page, "On disk") {
 			t.Fatalf("status %d, page missing repository or storage usage", resp.StatusCode)
 		}
 	})
 	t.Run("repository page shows files and revisions", func(t *testing.T) {
-		resp := do(t, http.MethodGet, open.url+"/ui/repo/acme/tiny", "", nil, nil)
+		resp := do(t, http.MethodGet, open.URL+"/ui/repo/acme/tiny", "", nil, nil)
 		page := body(t, resp)
-		for _, want := range []string{"model.safetensors", "tokenizer/vocab.txt", "HF_ENDPOINT=" + open.url, "/acme/tiny/resolve/"} {
+		for _, want := range []string{"model.safetensors", "tokenizer/vocab.txt", "HF_ENDPOINT=" + open.URL, "/acme/tiny/resolve/"} {
 			if !strings.Contains(page, want) {
 				t.Errorf("page missing %q", want)
 			}
@@ -606,36 +540,36 @@ func TestWebUI(t *testing.T) {
 		}
 	})
 	t.Run("hub-style repository link redirects to the page", func(t *testing.T) {
-		resp := do(t, http.MethodGet, open.url+"/acme/tiny", "", nil, nil)
+		resp := do(t, http.MethodGet, open.URL+"/acme/tiny", "", nil, nil)
 		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/ui/repo/acme/tiny" {
 			t.Fatalf("status %d location %q", resp.StatusCode, resp.Header.Get("Location"))
 		}
 	})
 	t.Run("unknown repository is a 404 page", func(t *testing.T) {
-		resp := do(t, http.MethodGet, open.url+"/ui/repo/acme/nope", "", nil, nil)
+		resp := do(t, http.MethodGet, open.URL+"/ui/repo/acme/nope", "", nil, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status %d", resp.StatusCode)
 		}
 	})
 	t.Run("private registry sends visitors to sign in", func(t *testing.T) {
 		for _, p := range []string{"/", "/ui/repo/acme/tiny"} {
-			resp := do(t, http.MethodGet, private.url+p, "", nil, nil)
+			resp := do(t, http.MethodGet, private.URL+p, "", nil, nil)
 			if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/login" {
 				t.Errorf("%s: status %d location %q", p, resp.StatusCode, resp.Header.Get("Location"))
 			}
 		}
-		resp := do(t, http.MethodGet, private.url+"/", "", nil, cookie(private, private.read))
+		resp := do(t, http.MethodGet, private.URL+"/", "", nil, cookie(private, private.Read))
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("signed-in visitor got %d", resp.StatusCode)
 		}
 	})
 	t.Run("sign in rejects bad tokens and sets a locked-down cookie for good ones", func(t *testing.T) {
 		form := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
-		resp := do(t, http.MethodPost, open.url+"/ui/login", "", strings.NewReader("token=md_wrong"), form)
+		resp := do(t, http.MethodPost, open.URL+"/ui/login", "", strings.NewReader("token=md_wrong"), form)
 		if resp.StatusCode != http.StatusUnauthorized || len(resp.Cookies()) != 0 {
 			t.Fatalf("bad token: status %d, %d cookies", resp.StatusCode, len(resp.Cookies()))
 		}
-		resp = do(t, http.MethodPost, open.url+"/ui/login", "", strings.NewReader("token="+open.admin), form)
+		resp = do(t, http.MethodPost, open.URL+"/ui/login", "", strings.NewReader("token="+open.Admin), form)
 		if resp.StatusCode != http.StatusSeeOther || len(resp.Cookies()) != 1 {
 			t.Fatalf("good token: status %d, %d cookies", resp.StatusCode, len(resp.Cookies()))
 		}
@@ -652,9 +586,9 @@ func TestWebUI(t *testing.T) {
 			}
 			return h
 		}
-		del := open.url + "/ui/repo/acme/tiny/delete"
+		del := open.URL + "/ui/repo/acme/tiny/delete"
 		exists := func() bool {
-			_, err := open.reg.GetRepo(context.Background(), "acme/tiny")
+			_, err := open.Reg.GetRepo(context.Background(), "acme/tiny")
 			return err == nil
 		}
 
@@ -662,32 +596,32 @@ func TestWebUI(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden || !exists() {
 			t.Fatalf("anonymous delete: status %d, repo exists %v", resp.StatusCode, exists())
 		}
-		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme/tiny"), form(cookie(open, open.write)))
+		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme/tiny"), form(cookie(open, open.Write)))
 		if resp.StatusCode != http.StatusForbidden || !exists() {
 			t.Fatalf("write-token delete: status %d, repo exists %v", resp.StatusCode, exists())
 		}
 		// A page on another site submitting the form with the admin's cookie.
-		cross := form(cookie(open, open.admin))
+		cross := form(cookie(open, open.Admin))
 		cross["Origin"] = "https://evil.example"
 		cross["Sec-Fetch-Site"] = "cross-site"
 		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme/tiny"), cross)
 		if resp.StatusCode != http.StatusForbidden || !exists() {
 			t.Fatalf("cross-site delete: status %d, repo exists %v", resp.StatusCode, exists())
 		}
-		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=wrong"), form(cookie(open, open.admin)))
+		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=wrong"), form(cookie(open, open.Admin)))
 		if resp.StatusCode != http.StatusSeeOther || !exists() || resp.Header.Get("Location") != "/ui/repo/acme/tiny?notice=not-deleted" {
 			t.Fatalf("wrong confirmation: status %d to %q, repo exists %v", resp.StatusCode, resp.Header.Get("Location"), exists())
 		}
 		// The page it lands on says what happened.
-		page := do(t, http.MethodGet, open.url+resp.Header.Get("Location"), "", nil, nil)
+		page := do(t, http.MethodGet, open.URL+resp.Header.Get("Location"), "", nil, nil)
 		if got := body(t, page); !strings.Contains(got, "Nothing deleted: the name you typed did not match.") {
 			t.Fatal("the page after a refused delete does not say so")
 		}
-		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme%2Ftiny"), form(cookie(open, open.admin)))
+		resp = do(t, http.MethodPost, del, "", strings.NewReader("confirm=acme%2Ftiny"), form(cookie(open, open.Admin)))
 		if resp.StatusCode != http.StatusSeeOther || exists() || resp.Header.Get("Location") != "/?notice=deleted" {
 			t.Fatalf("confirmed delete: status %d to %q, repo exists %v", resp.StatusCode, resp.Header.Get("Location"), exists())
 		}
-		page = do(t, http.MethodGet, open.url+resp.Header.Get("Location"), "", nil, nil)
+		page = do(t, http.MethodGet, open.URL+resp.Header.Get("Location"), "", nil, nil)
 		if got := body(t, page); !strings.Contains(got, "The repository was deleted") {
 			t.Fatal("the page after a delete does not say so")
 		}
@@ -707,7 +641,7 @@ func TestWebUI(t *testing.T) {
 			{"?notice=", false},
 		} {
 			for _, path := range []string{"/", "/ui/login"} {
-				got := body(t, do(t, http.MethodGet, open.url+path+tc.query, "", nil, nil))
+				got := body(t, do(t, http.MethodGet, open.URL+path+tc.query, "", nil, nil))
 				if strings.Contains(got, banner) != tc.shown {
 					t.Errorf("%s%s: banner shown = %v, want %v", path, tc.query, !tc.shown, tc.shown)
 				}
@@ -721,12 +655,12 @@ func TestWebUI(t *testing.T) {
 
 func TestStaticAssetsAndHealth(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: false, Version: "1.2.3"})
-	resp := do(t, http.MethodGet, in.url+"/static/app.css", "", nil, nil)
+	in := regtest.Start(t, server.Config{AnonymousRead: false, Version: "1.2.3"})
+	resp := do(t, http.MethodGet, in.URL+"/static/app.css", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/css") {
 		t.Fatalf("css: %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
-	resp = do(t, http.MethodGet, in.url+"/healthz", "", nil, nil)
+	resp = do(t, http.MethodGet, in.URL+"/healthz", "", nil, nil)
 	if got := body(t, resp); !bytes.Contains([]byte(got), []byte(`"1.2.3"`)) {
 		t.Fatalf("healthz = %s", got)
 	}

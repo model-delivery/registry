@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -24,13 +26,13 @@ import (
 // listing on the first request for a revision, then each file's content on
 // that file's first download.
 
-func pending(t *testing.T, in *instance, repo, rev string) int {
+func pending(t *testing.T, in *regtest.Instance, repo, rev string) int {
 	t.Helper()
-	c, err := in.reg.Resolve(context.Background(), repo, rev)
+	c, err := in.Reg.Resolve(context.Background(), repo, rev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := in.reg.PendingCount(context.Background(), c)
+	n, err := in.Reg.PendingCount(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,10 +43,10 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	// Nothing is in the registry. A client asks for one small file.
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/tokenizer/vocab.txt", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/tokenizer/vocab.txt", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["tokenizer/vocab.txt"] {
 		t.Fatalf("first request: status %d", resp.StatusCode)
 	}
@@ -56,11 +58,11 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 		t.Fatalf("upstream served %d files for a request for one", got)
 	}
 	// The revision is recorded under its upstream id with its complete listing.
-	c, err := local.reg.Resolve(ctx, "acme/tiny", "main")
+	c, err := local.Reg.Resolve(ctx, "acme/tiny", "main")
 	if err != nil || c.SHA != hub.pushed.SHA || c.Source != registry.SourceMirror {
 		t.Fatalf("recorded revision = %+v, %v", c, err)
 	}
-	files, _ := local.reg.Files(ctx, c)
+	files, _ := local.Reg.Files(ctx, c)
 	if len(files) != len(modelFiles) || pending(t, local, "acme/tiny", "main") != len(modelFiles)-1 {
 		t.Fatalf("listing has %d files with %d pending; want %d and %d",
 			len(files), pending(t, local, "acme/tiny", "main"), len(modelFiles), len(modelFiles)-1)
@@ -71,14 +73,14 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 
 		// What a client asks before downloading: size, identity, revision.
 		want := modelFiles["model.safetensors"]
-		head := do(t, http.MethodHead, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+		head := do(t, http.MethodHead, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 		if head.StatusCode != http.StatusOK || head.ContentLength != int64(len(want)) ||
-			head.Header.Get("ETag") != `"`+sha(want)+`"` || head.Header.Get("X-Repo-Commit") != hub.pushed.SHA ||
+			head.Header.Get("ETag") != `"`+kit.SHA256Hex(want)+`"` || head.Header.Get("X-Repo-Commit") != hub.pushed.SHA ||
 			head.Header.Get("Accept-Ranges") != "bytes" {
 			t.Fatalf("HEAD of a file not fetched yet: status %d length %d headers %v", head.StatusCode, head.ContentLength, head.Header)
 		}
 
-		tree := do(t, http.MethodGet, local.url+"/api/models/acme/tiny/tree/main?recursive=true", "", nil, nil)
+		tree := do(t, http.MethodGet, local.URL+"/api/models/acme/tiny/tree/main?recursive=true", "", nil, nil)
 		var entries []struct {
 			Type string `json:"type"`
 			Path string `json:"path"`
@@ -99,12 +101,12 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 			}
 		}
 		for p, content := range modelFiles {
-			if listed[p] != sha(content) {
+			if listed[p] != kit.SHA256Hex(content) {
 				t.Errorf("listing has the wrong digest for %s", p)
 			}
 		}
 
-		info := do(t, http.MethodGet, local.url+"/api/models/acme/tiny/revision/main", "", nil, nil)
+		info := do(t, http.MethodGet, local.URL+"/api/models/acme/tiny/revision/main", "", nil, nil)
 		var doc struct {
 			Siblings []json.RawMessage `json:"siblings"`
 		}
@@ -114,14 +116,14 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 		}
 
 		// The web page says which files are still to be fetched.
-		page := do(t, http.MethodGet, local.url+"/ui/repo/acme/tiny", "", nil, nil)
+		page := do(t, http.MethodGet, local.URL+"/ui/repo/acme/tiny", "", nil, nil)
 		if got := body(t, page); page.StatusCode != http.StatusOK || strings.Count(got, "fetched on demand") != len(modelFiles)-1 {
 			t.Errorf("repository page: status %d, marks %d files as fetched on demand, want %d",
 				page.StatusCode, strings.Count(got, "fetched on demand"), len(modelFiles)-1)
 		}
 
 		// The file already fetched is served again without asking upstream.
-		again := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/"+hub.pushed.SHA+"/tokenizer/vocab.txt", "", nil, nil)
+		again := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/"+hub.pushed.SHA+"/tokenizer/vocab.txt", "", nil, nil)
 		if again.StatusCode != http.StatusOK {
 			t.Errorf("second download: %d", again.StatusCode)
 		}
@@ -134,7 +136,7 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 
 	t.Run("each further file is fetched once, when first downloaded", func(t *testing.T) {
 		for range 3 {
-			resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+			resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 			if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["model.safetensors"] {
 				t.Fatalf("status %d", resp.StatusCode)
 			}
@@ -143,7 +145,7 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 			t.Fatalf("upstream has served %d files after two distinct files were downloaded", got)
 		}
 		// A range request for a file not fetched yet works too.
-		part := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, map[string]string{"Range": "bytes=2-11"})
+		part := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, map[string]string{"Range": "bytes=2-11"})
 		if part.StatusCode != http.StatusPartialContent || body(t, part) != modelFiles["config.json"][2:12] {
 			t.Fatalf("range on a pending file: status %d", part.StatusCode)
 		}
@@ -153,13 +155,13 @@ func TestPullThroughFetchesOnlyTheFilesAskedFor(t *testing.T) {
 	})
 
 	t.Run("a revision fetched piece by piece ends up identical to a mirrored one", func(t *testing.T) {
-		mirrored := start(t, server.Config{AnonymousRead: true, Upstream: hub.url})
-		if _, err := client.New(mirrored.url, mirrored.write).Mirror(ctx, "acme/tiny", "main", "", nil); err != nil {
+		mirrored := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url})
+		if _, err := client.New(mirrored.URL, mirrored.Write).Mirror(ctx, "acme/tiny", "main", "", nil); err != nil {
 			t.Fatal(err)
 		}
-		a, _ := local.reg.Files(ctx, c)
-		mc, _ := mirrored.reg.Resolve(ctx, "acme/tiny", "main")
-		b, _ := mirrored.reg.Files(ctx, mc)
+		a, _ := local.Reg.Files(ctx, c)
+		mc, _ := mirrored.Reg.Resolve(ctx, "acme/tiny", "main")
+		b, _ := mirrored.Reg.Files(ctx, mc)
 		if len(a) != len(b) {
 			t.Fatalf("%d files against %d", len(a), len(b))
 		}
@@ -255,35 +257,35 @@ func TestPullThroughVerifiesEachFile(t *testing.T) {
 	ctx := context.Background()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	hub.tampered.Store(true) // the upstream sends altered bytes for model.safetensors
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	// A file that arrives intact is served.
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("intact file: status %d", resp.StatusCode)
 	}
 
 	// The altered one is refused, with the reason, and nothing of it is kept.
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("altered file: status %d, want 502", resp.StatusCode)
 	}
 	if msg := body(t, resp); !strings.Contains(msg, "could not fetch from upstream") || !strings.Contains(msg, "verification failed") {
 		t.Fatalf("error does not explain itself: %s", msg)
 	}
-	c, _ := local.reg.Resolve(ctx, "acme/tiny", "main")
-	if f, err := local.reg.File(ctx, c, "model.safetensors"); err != nil || !f.Pending {
+	c, _ := local.Reg.Resolve(ctx, "acme/tiny", "main")
+	if f, err := local.Reg.File(ctx, c, "model.safetensors"); err != nil || !f.Pending {
 		t.Fatalf("the altered file is recorded as stored: %+v, %v", f, err)
 	}
-	if _, ok, _ := local.reg.StatBlob(ctx, sha("not the real weights")); ok {
+	if _, ok, _ := local.Reg.StatBlob(ctx, kit.SHA256Hex("not the real weights")); ok {
 		t.Fatal("the altered bytes were stored")
 	}
-	if _, ok, _ := local.reg.StatBlob(ctx, sha(modelFiles["model.safetensors"])); ok {
+	if _, ok, _ := local.Reg.StatBlob(ctx, kit.SHA256Hex(modelFiles["model.safetensors"])); ok {
 		t.Fatal("content was stored under the genuine digest although it never arrived")
 	}
 
 	// A failure is not remembered: once the upstream is sound, the download works.
 	hub.tampered.Store(false)
-	resp = do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+	resp = do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["model.safetensors"] {
 		t.Fatalf("retry: status %d", resp.StatusCode)
 	}
@@ -293,10 +295,10 @@ func TestMirrorCompletesARevisionPullThroughStarted(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	// A client downloads one file; the rest of the revision is only listed.
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 	if n := pending(t, local, "acme/tiny", "main"); n != len(modelFiles)-1 {
@@ -309,7 +311,7 @@ func TestMirrorCompletesARevisionPullThroughStarted(t *testing.T) {
 		// that fail verification.
 		hub.tampered.Store(true)
 		defer hub.tampered.Store(false)
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status %d, want 502", resp.StatusCode)
 		}
@@ -317,7 +319,7 @@ func TestMirrorCompletesARevisionPullThroughStarted(t *testing.T) {
 
 	// `modelctl mirror` fetches everything that is missing, and only that.
 	before := hub.files.Load()
-	done, err := client.New(local.url, local.write).Mirror(ctx, "acme/tiny", "main", "", nil)
+	done, err := client.New(local.URL, local.Write).Mirror(ctx, "acme/tiny", "main", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +336,7 @@ func TestMirrorCompletesARevisionPullThroughStarted(t *testing.T) {
 	// Complete now: everything is served with the upstream out of the picture.
 	lookups, downloads := hub.lookups.Load(), hub.files.Load()
 	dir := t.TempDir()
-	if _, err := client.New(local.url, "").Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
+	if _, err := client.New(local.URL, "").Pull(ctx, "acme/tiny", "main", dir, nil); err != nil {
 		t.Fatal(err)
 	}
 	if hub.lookups.Load() != lookups || hub.files.Load() != downloads {
@@ -348,11 +350,11 @@ func TestPendingFilesWhenPullThroughIsOff(t *testing.T) {
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	// Record a revision's listing the way pull-through does, then serve it
 	// from a registry that has pull-through turned off.
-	on := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-	if resp := do(t, http.MethodGet, on.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	on := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	if resp := do(t, http.MethodGet, on.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	off := httptestServer(t, on.reg, server.Config{AnonymousRead: true, Upstream: hub.url})
+	off := regtest.Serve(t, on.Reg, server.Config{AnonymousRead: true, Upstream: hub.url})
 	downloads := hub.files.Load()
 
 	// The fetched file is served; the others say plainly what is going on.
@@ -369,31 +371,31 @@ func TestPendingFilesWhenPullThroughIsOff(t *testing.T) {
 	}
 
 	// A revision cannot be built on files that were never fetched.
-	status, out := commitTo(t, &instance{reg: on.reg, url: off, write: on.write}, "acme/tiny", "main", on.write,
+	status, out := commitTo(t, &regtest.Instance{Reg: on.Reg, URL: off, Write: on.Write}, "acme/tiny", "main", on.Write,
 		header("on top", ""), inlineFile("extra.txt", "x"))
 	if status != http.StatusPreconditionFailed || !strings.Contains(out, "modelctl mirror acme/tiny") {
 		t.Fatalf("upload onto a partly fetched branch: status %d: %s", status, out)
 	}
-	if c, err := on.reg.Resolve(ctx, "acme/tiny", "main"); err != nil || c.SHA != hub.pushed.SHA {
+	if c, err := on.Reg.Resolve(ctx, "acme/tiny", "main"); err != nil || c.SHA != hub.pushed.SHA {
 		t.Fatalf("the refused upload moved the branch: %v %v", c.SHA, err)
 	}
 
 	// Deleting the repository removes the listing along with the content.
-	if _, err := on.reg.DeleteRepo(ctx, "acme/tiny"); err != nil {
+	if _, err := on.Reg.DeleteRepo(ctx, "acme/tiny"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := on.reg.GetRepo(ctx, "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
+	if _, err := on.Reg.GetRepo(ctx, "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
 		t.Fatalf("repository still exists: %v", err)
 	}
-	if _, ok, _ := on.reg.StatBlob(ctx, sha(modelFiles["config.json"])); ok {
+	if _, ok, _ := on.Reg.StatBlob(ctx, kit.SHA256Hex(modelFiles["config.json"])); ok {
 		t.Fatal("the repository's fetched content was left behind")
 	}
 	// The refused upload's file was stored before the commit was refused. It
 	// is unreferenced, and garbage collection removes it.
-	if res, err := on.reg.GC(ctx, 0); err != nil || res.Blobs != 1 {
+	if res, err := on.Reg.GC(ctx, 0); err != nil || res.Blobs != 1 {
 		t.Fatalf("gc = %+v, %v; want the one orphan removed", res, err)
 	}
-	if st, _ := on.reg.Stats(ctx); st.Blobs != 0 {
+	if st, _ := on.Reg.Stats(ctx); st.Blobs != 0 {
 		t.Fatalf("%d blobs left", st.Blobs)
 	}
 }
@@ -403,30 +405,30 @@ func TestPendingFilesWhenPullThroughIsOff(t *testing.T) {
 func TestPullThroughOfFilesIdentifiedByGitBlobID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	hub := start(t, server.Config{AnonymousRead: true})
+	hub := regtest.Start(t, server.Config{AnonymousRead: true})
 	// An upload from a Hugging Face client stores small files this way.
-	if status, out := commitTo(t, hub, "acme/git", "main", hub.write, header("first", ""),
+	if status, out := commitTo(t, hub, "acme/git", "main", hub.Write, header("first", ""),
 		inlineFile("config.json", `{"small":true}`), inlineFile("README.md", "# readme\n")); status != http.StatusOK {
 		t.Fatalf("seed the hub: %d %s", status, out)
 	}
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.URL, PullThrough: true})
 
-	head := do(t, http.MethodHead, local.url+"/acme/git/resolve/main/config.json", "", nil, nil)
-	upstream := do(t, http.MethodHead, hub.url+"/acme/git/resolve/main/config.json", "", nil, nil)
+	head := do(t, http.MethodHead, local.URL+"/acme/git/resolve/main/config.json", "", nil, nil)
+	upstream := do(t, http.MethodHead, hub.URL+"/acme/git/resolve/main/config.json", "", nil, nil)
 	etag := head.Header.Get("ETag")
 	if head.StatusCode != http.StatusOK || len(etag) != 42 || etag != upstream.Header.Get("ETag") {
 		t.Fatalf("HEAD before fetching: status %d, ETag %s, upstream's %s", head.StatusCode, etag, upstream.Header.Get("ETag"))
 	}
-	c, _ := local.reg.Resolve(ctx, "acme/git", "main")
-	if f, _ := local.reg.File(ctx, c, "config.json"); !f.Pending || f.LFS || f.SHA256 != "" {
+	c, _ := local.Reg.Resolve(ctx, "acme/git", "main")
+	if f, _ := local.Reg.File(ctx, c, "config.json"); !f.Pending || f.LFS || f.SHA256 != "" {
 		t.Fatalf("before fetching: %+v", f)
 	}
 
-	resp := do(t, http.MethodGet, local.url+"/acme/git/resolve/main/config.json", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/git/resolve/main/config.json", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || body(t, resp) != `{"small":true}` || resp.Header.Get("ETag") != etag {
 		t.Fatalf("download: status %d ETag %s", resp.StatusCode, resp.Header.Get("ETag"))
 	}
-	if f, _ := local.reg.File(ctx, c, "config.json"); f.Pending || f.SHA256 != sha(`{"small":true}`) {
+	if f, _ := local.Reg.File(ctx, c, "config.json"); f.Pending || f.SHA256 != kit.SHA256Hex(`{"small":true}`) {
 		t.Fatalf("after fetching: %+v", f)
 	}
 }

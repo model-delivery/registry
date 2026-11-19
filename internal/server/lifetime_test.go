@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -41,34 +43,34 @@ func (c *fakeClock) Advance(d time.Duration) {
 func TestSignedUploadURLExpires(t *testing.T) {
 	t.Parallel()
 	clock := newFakeClock()
-	in := start(t, server.Config{AnonymousRead: true, Now: clock.Now})
+	in := regtest.Start(t, server.Config{AnonymousRead: true, Now: clock.Now})
 	early, late := strings.Repeat("sent in time ", 300), strings.Repeat("sent too late ", 300)
 	urls := batch(t, in, "acme/up", early, late)
 
 	// Just inside the twelve hours: accepted.
 	clock.Advance(12*time.Hour - time.Second)
-	resp := do(t, http.MethodPut, urls[sha(early)], "", strings.NewReader(early), nil)
+	resp := do(t, http.MethodPut, urls[kit.SHA256Hex(early)], "", strings.NewReader(early), nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload before the URL expired: status %d (%s)", resp.StatusCode, body(t, resp))
 	}
-	if _, ok, _ := in.reg.StatBlob(context.Background(), sha(early)); !ok {
+	if _, ok, _ := in.Reg.StatBlob(context.Background(), kit.SHA256Hex(early)); !ok {
 		t.Fatal("the upload was not stored")
 	}
 
 	// Just past them: refused, with what to do, and nothing stored.
 	clock.Advance(2 * time.Second)
-	resp = do(t, http.MethodPut, urls[sha(late)], "", strings.NewReader(late), nil)
+	resp = do(t, http.MethodPut, urls[kit.SHA256Hex(late)], "", strings.NewReader(late), nil)
 	msg := body(t, resp)
 	if resp.StatusCode != http.StatusForbidden || !strings.Contains(msg, "expired") || !strings.Contains(msg, "start the upload again") {
 		t.Fatalf("upload after the URL expired: status %d: %s", resp.StatusCode, msg)
 	}
-	if _, ok, _ := in.reg.StatBlob(context.Background(), sha(late)); ok {
+	if _, ok, _ := in.Reg.StatBlob(context.Background(), kit.SHA256Hex(late)); ok {
 		t.Fatal("an upload to an expired URL was stored")
 	}
 
 	// A new URL from the batch route works again.
 	fresh := batch(t, in, "acme/up", late)
-	if resp := do(t, http.MethodPut, fresh[sha(late)], "", strings.NewReader(late), nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodPut, fresh[kit.SHA256Hex(late)], "", strings.NewReader(late), nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload to a new URL: status %d", resp.StatusCode)
 	}
 }
@@ -80,11 +82,11 @@ func TestRememberedMissExpires(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	clock := newFakeClock()
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true, Now: clock.Now})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true, Now: clock.Now})
 
 	ask := func(want int) {
 		t.Helper()
-		resp := do(t, http.MethodGet, local.url+"/api/models/acme/later/revision/main", "", nil, nil)
+		resp := do(t, http.MethodGet, local.URL+"/api/models/acme/later/revision/main", "", nil, nil)
 		if resp.StatusCode != want {
 			t.Fatalf("status %d, want %d (%s)", resp.StatusCode, want, body(t, resp))
 		}
@@ -120,7 +122,7 @@ func TestListingCompletesWhileEveryFileSlotIsBusy(t *testing.T) {
 	big := map[string]string{"a.bin": "aaaa", "b.bin": "bbbb", "c.bin": "cccc", "d.bin": "dddd"}
 	push(t, hub.inst, "acme/big", big, client.PushOptions{})
 	hub.hold = make(chan struct{})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	// Four downloads, each of a different file, all held back upstream.
 	var wg sync.WaitGroup
@@ -128,7 +130,7 @@ func TestListingCompletesWhileEveryFileSlotIsBusy(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, local.url+"/acme/big/resolve/main/"+name, nil)
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, local.URL+"/acme/big/resolve/main/"+name, nil)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Errorf("%s: %v", name, err)
@@ -153,7 +155,7 @@ func TestListingCompletesWhileEveryFileSlotIsBusy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, path := range []string{"/api/models/acme/tiny/revision/main", "/api/models/acme/tiny/tree/main", "/api/v1/repos/acme/tiny/revisions/main"} {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, local.url+path, nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, local.URL+path, nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("%s: the listing waited behind the file downloads: %v", path, err)
@@ -164,7 +166,7 @@ func TestListingCompletesWhileEveryFileSlotIsBusy(t *testing.T) {
 		}
 	}
 	// So is the metadata of one of its files, which costs no slot either.
-	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, local.url+"/acme/tiny/resolve/main/model.safetensors", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, local.URL+"/acme/tiny/resolve/main/model.safetensors", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("HEAD of a listed file: %v", err)

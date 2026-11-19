@@ -15,7 +15,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -62,19 +64,19 @@ func inlineFile(path, content string) map[string]any {
 
 func lfsFile(path, content string) map[string]any {
 	return map[string]any{"key": "lfsFile", "value": map[string]any{
-		"path": path, "algo": "sha256", "oid": sha(content), "size": len(content),
+		"path": path, "algo": "sha256", "oid": kit.SHA256Hex(content), "size": len(content),
 	}}
 }
 
 // batch asks where to upload objects and returns the upload URL per digest
 // ("" when the registry says it already has the object).
-func batch(t *testing.T, in *instance, repo string, contents ...string) map[string]string {
+func batch(t *testing.T, in *regtest.Instance, repo string, contents ...string) map[string]string {
 	t.Helper()
 	objects := make([]map[string]any, len(contents))
 	for i, c := range contents {
-		objects[i] = map[string]any{"oid": sha(c), "size": len(c)}
+		objects[i] = map[string]any{"oid": kit.SHA256Hex(c), "size": len(c)}
 	}
-	resp := do(t, http.MethodPost, in.url+"/"+repo+".git/info/lfs/objects/batch", in.write,
+	resp := do(t, http.MethodPost, in.URL+"/"+repo+".git/info/lfs/objects/batch", in.Write,
 		jsonBody(t, map[string]any{"operation": "upload", "transfers": []string{"basic", "multipart"}, "objects": objects, "hash_algo": "sha256"}), nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("batch: status %d (%s)", resp.StatusCode, body(t, resp))
@@ -99,9 +101,9 @@ func batch(t *testing.T, in *instance, repo string, contents ...string) map[stri
 	return urls
 }
 
-func commitTo(t *testing.T, in *instance, repo, branch, token string, lines ...map[string]any) (int, string) {
+func commitTo(t *testing.T, in *regtest.Instance, repo, branch, token string, lines ...map[string]any) (int, string) {
 	t.Helper()
-	resp := do(t, http.MethodPost, in.url+"/api/models/"+repo+"/commit/"+url.PathEscape(branch), token, commitBody(t, lines...),
+	resp := do(t, http.MethodPost, in.URL+"/api/models/"+repo+"/commit/"+url.PathEscape(branch), token, commitBody(t, lines...),
 		map[string]string{"Content-Type": "application/x-ndjson"})
 	return resp.StatusCode, body(t, resp)
 }
@@ -120,14 +122,14 @@ func commitOID(t *testing.T, responseBody string) string {
 func TestLargeFileUploadURLs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	content := strings.Repeat("large file content ", 4096)
-	href := batch(t, in, "acme/up", content)[sha(content)]
+	href := batch(t, in, "acme/up", content)[kit.SHA256Hex(content)]
 	if href == "" {
 		t.Fatal("no upload URL for an object the registry does not have")
 	}
 	stored := func(c string) bool {
-		_, ok, _ := in.reg.StatBlob(ctx, sha(c))
+		_, ok, _ := in.Reg.StatBlob(ctx, kit.SHA256Hex(c))
 		return ok
 	}
 
@@ -152,7 +154,7 @@ func TestLargeFileUploadURLs(t *testing.T) {
 		other := "a different object"
 		tamper := map[string]func(q url.Values, path *string){
 			"another digest": func(_ url.Values, path *string) {
-				*path = strings.Replace(*path, sha(content), sha(other), 1)
+				*path = strings.Replace(*path, kit.SHA256Hex(content), kit.SHA256Hex(other), 1)
 			},
 			"another size":      func(q url.Values, _ *string) { q.Set("size", strconv.Itoa(len(other))) },
 			"a later expiry":    func(q url.Values, _ *string) { q.Set("expires", "99999999999") },
@@ -177,8 +179,8 @@ func TestLargeFileUploadURLs(t *testing.T) {
 
 	t.Run("a URL from another server instance is refused", func(t *testing.T) {
 		// Signing keys are per process, so a URL cannot be replayed elsewhere.
-		elsewhere := start(t, server.Config{AnonymousRead: true})
-		target := strings.Replace(href, in.url, elsewhere.url, 1)
+		elsewhere := regtest.Start(t, server.Config{AnonymousRead: true})
+		target := strings.Replace(href, in.URL, elsewhere.URL, 1)
 		resp := do(t, http.MethodPut, target, "", strings.NewReader(content), nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status %d, want 403", resp.StatusCode)
@@ -190,13 +192,13 @@ func TestLargeFileUploadURLs(t *testing.T) {
 		if resp.StatusCode != http.StatusOK || !stored(content) {
 			t.Fatalf("status %d, stored %v", resp.StatusCode, stored(content))
 		}
-		if again := batch(t, in, "acme/up", content)[sha(content)]; again != "" {
+		if again := batch(t, in, "acme/up", content)[kit.SHA256Hex(content)]; again != "" {
 			t.Fatal("the registry asked for an object it already has")
 		}
 	})
 
 	t.Run("malformed objects are reported per object", func(t *testing.T) {
-		resp := do(t, http.MethodPost, in.url+"/acme/up.git/info/lfs/objects/batch", in.write,
+		resp := do(t, http.MethodPost, in.URL+"/acme/up.git/info/lfs/objects/batch", in.Write,
 			jsonBody(t, map[string]any{"operation": "upload", "objects": []map[string]any{{"oid": "not-a-digest", "size": 3}}}), nil)
 		if got := body(t, resp); resp.StatusCode != http.StatusOK || !strings.Contains(got, `"error"`) || strings.Contains(got, `"actions"`) {
 			t.Fatalf("status %d body %s", resp.StatusCode, got)
@@ -204,7 +206,7 @@ func TestLargeFileUploadURLs(t *testing.T) {
 	})
 
 	t.Run("downloads do not use this endpoint", func(t *testing.T) {
-		resp := do(t, http.MethodPost, in.url+"/acme/up.git/info/lfs/objects/batch", in.write,
+		resp := do(t, http.MethodPost, in.URL+"/acme/up.git/info/lfs/objects/batch", in.Write,
 			jsonBody(t, map[string]any{"operation": "download", "objects": []map[string]any{}}), nil)
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Fatalf("status %d", resp.StatusCode)
@@ -218,45 +220,45 @@ func TestUploadURLEndsWithItsToken(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	content := strings.Repeat("uploaded after the token was gone ", 512)
-	refused := func(t *testing.T, in *instance, href string) {
+	refused := func(t *testing.T, in *regtest.Instance, href string) {
 		t.Helper()
 		resp := do(t, http.MethodPut, href, "", strings.NewReader(content), nil)
 		msg := body(t, resp)
 		if resp.StatusCode != http.StatusForbidden || !strings.Contains(msg, "revoked or no longer has the write role") {
 			t.Fatalf("status %d, want 403 saying why: %s", resp.StatusCode, msg)
 		}
-		if _, ok, _ := in.reg.StatBlob(ctx, sha(content)); ok {
+		if _, ok, _ := in.Reg.StatBlob(ctx, kit.SHA256Hex(content)); ok {
 			t.Fatal("the upload was stored")
 		}
 	}
 
 	t.Run("revoked", func(t *testing.T) {
 		t.Parallel()
-		in := start(t, server.Config{AnonymousRead: true})
-		href := batch(t, in, "acme/up", content)[sha(content)]
-		if err := in.reg.RevokeToken(ctx, "write"); err != nil {
+		in := regtest.Start(t, server.Config{AnonymousRead: true})
+		href := batch(t, in, "acme/up", content)[kit.SHA256Hex(content)]
+		if err := in.Reg.RevokeToken(ctx, "write"); err != nil {
 			t.Fatal(err)
 		}
 		refused(t, in, href)
 	})
 	t.Run("reduced to the read role", func(t *testing.T) {
 		t.Parallel()
-		in := start(t, server.Config{AnonymousRead: true})
-		href := batch(t, in, "acme/up", content)[sha(content)]
-		if err := in.reg.SetToken(ctx, "write", registry.RoleRead, in.write, true); err != nil {
+		in := regtest.Start(t, server.Config{AnonymousRead: true})
+		href := batch(t, in, "acme/up", content)[kit.SHA256Hex(content)]
+		if err := in.Reg.SetToken(ctx, "write", registry.RoleRead, in.Write, true); err != nil {
 			t.Fatal(err)
 		}
 		refused(t, in, href)
 	})
 	t.Run("still valid: accepted, with a name that needs escaping", func(t *testing.T) {
 		t.Parallel()
-		in := start(t, server.Config{AnonymousRead: true})
-		secret, err := in.reg.CreateToken(ctx, "ci & deploy/main", registry.RoleWrite)
+		in := regtest.Start(t, server.Config{AnonymousRead: true})
+		secret, err := in.Reg.CreateToken(ctx, "ci & deploy/main", registry.RoleWrite)
 		if err != nil {
 			t.Fatal(err)
 		}
-		in.write = secret
-		href := batch(t, in, "acme/up", content)[sha(content)]
+		in.Write = secret
+		href := batch(t, in, "acme/up", content)[kit.SHA256Hex(content)]
 		if resp := do(t, http.MethodPut, href, "", strings.NewReader(content), nil); resp.StatusCode != http.StatusOK {
 			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 		}
@@ -266,13 +268,13 @@ func TestUploadURLEndsWithItsToken(t *testing.T) {
 func TestUploadCommits(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	big := strings.Repeat("big ", 5000)
-	if resp := do(t, http.MethodPut, batch(t, in, "acme/up", big)[sha(big)], "", strings.NewReader(big), nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodPut, batch(t, in, "acme/up", big)[kit.SHA256Hex(big)], "", strings.NewReader(big), nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload: %d", resp.StatusCode)
 	}
 
-	status, out := commitTo(t, in, "acme/up", "main", in.write, header("first", ""),
+	status, out := commitTo(t, in, "acme/up", "main", in.Write, header("first", ""),
 		inlineFile("config.json", "{}"), inlineFile("empty.txt", ""), lfsFile("model.bin", big), inlineFile("dir/a.txt", "a"), inlineFile("dir/b.txt", "b"))
 	if status != http.StatusOK {
 		t.Fatalf("first commit: %d %s", status, out)
@@ -280,11 +282,11 @@ func TestUploadCommits(t *testing.T) {
 	first := commitOID(t, out)
 
 	files := func(rev string) map[string]registry.File {
-		c, err := in.reg.Resolve(ctx, "acme/up", rev)
+		c, err := in.Reg.Resolve(ctx, "acme/up", rev)
 		if err != nil {
 			t.Fatal(err)
 		}
-		list, _ := in.reg.Files(ctx, c)
+		list, _ := in.Reg.Files(ctx, c)
 		m := map[string]registry.File{}
 		for _, f := range list {
 			m[f.Path] = f
@@ -297,21 +299,21 @@ func TestUploadCommits(t *testing.T) {
 		if len(got) != 5 {
 			t.Fatalf("%d files", len(got))
 		}
-		if f := got["model.bin"]; !f.LFS || f.ETag() != sha(big) {
+		if f := got["model.bin"]; !f.LFS || f.ETag() != kit.SHA256Hex(big) {
 			t.Errorf("large file: %+v", f)
 		}
 		// A file sent inline is a git-style file: its ETag is its git blob id.
-		if f := got["config.json"]; f.LFS || len(f.ETag()) != 40 || f.SHA256 != sha("{}") {
+		if f := got["config.json"]; f.LFS || len(f.ETag()) != 40 || f.SHA256 != kit.SHA256Hex("{}") {
 			t.Errorf("inline file: %+v", f)
 		}
-		resp := do(t, http.MethodHead, in.url+"/acme/up/resolve/main/config.json", "", nil, nil)
+		resp := do(t, http.MethodHead, in.URL+"/acme/up/resolve/main/config.json", "", nil, nil)
 		if resp.Header.Get("ETag") != `"`+got["config.json"].GitOID+`"` {
 			t.Errorf("served ETag %s", resp.Header.Get("ETag"))
 		}
 	})
 
 	t.Run("a later commit adds, replaces and deletes on top of the branch", func(t *testing.T) {
-		status, out := commitTo(t, in, "acme/up", "main", in.write, header("second", first),
+		status, out := commitTo(t, in, "acme/up", "main", in.Write, header("second", first),
 			inlineFile("config.json", `{"v":2}`),
 			map[string]any{"key": "deletedFile", "value": map[string]any{"path": "empty.txt"}},
 			map[string]any{"key": "deletedFolder", "value": map[string]any{"path": "dir/"}},
@@ -324,7 +326,7 @@ func TestUploadCommits(t *testing.T) {
 		for p := range got {
 			names = append(names, p)
 		}
-		if len(got) != 3 || got["config.json"].SHA256 != sha(`{"v":2}`) || got["model.bin"].SHA256 != sha(big) || got["new.txt"].SHA256 != sha("new") {
+		if len(got) != 3 || got["config.json"].SHA256 != kit.SHA256Hex(`{"v":2}`) || got["model.bin"].SHA256 != kit.SHA256Hex(big) || got["new.txt"].SHA256 != kit.SHA256Hex("new") {
 			t.Fatalf("files after second commit: %v", names)
 		}
 		// The first revision is untouched.
@@ -334,7 +336,7 @@ func TestUploadCommits(t *testing.T) {
 	})
 
 	head := func() string {
-		c, err := in.reg.Resolve(ctx, "acme/up", "main")
+		c, err := in.Reg.Resolve(ctx, "acme/up", "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -352,7 +354,7 @@ func TestUploadCommits(t *testing.T) {
 		{"made against a revision the branch has moved past", "main", "", []map[string]any{header("stale", first), inlineFile("x", "x")}, http.StatusPreconditionFailed, "moved"},
 		{"names a large file that was never uploaded", "main", "", []map[string]any{header("m", ""), lfsFile("ghost.bin", "never uploaded")}, http.StatusBadRequest, "HF_HUB_DISABLE_XET"},
 		{"declares the wrong size for a large file", "main", "", []map[string]any{header("m", ""),
-			{"key": "lfsFile", "value": map[string]any{"path": "model.bin", "algo": "sha256", "oid": sha(big), "size": 1}}}, http.StatusBadRequest, "bytes"},
+			{"key": "lfsFile", "value": map[string]any{"path": "model.bin", "algo": "sha256", "oid": kit.SHA256Hex(big), "size": 1}}}, http.StatusBadRequest, "bytes"},
 		{"has no header", "main", "", []map[string]any{inlineFile("x", "x")}, http.StatusBadRequest, "header"},
 		{"uses an unknown operation", "main", "", []map[string]any{header("m", ""), {"key": "renamedFile", "value": map[string]any{}}}, http.StatusBadRequest, "not supported"},
 		{"sends content that is not base64", "main", "", []map[string]any{header("m", ""),
@@ -368,7 +370,7 @@ func TestUploadCommits(t *testing.T) {
 	for _, tc := range refused {
 		t.Run("refuses a commit that "+tc.name, func(t *testing.T) {
 			before := head()
-			resp := do(t, http.MethodPost, in.url+"/api/models/acme/up/commit/"+tc.branch+tc.query, in.write, commitBody(t, tc.lines...), nil)
+			resp := do(t, http.MethodPost, in.URL+"/api/models/acme/up/commit/"+tc.branch+tc.query, in.Write, commitBody(t, tc.lines...), nil)
 			got := body(t, resp)
 			if resp.StatusCode != tc.want || !strings.Contains(got, tc.say) {
 				t.Fatalf("status %d, want %d mentioning %q: %s", resp.StatusCode, tc.want, tc.say, got)
@@ -385,7 +387,7 @@ func TestUploadCommits(t *testing.T) {
 	t.Run("refuses an inline file larger than the limit", func(t *testing.T) {
 		before := head()
 		huge := strings.Repeat("x", 23<<20) // encodes to more than one commit line may hold
-		status, out := commitTo(t, in, "acme/up", "main", in.write, header("m", ""), inlineFile("huge.bin", huge))
+		status, out := commitTo(t, in, "acme/up", "main", in.Write, header("m", ""), inlineFile("huge.bin", huge))
 		if status != http.StatusRequestEntityTooLarge || !strings.Contains(out, "large-file upload") {
 			t.Fatalf("status %d: %s", status, out)
 		}
@@ -398,23 +400,23 @@ func TestUploadCommits(t *testing.T) {
 func TestUploadRepositoriesAndBranches(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 
 	create := func(token string, payload map[string]any) (int, string) {
-		resp := do(t, http.MethodPost, in.url+"/api/repos/create", token, jsonBody(t, payload), nil)
+		resp := do(t, http.MethodPost, in.URL+"/api/repos/create", token, jsonBody(t, payload), nil)
 		return resp.StatusCode, body(t, resp)
 	}
 
-	status, out := create(in.write, map[string]any{"name": "model", "organization": "acme", "type": "model"})
-	if status != http.StatusOK || !strings.Contains(out, in.url+"/acme/model") {
+	status, out := create(in.Write, map[string]any{"name": "model", "organization": "acme", "type": "model"})
+	if status != http.StatusOK || !strings.Contains(out, in.URL+"/acme/model") {
 		t.Fatalf("create: %d %s", status, out)
 	}
 	// exist_ok clients treat this status as success.
-	if status, _ := create(in.write, map[string]any{"name": "model", "organization": "acme"}); status != http.StatusConflict {
+	if status, _ := create(in.Write, map[string]any{"name": "model", "organization": "acme"}); status != http.StatusConflict {
 		t.Fatalf("create again: %d, want 409", status)
 	}
 	// No namespace given: the token's name stands in for the user's.
-	status, out = create(in.write, map[string]any{"name": "mine"})
+	status, out = create(in.Write, map[string]any{"name": "mine"})
 	if status != http.StatusOK || !strings.Contains(out, "/write/mine") {
 		t.Fatalf("create without a namespace: %d %s", status, out)
 	}
@@ -424,27 +426,27 @@ func TestUploadRepositoriesAndBranches(t *testing.T) {
 		"a bad name":           {"name": "has space", "organization": "acme"},
 		"a reserved namespace": {"name": "x", "organization": "api"},
 	} {
-		if status, out := create(in.write, payload); status != http.StatusBadRequest {
+		if status, out := create(in.Write, payload); status != http.StatusBadRequest {
 			t.Errorf("%s: status %d %s", name, status, out)
 		}
 	}
 
 	t.Run("an empty repository exists, with no revision", func(t *testing.T) {
-		if _, err := in.reg.GetRepo(ctx, "acme/model"); err != nil {
+		if _, err := in.Reg.GetRepo(ctx, "acme/model"); err != nil {
 			t.Fatal(err)
 		}
-		resp := do(t, http.MethodGet, in.url+"/api/models/acme/model/revision/main", "", nil, nil)
+		resp := do(t, http.MethodGet, in.URL+"/api/models/acme/model/revision/main", "", nil, nil)
 		if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != "RevisionNotFound" {
 			t.Fatalf("status %d code %q", resp.StatusCode, resp.Header.Get("X-Error-Code"))
 		}
-		page := do(t, http.MethodGet, in.url+"/ui/repo/acme/model", "", nil, nil)
+		page := do(t, http.MethodGet, in.URL+"/ui/repo/acme/model", "", nil, nil)
 		if got := body(t, page); page.StatusCode != http.StatusOK || !strings.Contains(got, "no revisions yet") {
 			t.Fatalf("empty repository page: status %d", page.StatusCode)
 		}
 	})
 
 	branch := func(repo, name string, payload map[string]any) int {
-		resp := do(t, http.MethodPost, in.url+"/api/models/"+repo+"/branch/"+url.PathEscape(name), in.write, jsonBody(t, payload), nil)
+		resp := do(t, http.MethodPost, in.URL+"/api/models/"+repo+"/branch/"+url.PathEscape(name), in.Write, jsonBody(t, payload), nil)
 		return resp.StatusCode
 	}
 
@@ -452,15 +454,15 @@ func TestUploadRepositoriesAndBranches(t *testing.T) {
 		if got := branch("acme/model", "dev", map[string]any{}); got != http.StatusOK {
 			t.Fatalf("create_branch on an empty repository: %d", got)
 		}
-		status, out := commitTo(t, in, "acme/model", "dev", in.write, header("on dev", ""), inlineFile("a.txt", "a"))
+		status, out := commitTo(t, in, "acme/model", "dev", in.Write, header("on dev", ""), inlineFile("a.txt", "a"))
 		if status != http.StatusOK {
 			t.Fatalf("%d %s", status, out)
 		}
-		c, err := in.reg.Resolve(ctx, "acme/model", "dev")
+		c, err := in.Reg.Resolve(ctx, "acme/model", "dev")
 		if err != nil || c.SHA != commitOID(t, out) {
 			t.Fatalf("dev = %v, %v", c.SHA, err)
 		}
-		if _, err := in.reg.Resolve(ctx, "acme/model", "main"); !errors.Is(err, registry.ErrRevisionNotFound) {
+		if _, err := in.Reg.Resolve(ctx, "acme/model", "main"); !errors.Is(err, registry.ErrRevisionNotFound) {
 			t.Fatalf("main was created too: %v", err)
 		}
 	})
@@ -469,8 +471,8 @@ func TestUploadRepositoriesAndBranches(t *testing.T) {
 		if got := branch("acme/model", "release", map[string]any{"startingPoint": "dev"}); got != http.StatusOK {
 			t.Fatalf("status %d", got)
 		}
-		dev, _ := in.reg.Resolve(ctx, "acme/model", "dev")
-		rel, err := in.reg.Resolve(ctx, "acme/model", "release")
+		dev, _ := in.Reg.Resolve(ctx, "acme/model", "dev")
+		rel, err := in.Reg.Resolve(ctx, "acme/model", "release")
 		if err != nil || rel.SHA != dev.SHA {
 			t.Fatalf("release = %v, %v", rel.SHA, err)
 		}
@@ -485,7 +487,7 @@ func TestUploadRepositoriesAndBranches(t *testing.T) {
 
 func TestUploadAccessControl(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	content := "needs a token"
 	steps := []struct {
 		name, method, path string
@@ -498,7 +500,7 @@ func TestUploadAccessControl(t *testing.T) {
 			return jsonBody(t, map[string]any{"files": []map[string]any{{"path": "a", "size": 1, "sample": ""}}})
 		}},
 		{"ask where to upload", http.MethodPost, "/acme/x.git/info/lfs/objects/batch", func() *strings.Reader {
-			return jsonBody(t, map[string]any{"operation": "upload", "objects": []map[string]any{{"oid": sha(content), "size": len(content)}}})
+			return jsonBody(t, map[string]any{"operation": "upload", "objects": []map[string]any{{"oid": kit.SHA256Hex(content), "size": len(content)}}})
 		}},
 		{"commit", http.MethodPost, "/api/models/acme/x/commit/main", func() *strings.Reader {
 			return commitBody(t, header("m", ""), inlineFile("a", "a"))
@@ -506,19 +508,19 @@ func TestUploadAccessControl(t *testing.T) {
 		{"create a branch", http.MethodPost, "/api/models/acme/x/branch/dev", func() *strings.Reader { return jsonBody(t, map[string]any{}) }},
 	}
 	for _, step := range steps {
-		for who, want := range map[string]int{"": http.StatusUnauthorized, in.read: http.StatusForbidden, "hf_some_other_services_token": http.StatusUnauthorized} {
-			resp := do(t, step.method, in.url+step.path, who, step.body(), nil)
+		for who, want := range map[string]int{"": http.StatusUnauthorized, in.Read: http.StatusForbidden, "hf_some_other_services_token": http.StatusUnauthorized} {
+			resp := do(t, step.method, in.URL+step.path, who, step.body(), nil)
 			if resp.StatusCode != want {
 				t.Errorf("%s with token %q: status %d, want %d", step.name, firstN(who, 8), resp.StatusCode, want)
 			}
 		}
 	}
-	if _, err := in.reg.GetRepo(context.Background(), "acme/x"); err == nil {
+	if _, err := in.Reg.GetRepo(context.Background(), "acme/x"); err == nil {
 		t.Fatal("a caller without write access created a repository")
 	}
 	// An upload URL cannot be made up: it has to come from the registry.
-	forged := fmt.Sprintf("%s/api/lfs/upload/%s?size=%d&expires=99999999999&signature=%s", in.url, sha(content), len(content), strings.Repeat("ab", 32))
-	if resp := do(t, http.MethodPut, forged, in.write, strings.NewReader(content), nil); resp.StatusCode != http.StatusForbidden {
+	forged := fmt.Sprintf("%s/api/lfs/upload/%s?size=%d&expires=99999999999&signature=%s", in.URL, kit.SHA256Hex(content), len(content), strings.Repeat("ab", 32))
+	if resp := do(t, http.MethodPut, forged, in.Write, strings.NewReader(content), nil); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("a forged upload URL was accepted even with a write token: %d", resp.StatusCode)
 	}
 }
@@ -532,15 +534,15 @@ func firstN(s string, n int) string {
 
 func TestXetIsDeclinedWithTheFixInTheAddress(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	// The Xet client prints the address that failed and nothing else, so the
 	// explanation has to be in the address.
-	resp := do(t, http.MethodGet, in.url+"/api/models/acme/x/xet-write-token/main", in.write, nil, nil)
+	resp := do(t, http.MethodGet, in.URL+"/api/models/acme/x/xet-write-token/main", in.Write, nil, nil)
 	loc := resp.Header.Get("Location")
 	if resp.StatusCode != http.StatusTemporaryRedirect || !strings.Contains(loc, "HF_HUB_DISABLE_XET=1") {
 		t.Fatalf("status %d location %q", resp.StatusCode, loc)
 	}
-	final := do(t, http.MethodGet, in.url+loc, in.write, nil, nil)
+	final := do(t, http.MethodGet, in.URL+loc, in.Write, nil, nil)
 	if got := body(t, final); final.StatusCode != http.StatusBadRequest || !strings.Contains(got, "HF_HUB_DISABLE_XET=1") {
 		t.Fatalf("status %d body %s", final.StatusCode, got)
 	}

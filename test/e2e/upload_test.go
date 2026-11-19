@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -61,36 +62,21 @@ func lastJSON(t *testing.T, stdout string, v any) {
 	}
 }
 
-func writeFiles(t *testing.T, files map[string]string) string {
-	t.Helper()
-	dir := t.TempDir()
-	for p, content := range files {
-		full := filepath.Join(dir, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return dir
-}
-
 // revisionFiles is what the registry holds for a revision: path -> content.
-func revisionFiles(t *testing.T, in *instance, repo, rev string) (string, map[string]string) {
+func revisionFiles(t *testing.T, in *regtest.Instance, repo, rev string) (string, map[string]string) {
 	t.Helper()
 	ctx := context.Background()
-	c, err := in.reg.Resolve(ctx, repo, rev)
+	c, err := in.Reg.Resolve(ctx, repo, rev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := in.reg.Files(ctx, c)
+	files, err := in.Reg.Files(ctx, c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := map[string]string{}
 	for _, f := range files {
-		rc, _, err := in.reg.OpenBlob(ctx, f.SHA256)
+		rc, _, err := in.Reg.OpenBlob(ctx, f.SHA256)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,9 +140,9 @@ print(json.dumps({
 func TestHubClientUpload(t *testing.T) {
 	python(t)
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 
-	first := writeFiles(t, map[string]string{
+	first := regtest.WriteTree(t, map[string]string{
 		"config.json":         `{"v": 1}`,
 		"model.safetensors":   largeContent,
 		"tokenizer/vocab.txt": "a\nb\n",
@@ -165,13 +151,13 @@ func TestHubClientUpload(t *testing.T) {
 		"empty.txt":           "",
 		"name with space.txt": "spaced",
 	})
-	second := writeFiles(t, map[string]string{
+	second := regtest.WriteTree(t, map[string]string{
 		"model.safetensors": largeContent, // unchanged: must not be sent again
 		"adapter.bin":       "adapter",
 	})
 
 	// The older large-file protocol, which is what the registry speaks.
-	stdout, stderr, err := runPython(t, in.srv.URL, in.write, uploadPy, []string{"HF_HUB_DISABLE_XET=1"}, "team/uploaded", first, second)
+	stdout, stderr, err := runPython(t, in.URL, in.Write, uploadPy, []string{"HF_HUB_DISABLE_XET=1"}, "team/uploaded", first, second)
 	if err != nil {
 		t.Fatalf("upload failed: %v\n%s", err, stderr)
 	}
@@ -228,10 +214,10 @@ func TestHubClientUpload(t *testing.T) {
 	}
 
 	// And a standard download gets the uploaded model back.
-	checkSnapshot(t, in, "team/uploaded", rv[3], hfDownload(t, in.srv.URL, "team/uploaded", "main", "config.json"))
+	checkSnapshot(t, in, "team/uploaded", rv[3], hfDownload(t, in.URL, "team/uploaded", "main", "config.json"))
 
 	// The unchanged large file was stored once.
-	st, _ := in.reg.Stats(ctx)
+	st, _ := in.Reg.Stats(ctx)
 	if st.StoredBytes > int64(len(largeContent))+10_000 {
 		t.Errorf("stored %d bytes; the large file (%d bytes) appears to be stored more than once", st.StoredBytes, len(largeContent))
 	}
@@ -254,11 +240,11 @@ func TestHubClientUploadWithXetInstalled(t *testing.T) {
 	if err := exec.Command(python(t), "-c", "import hf_xet").Run(); err != nil {
 		t.Skip("hf_xet is not installed, so this client already uses the protocol the registry speaks")
 	}
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 
 	t.Run("small files upload with no extra setting", func(t *testing.T) {
-		dir := writeFiles(t, map[string]string{"config.json": "{}", "README.md": "# small\n", "weights.bin": strings.Repeat("w", 200_000)})
-		stdout, stderr, err := runPython(t, in.srv.URL, in.write, smallUploadPy, nil, "team/small", dir)
+		dir := regtest.WriteTree(t, map[string]string{"config.json": "{}", "README.md": "# small\n", "weights.bin": strings.Repeat("w", 200_000)})
+		stdout, stderr, err := runPython(t, in.URL, in.Write, smallUploadPy, nil, "team/small", dir)
 		if err != nil {
 			t.Fatalf("upload of small files failed: %v\n%s", err, stderr)
 		}
@@ -270,8 +256,8 @@ func TestHubClientUploadWithXetInstalled(t *testing.T) {
 	})
 
 	t.Run("a large file fails and says how to fix it", func(t *testing.T) {
-		dir := writeFiles(t, map[string]string{"config.json": "{}", "model.safetensors": largeContent})
-		_, stderr, err := runPython(t, in.srv.URL, in.write, smallUploadPy, nil, "team/large", dir)
+		dir := regtest.WriteTree(t, map[string]string{"config.json": "{}", "model.safetensors": largeContent})
+		_, stderr, err := runPython(t, in.URL, in.Write, smallUploadPy, nil, "team/large", dir)
 		if err == nil {
 			t.Fatal("the upload succeeded; if the registry now handles this, update the docs and this test")
 		}
@@ -280,7 +266,7 @@ func TestHubClientUploadWithXetInstalled(t *testing.T) {
 			t.Errorf("the error the user sees does not mention HF_HUB_DISABLE_XET")
 		}
 		// Nothing half-uploaded is visible.
-		if _, err := in.reg.Resolve(context.Background(), "team/large", "main"); err == nil {
+		if _, err := in.Reg.Resolve(context.Background(), "team/large", "main"); err == nil {
 			t.Error("a revision was recorded for an upload that failed")
 		}
 	})
@@ -298,18 +284,18 @@ func tail(s string, n int) string {
 func TestHubClientUploadNeedsWriteAccess(t *testing.T) {
 	python(t)
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true})
-	read, err := in.reg.CreateToken(ctx, "reader", registry.RoleRead)
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
+	read, err := in.Reg.CreateToken(ctx, "reader", registry.RoleRead)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := writeFiles(t, map[string]string{"config.json": "{}"})
+	dir := regtest.WriteTree(t, map[string]string{"config.json": "{}"})
 	for name, token := range map[string]string{"no token": "", "read-only token": read, "unknown token": "md_0000000000000000000000000000000000000000"} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := runPython(t, in.srv.URL, token, smallUploadPy, []string{"HF_HUB_DISABLE_XET=1"}, "team/denied", dir); err == nil {
+			if _, _, err := runPython(t, in.URL, token, smallUploadPy, []string{"HF_HUB_DISABLE_XET=1"}, "team/denied", dir); err == nil {
 				t.Fatal("the upload succeeded")
 			}
-			if _, err := in.reg.GetRepo(ctx, "team/denied"); err == nil {
+			if _, err := in.Reg.GetRepo(ctx, "team/denied"); err == nil {
 				t.Fatal("a repository was created by a caller who may not write")
 			}
 		})
@@ -329,12 +315,12 @@ main()
 // new repository, a single file, and a folder to a new branch.
 func TestHfUploadCommand(t *testing.T) {
 	python(t)
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	env := []string{"HF_HUB_DISABLE_XET=1"}
-	dir := writeFiles(t, map[string]string{"config.json": `{"v": 1}`, "model.safetensors": largeContent, "sub/vocab.txt": "a\n"})
+	dir := regtest.WriteTree(t, map[string]string{"config.json": `{"v": 1}`, "model.safetensors": largeContent, "sub/vocab.txt": "a\n"})
 	hf := func(args ...string) {
 		t.Helper()
-		if _, stderr, err := runPython(t, in.srv.URL, in.write, hfCommandPy, env, args...); err != nil {
+		if _, stderr, err := runPython(t, in.URL, in.Write, hfCommandPy, env, args...); err != nil {
 			t.Fatalf("hf %s failed: %v\n%s", strings.Join(args, " "), err, tail(stderr, 12))
 		}
 	}
@@ -345,7 +331,7 @@ func TestHfUploadCommand(t *testing.T) {
 		t.Fatalf("after hf upload: %s", paths(got))
 	}
 
-	one := filepath.Join(writeFiles(t, map[string]string{"notes.md": "# notes\n"}), "notes.md")
+	one := filepath.Join(regtest.WriteTree(t, map[string]string{"notes.md": "# notes\n"}), "notes.md")
 	hf("upload", "team/cli-model", one, "docs/notes.md")
 	second, got := revisionFiles(t, in, "team/cli-model", "main")
 	if second == first || got["docs/notes.md"] != "# notes\n" || len(got) != 4 {
@@ -353,7 +339,7 @@ func TestHfUploadCommand(t *testing.T) {
 	}
 
 	// A branch that does not exist yet, on a repository that already has revisions.
-	hf("upload", "team/cli-model", writeFiles(t, map[string]string{"experiment.txt": "x"}), "--revision", "experiment")
+	hf("upload", "team/cli-model", regtest.WriteTree(t, map[string]string{"experiment.txt": "x"}), "--revision", "experiment")
 	_, got = revisionFiles(t, in, "team/cli-model", "experiment")
 	if got["experiment.txt"] != "x" || got["config.json"] != `{"v": 1}` {
 		t.Fatalf("new branch should start from main and add the file: %s", paths(got))

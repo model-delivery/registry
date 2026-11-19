@@ -14,11 +14,8 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,38 +29,12 @@ import (
 	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/client"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
-type instance struct {
-	reg   *registry.Registry
-	srv   *httptest.Server
-	write string
-}
-
-func start(t *testing.T, cfg server.Config) *instance {
-	t.Helper()
-	return startWith(t, cfg, nil)
-}
-
-// startWith is start with a chosen storage backend; nil means local files.
-func startWith(t *testing.T, cfg server.Config, store blob.Store) *instance {
-	t.Helper()
-	reg, err := registry.Open(t.TempDir(), store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	write, err := reg.CreateToken(context.Background(), "writer", registry.RoleWrite)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(server.New(reg, cfg))
-	t.Cleanup(func() {
-		srv.Close()
-		_ = reg.Close()
-	})
-	return &instance{reg: reg, srv: srv, write: write}
-}
+// The registry each test runs against comes from internal/regtest, which
+// the server's own tests use too.
 
 func python(t *testing.T) string {
 	t.Helper()
@@ -183,19 +154,9 @@ func reachable() string {
 	return hosts
 }
 
-func fileSHA256(t *testing.T, p string) string {
-	t.Helper()
-	b, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
 // checkSnapshot compares what huggingface_hub wrote to disk with what the
 // registry says the revision contains.
-func checkSnapshot(t *testing.T, in *instance, repo, wantSHA string, res pyResult) {
+func checkSnapshot(t *testing.T, in *regtest.Instance, repo, wantSHA string, res pyResult) {
 	t.Helper()
 	if res.SHA != wantSHA {
 		t.Errorf("huggingface_hub saw revision %s, want %s", res.SHA, wantSHA)
@@ -204,11 +165,11 @@ func checkSnapshot(t *testing.T, in *instance, repo, wantSHA string, res pyResul
 	if filepath.Base(res.Snapshot) != wantSHA {
 		t.Errorf("snapshot folder is %s, want it named after revision %s", res.Snapshot, wantSHA)
 	}
-	c, err := in.reg.Resolve(context.Background(), repo, wantSHA)
+	c, err := in.Reg.Resolve(context.Background(), repo, wantSHA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := in.reg.Files(context.Background(), c)
+	files, err := in.Reg.Files(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +180,7 @@ func checkSnapshot(t *testing.T, in *instance, repo, wantSHA string, res pyResul
 		t.Errorf("client lists %d files, registry has %d", len(res.Siblings), len(files))
 	}
 	for _, f := range files {
-		got := fileSHA256(t, filepath.Join(res.Snapshot, filepath.FromSlash(f.Path)))
+		got := regtest.FileSHA256(t, filepath.Join(res.Snapshot, filepath.FromSlash(f.Path)))
 		if got != f.SHA256 {
 			t.Errorf("%s: downloaded sha256 %s, registry has %s", f.Path, got, f.SHA256)
 		}
@@ -253,27 +214,27 @@ func TestHubClientAgainstMirror(t *testing.T) {
 		}
 	}
 
-	hub := start(t, server.Config{AnonymousRead: true})
-	pushed, err := client.New(hub.srv.URL, hub.write).Push(ctx, dir, "acme/tiny", client.PushOptions{Branch: "main", Tags: []string{"v1.0"}})
+	hub := regtest.Start(t, server.Config{AnonymousRead: true})
+	pushed, err := client.New(hub.URL, hub.Write).Push(ctx, dir, "acme/tiny", client.PushOptions{Branch: "main", Tags: []string{"v1.0"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.srv.URL})
-	done, err := client.New(local.srv.URL, local.write).Mirror(ctx, "acme/tiny", "main", "", nil)
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.URL})
+	done, err := client.New(local.URL, local.Write).Mirror(ctx, "acme/tiny", "main", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if done.SHA != pushed.SHA {
 		t.Fatalf("mirror recorded revision %s, upstream is %s", done.SHA, pushed.SHA)
 	}
-	hub.srv.Close() // the upstream is gone
+	hub.StopServing() // the upstream is gone
 
 	t.Run("branch", func(t *testing.T) {
-		checkSnapshot(t, local, "acme/tiny", pushed.SHA, hfDownload(t, local.srv.URL, "acme/tiny", "main", "config.json"))
+		checkSnapshot(t, local, "acme/tiny", pushed.SHA, hfDownload(t, local.URL, "acme/tiny", "main", "config.json"))
 	})
 	t.Run("pinned revision id", func(t *testing.T) {
-		checkSnapshot(t, local, "acme/tiny", pushed.SHA, hfDownload(t, local.srv.URL, "acme/tiny", pushed.SHA, "tokenizer/vocab.txt"))
+		checkSnapshot(t, local, "acme/tiny", pushed.SHA, hfDownload(t, local.URL, "acme/tiny", pushed.SHA, "tokenizer/vocab.txt"))
 	})
 }
 
@@ -288,12 +249,12 @@ func TestHubClientAgainstPush(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	in := start(t, server.Config{AnonymousRead: true})
-	pushed, err := client.New(in.srv.URL, in.write).Push(ctx, dir, "team/own-model", client.PushOptions{Branch: "main", Tags: []string{"v1.0"}})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
+	pushed, err := client.New(in.URL, in.Write).Push(ctx, dir, "team/own-model", client.PushOptions{Branch: "main", Tags: []string{"v1.0"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := hfDownload(t, in.srv.URL, "team/own-model", "v1.0", "config.json")
+	res := hfDownload(t, in.URL, "team/own-model", "v1.0", "config.json")
 	checkSnapshot(t, in, "team/own-model", pushed.SHA, res)
 	if res.Branches["main"] != pushed.SHA || res.Tags["v1.0"] != pushed.SHA {
 		t.Errorf("list_repo_refs: branches %v tags %v, want main and v1.0 at %s", res.Branches, res.Tags, pushed.SHA)
@@ -321,22 +282,22 @@ func TestHubClientPullThrough(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	hub := start(t, server.Config{AnonymousRead: true})
-	pushed, err := client.New(hub.srv.URL, hub.write).Push(ctx, dir, "acme/on-demand", client.PushOptions{Branch: "main"})
+	hub := regtest.Start(t, server.Config{AnonymousRead: true})
+	pushed, err := client.New(hub.URL, hub.Write).Push(ctx, dir, "acme/on-demand", client.PushOptions{Branch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.srv.URL, PullThrough: true})
-	if _, err := local.reg.GetRepo(ctx, "acme/on-demand"); err == nil {
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.URL, PullThrough: true})
+	if _, err := local.Reg.GetRepo(ctx, "acme/on-demand"); err == nil {
 		t.Fatal("the registry already has the repository before anyone asked")
 	}
-	res := hfDownload(t, local.srv.URL, "acme/on-demand", "main", "sub/vocab.txt")
+	res := hfDownload(t, local.URL, "acme/on-demand", "main", "sub/vocab.txt")
 	checkSnapshot(t, local, "acme/on-demand", pushed.SHA, res)
 
 	// With the upstream gone, a second client still downloads everything.
-	hub.srv.Close()
-	checkSnapshot(t, local, "acme/on-demand", pushed.SHA, hfDownload(t, local.srv.URL, "acme/on-demand", pushed.SHA, "config.json"))
+	hub.StopServing()
+	checkSnapshot(t, local, "acme/on-demand", pushed.SHA, hfDownload(t, local.URL, "acme/on-demand", pushed.SHA, "config.json"))
 }
 
 // s3Stores returns the S3 backends to test against: always the in-memory
@@ -390,16 +351,16 @@ func TestHubClientAgainstS3(t *testing.T) {
 			t.Run(name+"/"+backend, func(t *testing.T) {
 				// Reads need a token, so the redirected case also shows the
 				// client fetching from the bucket with only the signed URL.
-				in := startWith(t, server.Config{AnonymousRead: false, RedirectDownloads: redirect}, store)
-				pushed, err := client.New(in.srv.URL, in.write).Push(ctx, dir, "team/in-bucket", client.PushOptions{Branch: "main"})
+				in := regtest.StartWith(t, server.Config{AnonymousRead: false, RedirectDownloads: redirect}, store)
+				pushed, err := client.New(in.URL, in.Write).Push(ctx, dir, "team/in-bucket", client.PushOptions{Branch: "main"})
 				if err != nil {
 					t.Fatal(err)
 				}
-				read, err := in.reg.CreateToken(ctx, "reader", registry.RoleRead)
+				read, err := in.Reg.CreateToken(ctx, "reader", registry.RoleRead)
 				if err != nil {
 					t.Fatal(err)
 				}
-				res, stderr, err := runDownload(t, in.srv.URL, read, "team/in-bucket", "main", "sub/vocab.txt")
+				res, stderr, err := runDownload(t, in.URL, read, "team/in-bucket", "main", "sub/vocab.txt")
 				if err != nil {
 					t.Fatalf("download failed: %v\n%s", err, stderr)
 				}
@@ -418,24 +379,24 @@ func TestHubClientWithToken(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	in := start(t, server.Config{AnonymousRead: false})
-	pushed, err := client.New(in.srv.URL, in.write).Push(ctx, dir, "team/private", client.PushOptions{Branch: "main"})
+	in := regtest.Start(t, server.Config{AnonymousRead: false})
+	pushed, err := client.New(in.URL, in.Write).Push(ctx, dir, "team/private", client.PushOptions{Branch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := in.reg.CreateToken(ctx, "reader", registry.RoleRead)
+	read, err := in.Reg.CreateToken(ctx, "reader", registry.RoleRead)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	res, stderr, err := runDownload(t, in.srv.URL, read, "team/private", "main", "config.json")
+	res, stderr, err := runDownload(t, in.URL, read, "team/private", "main", "config.json")
 	if err != nil {
 		t.Fatalf("download with a read token failed: %v\n%s", err, stderr)
 	}
 	checkSnapshot(t, in, "team/private", pushed.SHA, res)
 
 	for name, token := range map[string]string{"no token": "", "wrong token": "md_0000000000000000000000000000000000000000"} {
-		if _, _, err := runDownload(t, in.srv.URL, token, "team/private", "main", "config.json"); err == nil {
+		if _, _, err := runDownload(t, in.URL, token, "team/private", "main", "config.json"); err == nil {
 			t.Errorf("%s: download from a private registry succeeded", name)
 		}
 	}
@@ -469,8 +430,8 @@ func TestMirrorFromHuggingFace(t *testing.T) {
 		t.Fatalf("could not read upstream revision: %v", err)
 	}
 
-	local := start(t, server.Config{AnonymousRead: true})
-	done, err := client.New(local.srv.URL, local.write).Mirror(ctx, repo, "main", os.Getenv("HF_TOKEN"), func(e client.MirrorEvent) {
+	local := regtest.Start(t, server.Config{AnonymousRead: true})
+	done, err := client.New(local.URL, local.Write).Mirror(ctx, repo, "main", os.Getenv("HF_TOKEN"), func(e client.MirrorEvent) {
 		if e.Event == "file" {
 			t.Logf("%-10s %9d  %s", e.Status, e.Size, e.Path)
 		}
@@ -483,16 +444,16 @@ func TestMirrorFromHuggingFace(t *testing.T) {
 	}
 	t.Logf("mirrored %s@%s: %d files, %d bytes", done.Repo, done.SHA, done.Files, done.Bytes)
 
-	files, err := local.reg.Files(ctx, mustResolve(t, local, done.Repo, done.SHA))
+	files, err := local.Reg.Files(ctx, mustResolve(t, local, done.Repo, done.SHA))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no files recorded: %v", err)
 	}
-	checkSnapshot(t, local, done.Repo, upstream.SHA, hfDownload(t, local.srv.URL, done.Repo, "main", files[0].Path))
+	checkSnapshot(t, local, done.Repo, upstream.SHA, hfDownload(t, local.URL, done.Repo, "main", files[0].Path))
 }
 
-func mustResolve(t *testing.T, in *instance, repo, rev string) registry.Commit {
+func mustResolve(t *testing.T, in *regtest.Instance, repo, rev string) registry.Commit {
 	t.Helper()
-	c, err := in.reg.Resolve(context.Background(), repo, rev)
+	c, err := in.Reg.Resolve(context.Background(), repo, rev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +473,7 @@ func TestPullThroughOneFileFromHuggingFace(t *testing.T) {
 	if repo == "" {
 		repo = "hf-internal-testing/tiny-random-bert"
 	}
-	local := start(t, server.Config{AnonymousRead: true, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, PullThrough: true})
 
 	const script = `
 import json, sys
@@ -521,7 +482,7 @@ path = hf_hub_download(sys.argv[1], "config.json")
 info = HfApi().model_info(sys.argv[1])
 print(json.dumps({"path": path, "sha": info.sha, "files": len(info.siblings)}))
 `
-	stdout, stderr, err := runPython(t, local.srv.URL, "", script, nil, repo)
+	stdout, stderr, err := runPython(t, local.URL, "", script, nil, repo)
 	if err != nil {
 		t.Fatalf("download through a pull-through registry failed: %v\n%s", err, stderr)
 	}
@@ -536,7 +497,7 @@ print(json.dumps({"path": path, "sha": info.sha, "files": len(info.siblings)}))
 	if c.SHA != res.SHA {
 		t.Fatalf("client saw revision %s, registry recorded %s", res.SHA, c.SHA)
 	}
-	files, err := local.reg.Files(ctx, c)
+	files, err := local.Reg.Files(ctx, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,9 +513,9 @@ print(json.dumps({"path": path, "sha": info.sha, "files": len(info.siblings)}))
 	if stored != 1 || len(files) != res.Files || len(files) < 2 {
 		t.Fatalf("%d of %d files fetched; the client saw %d listed", stored, len(files), res.Files)
 	}
-	st, _ := local.reg.Stats(ctx)
+	st, _ := local.Reg.Stats(ctx)
 	t.Logf("%s@%s: %d files listed, 1 fetched, %d bytes stored", repo, c.SHA, len(files), st.StoredBytes)
-	if got := fileSHA256(t, res.Path); got != files[indexOf(files, "config.json")].SHA256 {
+	if got := regtest.FileSHA256(t, res.Path); got != files[indexOf(files, "config.json")].SHA256 {
 		t.Errorf("downloaded config.json hashes to %s", got)
 	}
 }

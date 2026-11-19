@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
 // countingHub is an upstream hub that counts what it is asked for.
 type countingHub struct {
-	inst     *instance // the registry playing the upstream
+	inst     *regtest.Instance // the registry playing the upstream
 	url      string
 	pushed   client.PushResult
 	lookups  atomic.Int64  // revision lookups: one per fetch started
@@ -69,16 +70,16 @@ func TestPullThroughStartsFromAnyEntryPoint(t *testing.T) {
 	for name, path := range entry {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+			local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 			method := http.MethodGet
 			if name == "file metadata" {
 				method = http.MethodHead
 			}
-			resp := do(t, method, local.url+path, "", nil, nil)
+			resp := do(t, method, local.URL+path, "", nil, nil)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 			}
-			if _, err := local.reg.Resolve(context.Background(), "acme/tiny", hub.pushed.SHA); err != nil {
+			if _, err := local.Reg.Resolve(context.Background(), "acme/tiny", hub.pushed.SHA); err != nil {
 				t.Fatalf("revision was not stored: %v", err)
 			}
 		})
@@ -89,12 +90,12 @@ func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	hub.hold = make(chan struct{})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	// A client with a short timeout, as download libraries have.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", nil)
 	if resp, err := http.DefaultClient.Do(req); err == nil {
 		_ = resp.Body.Close()
 		t.Fatalf("request finished with %d before the upstream released any file", resp.StatusCode)
@@ -104,8 +105,8 @@ func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 	close(hub.hold)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if c, err := local.reg.Resolve(context.Background(), "acme/tiny", "main"); err == nil {
-			if f, err := local.reg.File(context.Background(), c, "config.json"); err == nil && !f.Pending {
+		if c, err := local.Reg.Resolve(context.Background(), "acme/tiny", "main"); err == nil {
+			if f, err := local.Reg.File(context.Background(), c, "config.json"); err == nil && !f.Pending {
 				break
 			}
 		}
@@ -116,7 +117,7 @@ func TestPullThroughSurvivesTheClientLeaving(t *testing.T) {
 	}
 	// The retry is answered at once, from the registry.
 	lookups, downloads := hub.lookups.Load(), hub.files.Load()
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 	if resp.StatusCode != http.StatusOK || hub.lookups.Load() != lookups || hub.files.Load() != downloads {
 		t.Fatalf("retry: status %d, upstream lookups %d -> %d, files %d -> %d",
 			resp.StatusCode, lookups, hub.lookups.Load(), downloads, hub.files.Load())
@@ -140,9 +141,9 @@ func TestPullThroughIsOffByDefaultAndHonoursTheAllowList(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.cfg.AnonymousRead, tc.cfg.Upstream = true, hub.url
-			local := start(t, tc.cfg)
+			local := regtest.Start(t, tc.cfg)
 			before := hub.lookups.Load()
-			resp := do(t, http.MethodHead, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+			resp := do(t, http.MethodHead, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 			if resp.StatusCode != tc.want {
 				t.Fatalf("status %d, want %d", resp.StatusCode, tc.want)
 			}
@@ -155,7 +156,7 @@ func TestPullThroughIsOffByDefaultAndHonoursTheAllowList(t *testing.T) {
 					t.Error("the upstream was contacted for a repository pull-through does not cover")
 				}
 			}
-			_, err := local.reg.GetRepo(context.Background(), "acme/tiny")
+			_, err := local.Reg.GetRepo(context.Background(), "acme/tiny")
 			if (err == nil) != tc.pulled {
 				t.Fatalf("repository stored = %v, want %v", err == nil, tc.pulled)
 			}
@@ -166,10 +167,10 @@ func TestPullThroughIsOffByDefaultAndHonoursTheAllowList(t *testing.T) {
 func TestPullThroughNeedsReadAccess(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: false, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: false, Upstream: hub.url, PullThrough: true})
 
 	for name, token := range map[string]string{"no token": "", "unknown token": "md_unknown_token_000000000000"} {
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", token, nil, nil)
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", token, nil, nil)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s: status %d", name, resp.StatusCode)
 		}
@@ -178,7 +179,7 @@ func TestPullThroughNeedsReadAccess(t *testing.T) {
 		t.Fatal("a caller without read access made the registry contact the upstream")
 	}
 	// A read token is enough: fetching is part of reading.
-	resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", local.read, nil, nil)
+	resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", local.Read, nil, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("read token: status %d", resp.StatusCode)
 	}
@@ -187,7 +188,7 @@ func TestPullThroughNeedsReadAccess(t *testing.T) {
 func TestPullThroughWhenUpstreamDoesNotHaveIt(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
 
 	tests := []struct {
 		path, code string
@@ -198,7 +199,7 @@ func TestPullThroughWhenUpstreamDoesNotHaveIt(t *testing.T) {
 	for _, tc := range tests {
 		before := hub.lookups.Load()
 		for range 3 {
-			resp := do(t, http.MethodHead, local.url+tc.path, "", nil, nil)
+			resp := do(t, http.MethodHead, local.URL+tc.path, "", nil, nil)
 			if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != tc.code {
 				t.Fatalf("%s: status %d code %q", tc.path, resp.StatusCode, resp.Header.Get("X-Error-Code"))
 			}
@@ -211,11 +212,11 @@ func TestPullThroughWhenUpstreamDoesNotHaveIt(t *testing.T) {
 
 	// A file that is not in a revision the registry does hold is a plain
 	// 404; it is not a reason to contact the upstream.
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 	before := hub.lookups.Load()
-	resp := do(t, http.MethodHead, local.url+"/acme/tiny/resolve/main/absent.bin", "", nil, nil)
+	resp := do(t, http.MethodHead, local.URL+"/acme/tiny/resolve/main/absent.bin", "", nil, nil)
 	if resp.StatusCode != http.StatusNotFound || resp.Header.Get("X-Error-Code") != "EntryNotFound" || hub.lookups.Load() != before {
 		t.Fatalf("missing file: status %d code %q, upstream lookups %d -> %d",
 			resp.StatusCode, resp.Header.Get("X-Error-Code"), before, hub.lookups.Load())
@@ -227,15 +228,15 @@ func TestPullThroughFromAPrivateUpstream(t *testing.T) {
 	hub := newCountingHub(t, server.Config{AnonymousRead: false})
 
 	t.Run("without an upstream token the cause is reported", func(t *testing.T) {
-		local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+		local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(body(t, resp), "private or gated") {
 			t.Fatalf("status %d", resp.StatusCode)
 		}
 	})
 	t.Run("with the operator's upstream token it works", func(t *testing.T) {
-		local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, UpstreamToken: hub.inst.read, PullThrough: true})
-		resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+		local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, UpstreamToken: hub.inst.Read, PullThrough: true})
+		resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 		}

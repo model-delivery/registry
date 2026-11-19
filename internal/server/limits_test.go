@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -43,7 +45,7 @@ func TestFormBodiesAreBounded(t *testing.T) {
 	for _, key := range []string{"TMP", "TEMP", "TMPDIR"} {
 		t.Setenv(key, tmp)
 	}
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 
 	// post streams a multipart body with one 48 MiB file part, which is more
@@ -77,7 +79,7 @@ func TestFormBodiesAreBounded(t *testing.T) {
 				}
 			}
 		}()
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, in.url+path, pr)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, in.URL+path, pr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,19 +112,19 @@ func TestFormBodiesAreBounded(t *testing.T) {
 		}
 	})
 	t.Run("delete, as an admin", func(t *testing.T) {
-		status, spooled := post("/ui/repo/acme/tiny/delete", "confirm", map[string]string{"Cookie": "md_token=" + in.admin})
+		status, spooled := post("/ui/repo/acme/tiny/delete", "confirm", map[string]string{"Cookie": "md_token=" + in.Admin})
 		if spooled > 1<<20 {
 			t.Fatalf("%d bytes of a request body were written to the temporary directory", spooled)
 		}
 		if status != 0 && status != http.StatusSeeOther {
 			t.Fatalf("status %d, want 303", status)
 		}
-		if _, err := in.reg.GetRepo(context.Background(), "acme/tiny"); err != nil {
+		if _, err := in.Reg.GetRepo(context.Background(), "acme/tiny"); err != nil {
 			t.Fatalf("the repository was deleted by a form that could not be read: %v", err)
 		}
 	})
 	// An ordinary form still works.
-	resp := do(t, http.MethodPost, in.url+"/ui/login", "", strings.NewReader("token="+in.admin),
+	resp := do(t, http.MethodPost, in.URL+"/ui/login", "", strings.NewReader("token="+in.Admin),
 		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("ordinary sign-in: status %d", resp.StatusCode)
@@ -136,10 +138,10 @@ type chunked struct{ io.Reader }
 func TestUploadSizeLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true, MaxBlobBytes: 1000})
+	in := regtest.Start(t, server.Config{AnonymousRead: true, MaxBlobBytes: 1000})
 	small, large := strings.Repeat("s", 1000), strings.Repeat("L", 1001)
 	stored := func(c string) bool {
-		_, ok, _ := in.reg.StatBlob(ctx, sha(c))
+		_, ok, _ := in.Reg.StatBlob(ctx, kit.SHA256Hex(c))
 		return ok
 	}
 	refused := func(t *testing.T, resp *http.Response) {
@@ -154,22 +156,22 @@ func TestUploadSizeLimit(t *testing.T) {
 	}
 
 	t.Run("registry API, declared length", func(t *testing.T) {
-		refused(t, do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(large), in.write, strings.NewReader(large), nil))
+		refused(t, do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+kit.SHA256Hex(large), in.Write, strings.NewReader(large), nil))
 	})
 	t.Run("registry API, no declared length", func(t *testing.T) {
-		refused(t, do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(large), in.write, chunked{strings.NewReader(large)}, nil))
+		refused(t, do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+kit.SHA256Hex(large), in.Write, chunked{strings.NewReader(large)}, nil))
 	})
 	t.Run("a file at the limit is accepted either way", func(t *testing.T) {
-		resp := do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(small), in.write, chunked{strings.NewReader(small)}, nil)
+		resp := do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+kit.SHA256Hex(small), in.Write, chunked{strings.NewReader(small)}, nil)
 		if resp.StatusCode != http.StatusCreated || !stored(small) {
 			t.Fatalf("status %d, stored %v", resp.StatusCode, stored(small))
 		}
 	})
 	t.Run("large-file batch refuses per object", func(t *testing.T) {
 		other := strings.Repeat("o", 500)
-		resp := do(t, http.MethodPost, in.url+"/acme/up.git/info/lfs/objects/batch", in.write, jsonBody(t, map[string]any{
+		resp := do(t, http.MethodPost, in.URL+"/acme/up.git/info/lfs/objects/batch", in.Write, jsonBody(t, map[string]any{
 			"operation": "upload",
-			"objects":   []map[string]any{{"oid": sha(large), "size": len(large)}, {"oid": sha(other), "size": len(other)}},
+			"objects":   []map[string]any{{"oid": kit.SHA256Hex(large), "size": len(large)}, {"oid": kit.SHA256Hex(other), "size": len(other)}},
 		}), nil)
 		var out struct {
 			Objects []struct {
@@ -195,7 +197,7 @@ func TestUploadSizeLimit(t *testing.T) {
 		}
 	})
 	t.Run("a file sent inside a commit", func(t *testing.T) {
-		status, out := commitTo(t, in, "acme/up", "main", in.write, header("m", ""), inlineFile("big.txt", large))
+		status, out := commitTo(t, in, "acme/up", "main", in.Write, header("m", ""), inlineFile("big.txt", large))
 		if status != http.StatusRequestEntityTooLarge || !strings.Contains(out, "REGISTRY_MAX_BLOB_BYTES") || stored(large) {
 			t.Fatalf("status %d: %s", status, out)
 		}
@@ -205,22 +207,22 @@ func TestUploadSizeLimit(t *testing.T) {
 func TestCommitBodyHasATotalLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true, MaxCommitBytes: 1 << 20})
-	if status, out := commitTo(t, in, "acme/up", "main", in.write, header("first", ""), inlineFile("a.txt", "a")); status != http.StatusOK {
+	in := regtest.Start(t, server.Config{AnonymousRead: true, MaxCommitBytes: 1 << 20})
+	if status, out := commitTo(t, in, "acme/up", "main", in.Write, header("first", ""), inlineFile("a.txt", "a")); status != http.StatusOK {
 		t.Fatalf("a small commit: %d %s", status, out)
 	}
-	before, _ := in.reg.Resolve(ctx, "acme/up", "main")
+	before, _ := in.Reg.Resolve(ctx, "acme/up", "main")
 
 	// Every line is far below the per-file limit; together they are too much.
 	lines := []map[string]any{header("many", "")}
 	for i := range 8 {
 		lines = append(lines, inlineFile(fmt.Sprintf("part-%d.bin", i), strings.Repeat("x", 200<<10)))
 	}
-	status, out := commitTo(t, in, "acme/up", "main", in.write, lines...)
+	status, out := commitTo(t, in, "acme/up", "main", in.Write, lines...)
 	if status != http.StatusRequestEntityTooLarge || !strings.Contains(out, "in total") {
 		t.Fatalf("status %d: %s", status, out)
 	}
-	if after, _ := in.reg.Resolve(ctx, "acme/up", "main"); after.SHA != before.SHA {
+	if after, _ := in.Reg.Resolve(ctx, "acme/up", "main"); after.SHA != before.SHA {
 		t.Fatal("a refused commit moved the branch")
 	}
 }
@@ -229,20 +231,20 @@ func TestCommitBodyHasATotalLimit(t *testing.T) {
 // hold a connection for ever.
 func TestSmallBodiesHaveADeadline(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true, BodyTimeout: 200 * time.Millisecond})
+	in := regtest.Start(t, server.Config{AnonymousRead: true, BodyTimeout: 200 * time.Millisecond})
 	tests := []struct {
 		name, path, token, contentType, sent string
 		want                                 int
 		say                                  string
 	}{
-		{"hugging face JSON route", "/api/repos/create", in.write, "application/json", `{"name":`, http.StatusBadRequest, "did not arrive"},
-		{"registry API JSON route", "/api/v1/tokens", in.admin, "application/json", `{"name":`, http.StatusBadRequest, "did not arrive"},
+		{"hugging face JSON route", "/api/repos/create", in.Write, "application/json", `{"name":`, http.StatusBadRequest, "did not arrive"},
+		{"registry API JSON route", "/api/v1/tokens", in.Admin, "application/json", `{"name":`, http.StatusBadRequest, "did not arrive"},
 		{"sign-in form, no token", "/ui/login", "", "application/x-www-form-urlencoded", "token=md_", http.StatusUnauthorized, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, err := net.Dial("tcp", strings.TrimPrefix(in.url, "http://"))
+			conn, err := net.Dial("tcp", strings.TrimPrefix(in.URL, "http://"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -277,11 +279,11 @@ func TestSmallBodiesHaveADeadline(t *testing.T) {
 // server would otherwise wait for the announced body before answering.
 func TestAnnouncedBodiesHaveADeadlineOnEveryRoute(t *testing.T) {
 	t.Parallel()
-	open := start(t, server.Config{AnonymousRead: true, BodyTimeout: 200 * time.Millisecond})
-	private := start(t, server.Config{AnonymousRead: false, BodyTimeout: 200 * time.Millisecond})
+	open := regtest.Start(t, server.Config{AnonymousRead: true, BodyTimeout: 200 * time.Millisecond})
+	private := regtest.Start(t, server.Config{AnonymousRead: false, BodyTimeout: 200 * time.Millisecond})
 	tests := []struct {
 		name   string
-		in     *instance
+		in     *regtest.Instance
 		method string
 		path   string
 		header string
@@ -298,7 +300,7 @@ func TestAnnouncedBodiesHaveADeadlineOnEveryRoute(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, err := net.Dial("tcp", strings.TrimPrefix(tc.in.url, "http://"))
+			conn, err := net.Dial("tcp", strings.TrimPrefix(tc.in.URL, "http://"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -352,17 +354,17 @@ func (s *slowly) Read(p []byte) (int, error) {
 func TestFileTransfersHaveNoBodyDeadline(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	in := start(t, server.Config{AnonymousRead: true, BodyTimeout: 100 * time.Millisecond})
+	in := regtest.Start(t, server.Config{AnonymousRead: true, BodyTimeout: 100 * time.Millisecond})
 	const pause = 600 * time.Millisecond
 	stored := func(c string) bool {
-		_, ok, _ := in.reg.StatBlob(ctx, sha(c))
+		_, ok, _ := in.Reg.StatBlob(ctx, kit.SHA256Hex(c))
 		return ok
 	}
 
 	t.Run("an upload through the registry API", func(t *testing.T) {
 		t.Parallel()
 		content := strings.Repeat("slow push ", 1000)
-		resp := do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(content), in.write, &slowly{content: content, pause: pause}, nil)
+		resp := do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+kit.SHA256Hex(content), in.Write, &slowly{content: content, pause: pause}, nil)
 		if resp.StatusCode != http.StatusCreated || !stored(content) {
 			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
 		}
@@ -370,7 +372,7 @@ func TestFileTransfersHaveNoBodyDeadline(t *testing.T) {
 	t.Run("a large-file upload from a Hugging Face client", func(t *testing.T) {
 		t.Parallel()
 		content := strings.Repeat("slow large file ", 1000)
-		href := batch(t, in, "acme/slow", content)[sha(content)]
+		href := batch(t, in, "acme/slow", content)[kit.SHA256Hex(content)]
 		resp := do(t, http.MethodPut, href, "", &slowly{content: content, pause: pause}, nil)
 		if resp.StatusCode != http.StatusOK || !stored(content) {
 			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
@@ -381,7 +383,7 @@ func TestFileTransfersHaveNoBodyDeadline(t *testing.T) {
 		lines := commitBody(t, header("slow", ""), inlineFile("a.txt", strings.Repeat("a", 5000)), inlineFile("b.txt", strings.Repeat("b", 5000)))
 		raw, _ := io.ReadAll(lines)
 		for _, branch := range []string{"main", "refs%2Fpr%2F1"} {
-			resp := do(t, http.MethodPost, in.url+"/api/models/acme/slow-commit/commit/"+branch, in.write,
+			resp := do(t, http.MethodPost, in.URL+"/api/models/acme/slow-commit/commit/"+branch, in.Write,
 				&slowly{content: string(raw), pause: pause}, map[string]string{"Content-Type": "application/x-ndjson"})
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("%s: status %d (%s)", branch, resp.StatusCode, body(t, resp))
@@ -396,12 +398,12 @@ func TestBodyDeadlineDoesNotCutALongResponse(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	hub.hold = make(chan struct{})
-	local := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, BodyTimeout: 100 * time.Millisecond})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, BodyTimeout: 100 * time.Millisecond})
 	go func() {
 		time.Sleep(600 * time.Millisecond) // several deadlines long
 		close(hub.hold)
 	}()
-	done, err := client.New(local.url, local.write).Mirror(context.Background(), "acme/tiny", "main", "", nil)
+	done, err := client.New(local.URL, local.Write).Mirror(context.Background(), "acme/tiny", "main", "", nil)
 	if err != nil || done.SHA != hub.pushed.SHA {
 		t.Fatalf("mirror = %+v, %v", done, err)
 	}
@@ -410,17 +412,17 @@ func TestBodyDeadlineDoesNotCutALongResponse(t *testing.T) {
 // The listing's totals: each distinct file counted once per repository.
 func TestRepositoryListingTotals(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	shared := strings.Repeat("shared", 100)
 	push(t, in, "acme/one", map[string]string{"a.bin": shared, "b.bin": "only-one"}, client.PushOptions{})
 	// A second revision that keeps one file and replaces the other.
 	push(t, in, "acme/one", map[string]string{"a.bin": shared, "b.bin": "changed"}, client.PushOptions{})
 	push(t, in, "acme/two", map[string]string{"copy.bin": shared}, client.PushOptions{})
-	if resp := do(t, http.MethodPost, in.url+"/api/repos/create", in.write, jsonBody(t, map[string]any{"name": "empty", "organization": "acme"}), nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodPost, in.URL+"/api/repos/create", in.Write, jsonBody(t, map[string]any{"name": "empty", "organization": "acme"}), nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
 
-	resp := do(t, http.MethodGet, in.url+"/api/v1/repos", "", nil, nil)
+	resp := do(t, http.MethodGet, in.URL+"/api/v1/repos", "", nil, nil)
 	var raw struct {
 		Repos []map[string]json.RawMessage `json:"repos"`
 	}

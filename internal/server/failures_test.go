@@ -17,7 +17,9 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -61,9 +63,9 @@ func signedInForm(token string) map[string]string {
 }
 
 // mirrorLines posts a mirror request and returns the lines of its answer.
-func mirrorLines(t *testing.T, in *instance, repo string) (status int, lines []map[string]any) {
+func mirrorLines(t *testing.T, in *regtest.Instance, repo string) (status int, lines []map[string]any) {
 	t.Helper()
-	resp := do(t, http.MethodPost, in.url+"/api/v1/mirror", in.write, jsonBody(t, map[string]any{"repo": repo}), nil)
+	resp := do(t, http.MethodPost, in.URL+"/api/v1/mirror", in.Write, jsonBody(t, map[string]any{"repo": repo}), nil)
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		var line map[string]any
@@ -83,14 +85,14 @@ func TestLocalFailuresAreNotReportedAsUpstreamFailures(t *testing.T) {
 	t.Parallel()
 	hub := newCountingHub(t, server.Config{AnonymousRead: true})
 	disk := &fullDisk{Store: newFS(t)}
-	logs := &syncBuffer{}
-	local := startWith(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true,
+	logs := &regtest.LogBuffer{}
+	local := regtest.StartWith(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true,
 		Logger: slog.New(slog.NewTextHandler(logs, nil))}, disk)
 	const file = "/acme/tiny/resolve/main/model.safetensors"
 
 	t.Run("pull-through of a file", func(t *testing.T) {
 		disk.full.Store(true)
-		resp := do(t, http.MethodGet, local.url+file, "", nil, nil)
+		resp := do(t, http.MethodGet, local.URL+file, "", nil, nil)
 		shown := body(t, resp) + resp.Header.Get("X-Error-Message")
 		if resp.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("status %d, want 500: %s", resp.StatusCode, shown)
@@ -105,7 +107,7 @@ func TestLocalFailuresAreNotReportedAsUpstreamFailures(t *testing.T) {
 		}
 		// Nothing was recorded, so the file is fetched once the disk has room.
 		disk.full.Store(false)
-		resp = do(t, http.MethodGet, local.url+file, "", nil, nil)
+		resp = do(t, http.MethodGet, local.URL+file, "", nil, nil)
 		if resp.StatusCode != http.StatusOK || body(t, resp) != modelFiles["model.safetensors"] {
 			t.Fatalf("after the disk had room again: status %d", resp.StatusCode)
 		}
@@ -114,8 +116,8 @@ func TestLocalFailuresAreNotReportedAsUpstreamFailures(t *testing.T) {
 	t.Run("an upstream failure is still a gateway error with its reason", func(t *testing.T) {
 		hub.tampered.Store(true)
 		defer hub.tampered.Store(false)
-		fresh := start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
-		resp := do(t, http.MethodGet, fresh.url+file, "", nil, nil)
+		fresh := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url, PullThrough: true})
+		resp := do(t, http.MethodGet, fresh.URL+file, "", nil, nil)
 		msg := body(t, resp)
 		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(msg, "could not fetch from upstream") || !strings.Contains(msg, "verification failed") {
 			t.Fatalf("status %d: %s", resp.StatusCode, msg)
@@ -128,8 +130,8 @@ func TestLocalFailuresAreNotReportedAsUpstreamFailures(t *testing.T) {
 	t.Run("mirror", func(t *testing.T) {
 		target := &fullDisk{Store: newFS(t)}
 		target.full.Store(true)
-		mirrorLogs := &syncBuffer{}
-		in := startWith(t, server.Config{AnonymousRead: true, Upstream: hub.url,
+		mirrorLogs := &regtest.LogBuffer{}
+		in := regtest.StartWith(t, server.Config{AnonymousRead: true, Upstream: hub.url,
 			Logger: slog.New(slog.NewTextHandler(mirrorLogs, nil))}, target)
 
 		status, lines := mirrorLines(t, in, "acme/tiny")
@@ -152,7 +154,7 @@ func TestLocalFailuresAreNotReportedAsUpstreamFailures(t *testing.T) {
 		if got := mirrorLogs.String(); !strings.Contains(got, serverPath+"/tmp/stage-1") || !strings.Contains(got, "level=ERROR") {
 			t.Errorf("the failure was not logged in full:\n%s", got)
 		}
-		if _, err := in.reg.GetRepo(context.Background(), "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
+		if _, err := in.Reg.GetRepo(context.Background(), "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
 			t.Errorf("a failed mirror recorded something: %v", err)
 		}
 
@@ -179,9 +181,9 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 		Warning *string `json:"warning"`
 		Error   string  `json:"error"`
 	}
-	remove := func(t *testing.T, in *instance) (int, answer, string) {
+	remove := func(t *testing.T, in *regtest.Instance) (int, answer, string) {
 		t.Helper()
-		resp := do(t, http.MethodDelete, in.url+"/api/v1/repos/acme/tiny", in.admin, nil, nil)
+		resp := do(t, http.MethodDelete, in.URL+"/api/v1/repos/acme/tiny", in.Admin, nil, nil)
 		raw := body(t, resp)
 		var out answer
 		if err := json.Unmarshal([]byte(raw), &out); err != nil {
@@ -192,8 +194,8 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 
 	t.Run("registry API", func(t *testing.T) {
 		t.Parallel()
-		logs := &syncBuffer{}
-		in := startWith(t, server.Config{AnonymousRead: true, Logger: slog.New(slog.NewTextHandler(logs, nil))}, stuckFiles{newFS(t)})
+		logs := &regtest.LogBuffer{}
+		in := regtest.StartWith(t, server.Config{AnonymousRead: true, Logger: slog.New(slog.NewTextHandler(logs, nil))}, stuckFiles{newFS(t)})
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 
 		status, out, raw := remove(t, in)
@@ -212,7 +214,7 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 		if got := logs.String(); !strings.Contains(got, "permission denied") || !strings.Contains(got, "level=WARN") {
 			t.Fatalf("the reason was not logged:\n%s", got)
 		}
-		if resp := do(t, http.MethodGet, in.url+"/api/v1/repos/acme/tiny", "", nil, nil); resp.StatusCode != http.StatusNotFound {
+		if resp := do(t, http.MethodGet, in.URL+"/api/v1/repos/acme/tiny", "", nil, nil); resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("the repository is still there: %d", resp.StatusCode)
 		}
 		// Deleting it again is the ordinary "no such repository".
@@ -223,7 +225,7 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 
 	t.Run("no warning when everything was removed", func(t *testing.T) {
 		t.Parallel()
-		in := start(t, server.Config{AnonymousRead: true})
+		in := regtest.Start(t, server.Config{AnonymousRead: true})
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 		status, out, raw := remove(t, in)
 		if status != http.StatusOK || out.Warning != nil || strings.Contains(raw, "warning") {
@@ -236,25 +238,25 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 
 	t.Run("web UI", func(t *testing.T) {
 		t.Parallel()
-		in := startWith(t, server.Config{AnonymousRead: true}, stuckFiles{newFS(t)})
+		in := regtest.StartWith(t, server.Config{AnonymousRead: true}, stuckFiles{newFS(t)})
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
-		resp := do(t, http.MethodPost, in.url+"/ui/repo/acme/tiny/delete", "", strings.NewReader("confirm=acme%2Ftiny"), signedInForm(in.admin))
+		resp := do(t, http.MethodPost, in.URL+"/ui/repo/acme/tiny/delete", "", strings.NewReader("confirm=acme%2Ftiny"), signedInForm(in.Admin))
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/?notice=deleted-partly" {
 			t.Fatalf("status %d to %q", resp.StatusCode, resp.Header.Get("Location"))
 		}
-		page := body(t, do(t, http.MethodGet, in.url+resp.Header.Get("Location"), "", nil, nil))
+		page := body(t, do(t, http.MethodGet, in.URL+resp.Header.Get("Location"), "", nil, nil))
 		if !strings.Contains(page, "The repository was deleted, but") || !strings.Contains(page, "could not be removed") || strings.Contains(page, serverPath) {
 			t.Fatalf("the page after the delete does not say what happened, or says too much:\n%s", page)
 		}
-		if _, err := in.reg.GetRepo(context.Background(), "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
+		if _, err := in.Reg.GetRepo(context.Background(), "acme/tiny"); !errors.Is(err, registry.ErrRepoNotFound) {
 			t.Fatalf("the repository is still there: %v", err)
 		}
 	})
 
 	t.Run("the notice after a clean delete allows for an upload in flight", func(t *testing.T) {
 		t.Parallel()
-		in := start(t, server.Config{AnonymousRead: true})
-		page := body(t, do(t, http.MethodGet, in.url+"/?notice=deleted", "", nil, nil))
+		in := regtest.Start(t, server.Config{AnonymousRead: true})
+		page := body(t, do(t, http.MethodGet, in.URL+"/?notice=deleted", "", nil, nil))
 		if !strings.Contains(page, "The repository was deleted") || !strings.Contains(page, "upload in progress") {
 			t.Fatalf("notice does not mention files spared for an upload:\n%s", page)
 		}
@@ -266,16 +268,16 @@ func TestDeletingARepositoryWhoseFilesCannotBeRemoved(t *testing.T) {
 // huggingface_hub shows the first and picks its exception by the second.
 func TestHuggingFaceErrorsAlwaysCarryTheirMessage(t *testing.T) {
 	t.Parallel()
-	open := start(t, server.Config{AnonymousRead: true})
-	private := start(t, server.Config{AnonymousRead: false})
-	for _, in := range []*instance{open, private} {
+	open := regtest.Start(t, server.Config{AnonymousRead: true})
+	private := regtest.Start(t, server.Config{AnonymousRead: false})
+	for _, in := range []*regtest.Instance{open, private} {
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 	}
 	sha40 := strings.Repeat("0", 40)
 
 	tests := []struct {
 		name   string
-		in     *instance
+		in     *regtest.Instance
 		method string
 		path   string
 		token  string
@@ -295,16 +297,16 @@ func TestHuggingFaceErrorsAlwaysCarryTheirMessage(t *testing.T) {
 		{"anonymous read of a private registry", private, http.MethodGet, "/api/models/acme/tiny", "", "", 401, ""},
 		{"anonymous download from a private registry", private, http.MethodGet, "/acme/tiny/resolve/main/config.json", "", "", 401, ""},
 		{"anonymous upload", open, http.MethodPost, "/api/models/acme/tiny/preupload/main", "", `{}`, 401, ""},
-		{"upload with a read token", open, http.MethodPost, "/api/models/acme/tiny/commit/main", open.read, `{}`, 403, ""},
+		{"upload with a read token", open, http.MethodPost, "/api/models/acme/tiny/commit/main", open.Read, `{}`, 403, ""},
 		{"whoami without a token", open, http.MethodGet, "/api/whoami-v2", "", "", 401, ""},
-		{"repository that exists", open, http.MethodPost, "/api/repos/create", open.write, `{"name":"tiny","organization":"acme"}`, 409, ""},
-		{"repository id that is not one", open, http.MethodPost, "/api/repos/create", open.write, `{"name":"a b","organization":"acme"}`, 400, ""},
-		{"commit to a revision id", open, http.MethodPost, "/api/models/acme/tiny/commit/" + sha40, open.write, `{}`, 400, ""},
-		{"commit with an unknown operation", open, http.MethodPost, "/api/models/acme/tiny/commit/main", open.write, `{"key":"rename","value":{}}`, 400, ""},
-		{"branch in an unknown repository", open, http.MethodPost, "/api/models/acme/absent/branch/dev", open.write, `{}`, 404, "RepoNotFound"},
-		{"branch from an unknown revision", open, http.MethodPost, "/api/models/acme/tiny/branch/dev", open.write, `{"startingPoint":"nope"}`, 404, "RevisionNotFound"},
-		{"large-file batch for a download", open, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", open.write, `{"operation":"download"}`, 501, ""},
-		{"large-file upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + sha("x"), "", "x", 403, ""},
+		{"repository that exists", open, http.MethodPost, "/api/repos/create", open.Write, `{"name":"tiny","organization":"acme"}`, 409, ""},
+		{"repository id that is not one", open, http.MethodPost, "/api/repos/create", open.Write, `{"name":"a b","organization":"acme"}`, 400, ""},
+		{"commit to a revision id", open, http.MethodPost, "/api/models/acme/tiny/commit/" + sha40, open.Write, `{}`, 400, ""},
+		{"commit with an unknown operation", open, http.MethodPost, "/api/models/acme/tiny/commit/main", open.Write, `{"key":"rename","value":{}}`, 400, ""},
+		{"branch in an unknown repository", open, http.MethodPost, "/api/models/acme/absent/branch/dev", open.Write, `{}`, 404, "RepoNotFound"},
+		{"branch from an unknown revision", open, http.MethodPost, "/api/models/acme/tiny/branch/dev", open.Write, `{"startingPoint":"nope"}`, 404, "RevisionNotFound"},
+		{"large-file batch for a download", open, http.MethodPost, "/acme/tiny.git/info/lfs/objects/batch", open.Write, `{"operation":"download"}`, 501, ""},
+		{"large-file upload without a signed URL", open, http.MethodPut, "/api/lfs/upload/" + kit.SHA256Hex("x"), "", "x", 403, ""},
 		{"xet", open, http.MethodGet, "/api/xet-is-not-supported/x", "", "", 400, ""},
 	}
 	for _, tc := range tests {
@@ -314,7 +316,7 @@ func TestHuggingFaceErrorsAlwaysCarryTheirMessage(t *testing.T) {
 			if tc.body != "" {
 				rd = strings.NewReader(tc.body)
 			}
-			resp := do(t, tc.method, tc.in.url+tc.path, tc.token, rd, nil)
+			resp := do(t, tc.method, tc.in.URL+tc.path, tc.token, rd, nil)
 			raw := body(t, resp)
 			if resp.StatusCode != tc.status {
 				t.Fatalf("status %d, want %d: %s", resp.StatusCode, tc.status, raw)
@@ -336,10 +338,10 @@ func TestHuggingFaceErrorsAlwaysCarryTheirMessage(t *testing.T) {
 
 	t.Run("an existing repository is named in the conflict", func(t *testing.T) {
 		t.Parallel()
-		resp := do(t, http.MethodPost, open.url+"/api/repos/create", open.write, strings.NewReader(`{"name":"tiny","organization":"acme"}`), nil)
+		resp := do(t, http.MethodPost, open.URL+"/api/repos/create", open.Write, strings.NewReader(`{"name":"tiny","organization":"acme"}`), nil)
 		var out map[string]string
 		decode(t, resp, &out)
-		if resp.StatusCode != http.StatusConflict || out["url"] != open.url+"/acme/tiny" || out["error"] == "" || len(out) != 2 {
+		if resp.StatusCode != http.StatusConflict || out["url"] != open.URL+"/acme/tiny" || out["error"] == "" || len(out) != 2 {
 			t.Fatalf("status %d body %v; want the error and the repository's url, as before", resp.StatusCode, out)
 		}
 	})
@@ -349,13 +351,13 @@ func TestHuggingFaceErrorsAlwaysCarryTheirMessage(t *testing.T) {
 // API's JSON, the Hugging Face header as well, or a page for a browser.
 func TestRefusalsAreWrittenForWhoeverAsked(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: false})
+	in := regtest.Start(t, server.Config{AnonymousRead: false})
 	push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 
 	t.Run("registry API", func(t *testing.T) {
 		t.Parallel()
-		for token, want := range map[string]int{"": 401, in.read: 403} {
-			resp := do(t, http.MethodDelete, in.url+"/api/v1/repos/acme/tiny", token, nil, nil)
+		for token, want := range map[string]int{"": 401, in.Read: 403} {
+			resp := do(t, http.MethodDelete, in.URL+"/api/v1/repos/acme/tiny", token, nil, nil)
 			raw := body(t, resp)
 			if resp.StatusCode != want || !strings.Contains(raw, `"error"`) || resp.Header.Get("Content-Type") != "application/json" {
 				t.Errorf("status %d (%s), want %d as JSON", resp.StatusCode, raw, want)
@@ -368,8 +370,8 @@ func TestRefusalsAreWrittenForWhoeverAsked(t *testing.T) {
 
 	t.Run("Hugging Face", func(t *testing.T) {
 		t.Parallel()
-		for token, want := range map[string]int{"": 401, in.read: 403} {
-			resp := do(t, http.MethodPost, in.url+"/api/models/acme/tiny/commit/main", token, strings.NewReader(`{}`), nil)
+		for token, want := range map[string]int{"": 401, in.Read: 403} {
+			resp := do(t, http.MethodPost, in.URL+"/api/models/acme/tiny/commit/main", token, strings.NewReader(`{}`), nil)
 			msg := resp.Header.Get("X-Error-Message")
 			if resp.StatusCode != want || !strings.Contains(msg, "write role") {
 				t.Errorf("status %d with X-Error-Message %q, want %d naming the role needed", resp.StatusCode, msg, want)
@@ -383,17 +385,17 @@ func TestRefusalsAreWrittenForWhoeverAsked(t *testing.T) {
 	t.Run("web UI", func(t *testing.T) {
 		t.Parallel()
 		// May not read: sent to sign in.
-		resp := do(t, http.MethodGet, in.url+"/ui/repo/acme/tiny", "", nil, nil)
+		resp := do(t, http.MethodGet, in.URL+"/ui/repo/acme/tiny", "", nil, nil)
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/login" {
 			t.Errorf("anonymous page view: status %d to %q", resp.StatusCode, resp.Header.Get("Location"))
 		}
 		// May read, may not delete: shown the sign-in page with the reason.
-		resp = do(t, http.MethodPost, in.url+"/ui/repo/acme/tiny/delete", "", strings.NewReader("confirm=acme%2Ftiny"), signedInForm(in.write))
+		resp = do(t, http.MethodPost, in.URL+"/ui/repo/acme/tiny/delete", "", strings.NewReader("confirm=acme%2Ftiny"), signedInForm(in.Write))
 		page := body(t, resp)
 		if resp.StatusCode != http.StatusForbidden || !strings.Contains(page, "admin role") || !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
 			t.Errorf("delete with a write token: status %d\n%s", resp.StatusCode, page)
 		}
-		if _, err := in.reg.GetRepo(context.Background(), "acme/tiny"); err != nil {
+		if _, err := in.Reg.GetRepo(context.Background(), "acme/tiny"); err != nil {
 			t.Errorf("the refused delete removed the repository: %v", err)
 		}
 	})
@@ -403,17 +405,17 @@ func TestRefusalsAreWrittenForWhoeverAsked(t *testing.T) {
 // and the one v0.3.0 shipped still works.
 func TestSnapshotAddresses(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 	for _, path := range []string{"/api/v1/backups/snapshot", "/api/v1/backup/snapshot"} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
-			for token, want := range map[string]int{"": 401, in.read: 403, in.write: 403} {
-				if resp := do(t, http.MethodGet, in.url+path, token, nil, nil); resp.StatusCode != want {
+			for token, want := range map[string]int{"": 401, in.Read: 403, in.Write: 403} {
+				if resp := do(t, http.MethodGet, in.URL+path, token, nil, nil); resp.StatusCode != want {
 					t.Errorf("status %d, want %d", resp.StatusCode, want)
 				}
 			}
-			resp := do(t, http.MethodGet, in.url+path, in.admin, nil, nil)
+			resp := do(t, http.MethodGet, in.URL+path, in.Admin, nil, nil)
 			content := body(t, resp)
 			if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/vnd.sqlite3" || !strings.HasPrefix(content, "SQLite format 3") {
 				t.Fatalf("status %d, type %q, %d bytes", resp.StatusCode, resp.Header.Get("Content-Type"), len(content))

@@ -17,6 +17,8 @@ import (
 	"github.com/model-delivery/registry/internal/blob"
 	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -36,9 +38,9 @@ type verifyLine struct {
 
 // verify runs the check and returns the first line, the per-blob lines by
 // digest, and the last line.
-func verify(t *testing.T, in *instance) (start verifyLine, blobs map[string]verifyLine, last verifyLine) {
+func verify(t *testing.T, in *regtest.Instance) (start verifyLine, blobs map[string]verifyLine, last verifyLine) {
 	t.Helper()
-	resp := do(t, http.MethodPost, in.url+"/api/v1/verify", in.admin, nil, nil)
+	resp := do(t, http.MethodPost, in.URL+"/api/v1/verify", in.Admin, nil, nil)
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/x-ndjson" {
 		t.Fatalf("status %d, content type %q", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
@@ -107,7 +109,7 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 		t.Run(backend.name, func(t *testing.T) {
 			t.Parallel()
 			store, overwrite, remove := backend.open(t)
-			in := startWith(t, server.Config{AnonymousRead: true}, store)
+			in := regtest.StartWith(t, server.Config{AnonymousRead: true}, store)
 			push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
 			// A second repository that shares the weights.
 			push(t, in, "acme/other", map[string]string{"model.safetensors": weights, "extra.txt": extra}, client.PushOptions{})
@@ -129,9 +131,9 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 			// Three kinds of damage, done behind the registry's back.
 			flipped := []byte(weights)
 			flipped[len(flipped)/2] ^= 0x01
-			overwrite(sha(weights), flipped)     // same size, one byte different
-			overwrite(sha(vocab), []byte("a\n")) // cut short
-			remove(sha(config))                  // gone
+			overwrite(kit.SHA256Hex(weights), flipped)     // same size, one byte different
+			overwrite(kit.SHA256Hex(vocab), []byte("a\n")) // cut short
+			remove(kit.SHA256Hex(config))                  // gone
 
 			_, blobs, done = verify(t, in)
 			if done.Event != "done" || done.Blobs != 4 || done.Failed != 3 {
@@ -141,10 +143,10 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 				status, say string
 				repos       []string
 			}{
-				sha(weights): {"damaged", "sha256", []string{"acme/other", "acme/tiny"}},
-				sha(vocab):   {"damaged", "bytes", []string{"acme/tiny"}},
-				sha(config):  {"missing", "nothing under this name", []string{"acme/tiny"}},
-				sha(extra):   {"ok", "", nil},
+				kit.SHA256Hex(weights): {"damaged", "sha256", []string{"acme/other", "acme/tiny"}},
+				kit.SHA256Hex(vocab):   {"damaged", "bytes", []string{"acme/tiny"}},
+				kit.SHA256Hex(config):  {"missing", "nothing under this name", []string{"acme/tiny"}},
+				kit.SHA256Hex(extra):   {"ok", "", nil},
 			}
 			for d, w := range want {
 				got := blobs[d]
@@ -155,11 +157,11 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 			}
 
 			// Checking changes nothing, and what is intact is still served.
-			if resp := do(t, http.MethodGet, in.url+"/acme/other/resolve/main/extra.txt", "", nil, nil); body(t, resp) != extra {
+			if resp := do(t, http.MethodGet, in.URL+"/acme/other/resolve/main/extra.txt", "", nil, nil); body(t, resp) != extra {
 				t.Fatal("an intact file is no longer served")
 			}
 			// A download of the missing file names the command that finds them all.
-			resp := do(t, http.MethodGet, in.url+"/acme/tiny/resolve/main/config.json", "", nil, nil)
+			resp := do(t, http.MethodGet, in.URL+"/acme/tiny/resolve/main/config.json", "", nil, nil)
 			if msg := body(t, resp); resp.StatusCode != http.StatusInternalServerError || !strings.Contains(msg, "modelctl verify") {
 				t.Fatalf("download of a missing file: status %d: %s", resp.StatusCode, msg)
 			}
@@ -167,10 +169,10 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 			// The repair docs/operations.md describes: remove what is damaged
 			// from storage, then upload the right bytes again under the
 			// same digest.
-			remove(sha(weights))
-			remove(sha(vocab))
+			remove(kit.SHA256Hex(weights))
+			remove(kit.SHA256Hex(vocab))
 			for _, content := range []string{weights, vocab, config} {
-				resp := do(t, http.MethodPut, in.url+"/api/v1/blobs/"+sha(content), in.write, strings.NewReader(content), nil)
+				resp := do(t, http.MethodPut, in.URL+"/api/v1/blobs/"+kit.SHA256Hex(content), in.Write, strings.NewReader(content), nil)
 				if resp.StatusCode != http.StatusCreated {
 					t.Fatalf("re-upload: status %d (%s)", resp.StatusCode, body(t, resp))
 				}
@@ -178,7 +180,7 @@ func TestVerifyFindsMissingAndDamagedFiles(t *testing.T) {
 			if _, _, done := verify(t, in); done.Event != "done" || done.Blobs != 4 || done.Failed != 0 {
 				t.Fatalf("after the repair: done = %+v", done)
 			}
-			if resp := do(t, http.MethodGet, in.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); body(t, resp) != weights {
+			if resp := do(t, http.MethodGet, in.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); body(t, resp) != weights {
 				t.Fatal("the repaired file is not served as it was")
 			}
 		})
@@ -192,13 +194,13 @@ func TestDamagedMirrorIsRepairedByDeletingAndMirroringAgain(t *testing.T) {
 	ctx := context.Background()
 	_, hubURL, _ := upstreamHub(t, server.Config{AnonymousRead: true}, nil)
 	store, overwrite, _ := damageableStores[0].open(t) // the filesystem
-	local := startWith(t, server.Config{AnonymousRead: true, Upstream: hubURL}, store)
-	cl := client.New(local.url, local.admin)
+	local := regtest.StartWith(t, server.Config{AnonymousRead: true, Upstream: hubURL}, store)
+	cl := client.New(local.URL, local.Admin)
 	if _, err := cl.Mirror(ctx, "acme/tiny", "main", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	weights := modelFiles["model.safetensors"]
-	overwrite(sha(weights), []byte(strings.ToUpper(weights)))
+	overwrite(kit.SHA256Hex(weights), []byte(strings.ToUpper(weights)))
 	if _, _, done := verify(t, local); done.Failed != 1 {
 		t.Fatalf("after damage: done = %+v", done)
 	}
@@ -212,7 +214,7 @@ func TestDamagedMirrorIsRepairedByDeletingAndMirroringAgain(t *testing.T) {
 		t.Fatalf("after mirroring again: done = %+v; the docs say this does not repair", done)
 	}
 
-	if resp := do(t, http.MethodDelete, local.url+"/api/v1/repos/acme/tiny", local.admin, nil, nil); resp.StatusCode != http.StatusOK {
+	if resp := do(t, http.MethodDelete, local.URL+"/api/v1/repos/acme/tiny", local.Admin, nil, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete: status %d", resp.StatusCode)
 	}
 	if _, err := cl.Mirror(ctx, "acme/tiny", "main", "", nil); err != nil {
@@ -221,14 +223,14 @@ func TestDamagedMirrorIsRepairedByDeletingAndMirroringAgain(t *testing.T) {
 	if _, _, done := verify(t, local); done.Blobs != len(modelFiles) || done.Failed != 0 {
 		t.Fatalf("after delete and mirror: done = %+v", done)
 	}
-	if resp := do(t, http.MethodGet, local.url+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); body(t, resp) != weights {
+	if resp := do(t, http.MethodGet, local.URL+"/acme/tiny/resolve/main/model.safetensors", "", nil, nil); body(t, resp) != weights {
 		t.Fatal("the repaired file is not served as it was upstream")
 	}
 }
 
 func TestVerifyOfAnEmptyRegistry(t *testing.T) {
 	t.Parallel()
-	in := start(t, server.Config{AnonymousRead: true})
+	in := regtest.Start(t, server.Config{AnonymousRead: true})
 	start, blobs, done := verify(t, in)
 	if start.Blobs != 0 || len(blobs) != 0 || done.Event != "done" || done.Blobs != 0 || done.Failed != 0 {
 		t.Fatalf("start %+v, %d blob lines, done %+v", start, len(blobs), done)

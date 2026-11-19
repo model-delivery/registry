@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -44,12 +45,12 @@ func TestBackupNowWarnsWhenOldBackupsCannotBeRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logs := &syncBuffer{}
-	in := startWith(t, server.Config{AnonymousRead: true, BackupKeep: 1, Logger: slog.New(slog.NewTextHandler(logs, nil))}, undeletable{fs})
+	logs := &regtest.LogBuffer{}
+	in := regtest.StartWith(t, server.Config{AnonymousRead: true, BackupKeep: 1, Logger: slog.New(slog.NewTextHandler(logs, nil))}, undeletable{fs})
 
 	take := func() (int, backupAnswer) {
 		t.Helper()
-		resp := do(t, http.MethodPost, in.url+"/api/v1/backups", in.admin, nil, nil)
+		resp := do(t, http.MethodPost, in.URL+"/api/v1/backups", in.Admin, nil, nil)
 		var out backupAnswer
 		if err := json.Unmarshal([]byte(body(t, resp)), &out); err != nil {
 			t.Fatal(err)
@@ -83,7 +84,7 @@ func TestBackupNowWarnsWhenOldBackupsCannotBeRemoved(t *testing.T) {
 	}
 
 	// Both are there to be listed.
-	resp := do(t, http.MethodGet, in.url+"/api/v1/backups", in.admin, nil, nil)
+	resp := do(t, http.MethodGet, in.URL+"/api/v1/backups", in.Admin, nil, nil)
 	var listing struct {
 		Backups []struct {
 			Name string `json:"name"`

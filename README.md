@@ -126,14 +126,19 @@ modelctl restore <file>|--latest    put a backup back (registry stopped)
 ```
 
 Client commands read `MODELCTL_ENDPOINT` (default `http://localhost:8080`)
-and `MODELCTL_TOKEN`. Every one accepts `--json` for scripts.
+and `MODELCTL_TOKEN`. Every one accepts `--json` for scripts. `mirror`,
+`push`, `pull`, `list`, `inspect` and `delete` work on models unless given
+`--repo-type dataset`, the same flag `hf download` and `hf upload` take.
 
 ```bash
 modelctl mirror meta-llama/Llama-3.2-1B --upstream-token "$HF_TOKEN"   # gated repository
 modelctl mirror openai-community/gpt2 --revision <branch, tag or 40-character revision id>
+modelctl mirror --repo-type dataset stanfordnlp/imdb                    # a dataset
 modelctl push ./my-model my-team/my-model --tag v1.0 --message "first release"
+modelctl push ./my-data my-team/my-data --repo-type dataset
 modelctl pull my-team/my-model --revision v1.0 --dir ./out
 modelctl inspect my-team/my-model --revision main
+modelctl list --repo-type dataset
 modelctl token create ci --role write
 ```
 

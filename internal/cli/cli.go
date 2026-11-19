@@ -51,6 +51,8 @@ Recovery (registry stopped):
 
 Client commands read MODELCTL_ENDPOINT (default http://localhost:8080) and
 MODELCTL_TOKEN. Add --json to any of them for machine-readable output.
+mirror, push, pull, list, inspect and delete work on models; add
+--repo-type dataset to work on datasets instead, as with hf.
 Run "modelctl <command> --help" for a command's flags.
 `
 
@@ -257,27 +259,67 @@ func checkRepo(name string) error {
 	return nil
 }
 
+// repoTypeFlag adds --repo-type to a command that names repositories,
+// spelled as the hf CLI spells it so that there is one thing to learn.
+func (c *command) repoTypeFlag() *string {
+	return c.String("repo-type", string(client.Model), "repository type: model or dataset, as with hf --repo-type")
+}
+
+// repoType reads the value of --repo-type.
+func repoType(flagValue string) (client.RepoType, error) {
+	typ, err := client.ParseRepoType(flagValue)
+	if err != nil {
+		return "", usagef("--repo-type: %v", err)
+	}
+	return typ, nil
+}
+
+// repoKey checks a repository name given on the command line and the
+// --repo-type given with it, and returns the key the client addresses the
+// repository by.
+func repoKey(name, typeFlag string) (string, error) {
+	typ, err := repoType(typeFlag)
+	if err != nil {
+		return "", err
+	}
+	if err := checkRepo(name); err != nil {
+		return "", err
+	}
+	return client.RepoKey(typ, name), nil
+}
+
+// shown is how output names a repository: by its name, with "dataset"
+// before the name of a dataset. A model's lines read as they always have.
+func shown(name string, typ client.RepoType) string {
+	if typ == client.Dataset {
+		return "dataset " + name
+	}
+	return name
+}
+
 // ---- mirror ----
 
 func cmdMirror(e *env, args []string) error {
 	c := newClientCommand(e, "mirror", "mirror <namespace/name> [flags]")
 	revision := c.String("revision", defaultBranch, "upstream branch, tag or revision id")
 	upToken := c.String("upstream-token", "", "token for the upstream hub, for private or gated repositories (env MODELCTL_UPSTREAM_TOKEN, then HF_TOKEN)")
+	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
 		return err
 	}
-	if err := checkRepo(pos[0]); err != nil {
+	key, err := repoKey(pos[0], *typeFlag)
+	if err != nil {
 		return err
 	}
 	upstreamToken := e.option(*upToken, "", "MODELCTL_UPSTREAM_TOKEN", "HF_TOKEN")
-	done, err := c.client().Mirror(e.ctx, pos[0], *revision, upstreamToken, func(ev client.MirrorEvent) {
+	done, err := c.client().Mirror(e.ctx, key, *revision, upstreamToken, func(ev client.MirrorEvent) {
 		if c.jsonOut {
 			return
 		}
 		switch ev.Event {
 		case client.EventStart:
-			fmt.Fprintf(e.stderr, "Mirroring %s at revision %s: %d files, %s\n", ev.Repo, ev.SHA, ev.Files, kit.HumanBytes(ev.Bytes))
+			fmt.Fprintf(e.stderr, "Mirroring %s at revision %s: %d files, %s\n", shown(ev.Repo, ev.RepoType), ev.SHA, ev.Files, kit.HumanBytes(ev.Bytes))
 		case client.EventFile:
 			c.progress(ev.Status, ev.Size, ev.Path)
 		}
@@ -288,7 +330,7 @@ func cmdMirror(e *env, args []string) error {
 	if c.jsonOut {
 		return c.printJSON(done)
 	}
-	fmt.Fprintf(e.stdout, "Mirrored %s at revision %s\n", done.Repo, done.SHA)
+	fmt.Fprintf(e.stdout, "Mirrored %s at revision %s\n", shown(done.Repo, done.RepoType), done.SHA)
 	fmt.Fprintf(e.stdout, "%d files verified: %s downloaded, %s already stored\n",
 		done.Files, kit.HumanBytes(done.DownloadedBytes), kit.HumanBytes(done.ReusedBytes))
 	return nil
@@ -316,6 +358,7 @@ func cmdPush(e *env, args []string) error {
 	merge := c.Bool("merge", false, "keep the branch's existing files and add or replace these (default: the directory becomes the whole revision)")
 	var tags stringList
 	c.Var(&tags, "tag", "tag to create at the new revision; repeatable; tags never move")
+	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 2, 2)
 	if err != nil {
 		return err
@@ -323,10 +366,11 @@ func cmdPush(e *env, args []string) error {
 	if fi, err := os.Stat(pos[0]); err != nil || !fi.IsDir() {
 		return usagef("%s is not a directory", pos[0])
 	}
-	if err := checkRepo(pos[1]); err != nil {
+	key, err := repoKey(pos[1], *typeFlag)
+	if err != nil {
 		return err
 	}
-	res, err := c.client().Push(e.ctx, pos[0], pos[1], client.PushOptions{
+	res, err := c.client().Push(e.ctx, pos[0], key, client.PushOptions{
 		Branch: *branch, Tags: tags, Message: *message, Merge: *merge,
 		Progress: func(p string, size int64, uploaded bool) {
 			status := "exists"
@@ -342,7 +386,7 @@ func cmdPush(e *env, args []string) error {
 	if c.jsonOut {
 		return c.printJSON(res)
 	}
-	fmt.Fprintf(e.stdout, "Pushed %s at revision %s (%s)\n", res.Repo, res.SHA, *branch)
+	fmt.Fprintf(e.stdout, "Pushed %s at revision %s (%s)\n", shown(res.Repo, res.RepoType), res.SHA, *branch)
 	return nil
 }
 
@@ -352,18 +396,20 @@ func cmdPull(e *env, args []string) error {
 	c := newClientCommand(e, "pull", "pull <namespace/name> [flags]")
 	revision := c.String("revision", defaultBranch, "branch, tag or revision id")
 	dir := c.String("dir", "", "target directory (default: ./<name>)")
+	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
 		return err
 	}
-	if err := checkRepo(pos[0]); err != nil {
+	key, err := repoKey(pos[0], *typeFlag)
+	if err != nil {
 		return err
 	}
 	target := *dir
 	if target == "" {
 		_, target, _ = strings.Cut(pos[0], "/")
 	}
-	rev, err := c.client().Pull(e.ctx, pos[0], *revision, target, func(p string, size int64, fetched bool) {
+	rev, err := c.client().Pull(e.ctx, key, *revision, target, func(p string, size int64, fetched bool) {
 		status := "up to date"
 		if fetched {
 			status = "downloaded"
@@ -374,9 +420,13 @@ func cmdPull(e *env, args []string) error {
 		return err
 	}
 	if c.jsonOut {
-		return c.printJSON(map[string]any{"repo": rev.Repo, "sha": rev.SHA, "dir": target, "files": len(rev.Files)})
+		out := map[string]any{"repo": rev.Repo, "sha": rev.SHA, "dir": target, "files": len(rev.Files)}
+		if rev.RepoType != "" {
+			out["repo_type"] = rev.RepoType
+		}
+		return c.printJSON(out)
 	}
-	fmt.Fprintf(e.stdout, "Pulled %s at revision %s into %s (%d files verified)\n", rev.Repo, rev.SHA, target, len(rev.Files))
+	fmt.Fprintf(e.stdout, "Pulled %s at revision %s into %s (%d files verified)\n", shown(rev.Repo, rev.RepoType), rev.SHA, target, len(rev.Files))
 	return nil
 }
 
@@ -384,10 +434,15 @@ func cmdPull(e *env, args []string) error {
 
 func cmdList(e *env, args []string) error {
 	c := newClientCommand(e, "list", "list [flags]")
+	typeFlag := c.repoTypeFlag()
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
 	}
-	list, err := c.client().ListRepos(e.ctx)
+	typ, err := repoType(*typeFlag)
+	if err != nil {
+		return err
+	}
+	list, err := c.client().ListRepositories(e.ctx, typ)
 	if err != nil {
 		return err
 	}
@@ -395,6 +450,10 @@ func cmdList(e *env, args []string) error {
 		return c.printJSON(list.Raw)
 	}
 	if len(list.Repos) == 0 {
+		if typ == client.Dataset {
+			fmt.Fprintln(e.stdout, "No datasets yet. Try: modelctl mirror --repo-type dataset <namespace/name>")
+			return nil
+		}
 		fmt.Fprintln(e.stdout, "No repositories yet. Try: modelctl mirror <namespace/name>")
 		return nil
 	}
@@ -413,21 +472,23 @@ func cmdList(e *env, args []string) error {
 func cmdInspect(e *env, args []string) error {
 	c := newClientCommand(e, "inspect", "inspect <namespace/name> [flags]")
 	revision := c.String("revision", "", "also list the files of this branch, tag or revision id")
+	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
 		return err
 	}
-	if err := checkRepo(pos[0]); err != nil {
+	key, err := repoKey(pos[0], *typeFlag)
+	if err != nil {
 		return err
 	}
 	cl := c.client()
-	d, err := cl.Repo(e.ctx, pos[0])
+	d, err := cl.Repo(e.ctx, key)
 	if err != nil {
 		return err
 	}
 	var rev *client.Revision
 	if *revision != "" {
-		r, err := cl.Revision(e.ctx, pos[0], *revision)
+		r, err := cl.Revision(e.ctx, key, *revision)
 		if err != nil {
 			return err
 		}
@@ -439,9 +500,9 @@ func cmdInspect(e *env, args []string) error {
 		}
 		return c.printJSON(d.Raw)
 	}
-	fmt.Fprintf(e.stdout, "Repository: %s\n", d.Name)
+	fmt.Fprintf(e.stdout, "Repository: %s\n", shown(d.Name, d.Type))
 	if d.Upstream != "" {
-		fmt.Fprintf(e.stdout, "Mirror of:  %s/%s\n", d.Upstream, d.Name)
+		fmt.Fprintf(e.stdout, "Mirror of:  %s/%s\n", d.Upstream, key) // the key is the path on the hub
 	}
 	tw := c.table()
 	fmt.Fprintln(tw, "\nREF\tKIND\tREVISION")
@@ -468,24 +529,27 @@ func cmdInspect(e *env, args []string) error {
 func cmdDelete(e *env, args []string) error {
 	c := newClientCommand(e, "delete", "delete <namespace/name> --yes [flags]")
 	yes := c.Bool("yes", false, "confirm: this removes every revision and cannot be undone")
+	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
 		return err
 	}
-	if err := checkRepo(pos[0]); err != nil {
+	key, err := repoKey(pos[0], *typeFlag)
+	if err != nil {
 		return err
 	}
+	typ, _ := repoType(*typeFlag) // checked by repoKey
 	if !*yes {
-		return usagef("deleting %s removes every revision and cannot be undone; pass --yes to confirm", pos[0])
+		return usagef("deleting %s removes every revision and cannot be undone; pass --yes to confirm", shown(pos[0], typ))
 	}
-	res, err := c.client().DeleteRepo(e.ctx, pos[0])
+	res, err := c.client().DeleteRepo(e.ctx, key)
 	if err != nil {
 		return err
 	}
 	if c.jsonOut {
 		return c.printJSON(res.Raw)
 	}
-	fmt.Fprintf(e.stdout, "Deleted %s: freed %s in %d stored files\n", pos[0], kit.HumanBytes(res.Bytes), res.Blobs)
+	fmt.Fprintf(e.stdout, "Deleted %s: freed %s in %d stored files\n", shown(pos[0], typ), kit.HumanBytes(res.Bytes), res.Blobs)
 	c.warn(res.Warning)
 	return nil
 }

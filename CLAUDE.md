@@ -178,7 +178,7 @@ are exercised), `task build`, `task docker`.
   in (`asAPI`, `asHF`, `asUI`), or `public`, with a comment saying why no
   role is asked (the signed upload URL, whoami, sign-in, the health check).
   Paths the mux cannot match are routed by `Server.root` and
-  `Server.hfModels`, which gate each route they find the same way. The gate
+  `Server.hfRepos`, which gate each route they find the same way. The gate
   is the only place a role is compared: a handler never checks one itself.
   A new route registered any other way is a bug; `TestAccessControl` is
   where to add the case.

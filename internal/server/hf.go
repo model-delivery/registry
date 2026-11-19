@@ -180,9 +180,20 @@ func (s *Server) hfRepoInfo(w http.ResponseWriter, r *http.Request, repo, rev st
 	if c.UpstreamInfo != "" {
 		_ = json.Unmarshal([]byte(c.UpstreamInfo), &doc)
 	}
-	siblings := make([]map[string]string, len(files))
+	// With blobs=true (files_metadata=True in huggingface_hub) the Hub also
+	// gives each file's size, git blob id and, for a large file, its LFS
+	// digest. Without it, the name alone.
+	withBlobs := queryTrue(r, "blobs")
+	siblings := make([]hfSibling, len(files))
 	for i, f := range files {
-		siblings[i] = map[string]string{"rfilename": f.Path}
+		siblings[i] = hfSibling{RFilename: f.Path}
+		if withBlobs {
+			size := f.Size
+			siblings[i].Size, siblings[i].BlobID = &size, f.GitOID
+			if f.LFS {
+				siblings[i].LFS = &hfSiblingLFS{SHA256: f.SHA256, Size: f.Size, PointerSize: lfsPointerSize(f)}
+			}
+		}
 	}
 	// The Hub names a repository by its id alone, whatever its type; only a
 	// model's description also carries modelId.
@@ -203,6 +214,32 @@ func (s *Server) hfRepoInfo(w http.ResponseWriter, r *http.Request, repo, rev st
 		doc["tags"] = []string{}
 	}
 	writeJSON(w, http.StatusOK, doc)
+}
+
+// hfSibling is a file in a repository description.
+type hfSibling struct {
+	RFilename string        `json:"rfilename"`
+	BlobID    string        `json:"blobId,omitempty"`
+	Size      *int64        `json:"size,omitempty"`
+	LFS       *hfSiblingLFS `json:"lfs,omitempty"`
+}
+
+// hfSiblingLFS is how a repository description gives a large file's
+// digest; a tree entry gives it as hfLFS.
+type hfSiblingLFS struct {
+	SHA256      string `json:"sha256"`
+	Size        int64  `json:"size"`
+	PointerSize int    `json:"pointerSize"`
+}
+
+// queryTrue reports whether a query parameter is set to true, as the
+// Python clients spell it.
+func queryTrue(r *http.Request, name string) bool {
+	switch r.URL.Query().Get(name) {
+	case "true", "True", "1":
+		return true
+	}
+	return false
 }
 
 type hfLFS struct {
@@ -230,8 +267,7 @@ func (s *Server) hfTree(w http.ResponseWriter, r *http.Request, repo, rev, dir s
 		s.hfFail(w, r, err)
 		return
 	}
-	recursive := r.URL.Query().Get("recursive")
-	deep := recursive == "true" || recursive == "True" || recursive == "1"
+	deep := queryTrue(r, "recursive")
 	prefix := ""
 	if dir != "" {
 		prefix = dir + "/"

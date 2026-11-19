@@ -132,6 +132,72 @@ func TestDatasetHubRoutes(t *testing.T) {
 		}
 	})
 
+	// dataset_info and model_info with files_metadata=True ask for blobs=true
+	// and read each file's size, blob id and LFS digest from the siblings;
+	// huggingface.co gives them, and the tree gives the same values.
+	t.Run("info with blobs=true", func(t *testing.T) {
+		t.Parallel()
+		type sibling struct {
+			RFilename string `json:"rfilename"`
+			BlobID    string `json:"blobId"`
+			Size      *int64 `json:"size"`
+			LFS       *struct {
+				SHA256      string `json:"sha256"`
+				Size        int64  `json:"size"`
+				PointerSize int    `json:"pointerSize"`
+			} `json:"lfs"`
+		}
+		for api, files := range map[string]map[string]string{"datasets": datasetFiles, "models": modelFiles} {
+			var tree []struct {
+				Type string `json:"type"`
+				OID  string `json:"oid"`
+				Size int64  `json:"size"`
+				Path string `json:"path"`
+				LFS  *struct {
+					OID string `json:"oid"`
+				} `json:"lfs"`
+			}
+			decode(t, do(t, http.MethodGet, in.URL+"/api/"+api+"/acme/tiny/tree/main?recursive=true", "", nil, nil), &tree)
+			var doc struct {
+				Siblings []sibling `json:"siblings"`
+			}
+			decode(t, do(t, http.MethodGet, in.URL+"/api/"+api+"/acme/tiny/revision/main?blobs=true", "", nil, nil), &doc)
+			if len(doc.Siblings) != len(files) {
+				t.Fatalf("%s: siblings %+v", api, doc.Siblings)
+			}
+			for _, s := range doc.Siblings {
+				var entry = -1
+				for i, e := range tree {
+					if e.Path == s.RFilename {
+						entry = i
+					}
+				}
+				switch {
+				case entry < 0:
+					t.Errorf("%s: %s is a sibling but not in the tree", api, s.RFilename)
+				case s.Size == nil || *s.Size != int64(len(files[s.RFilename])):
+					t.Errorf("%s: %s has size %v, want %d", api, s.RFilename, s.Size, len(files[s.RFilename]))
+				case s.BlobID == "" || s.BlobID != tree[entry].OID:
+					t.Errorf("%s: %s has blobId %q, the tree says %q", api, s.RFilename, s.BlobID, tree[entry].OID)
+				case (s.LFS == nil) != (tree[entry].LFS == nil):
+					t.Errorf("%s: %s: lfs %+v in the siblings, %+v in the tree", api, s.RFilename, s.LFS, tree[entry].LFS)
+				case s.LFS != nil && (s.LFS.SHA256 != tree[entry].LFS.OID || s.LFS.Size != *s.Size || s.LFS.PointerSize == 0):
+					t.Errorf("%s: %s: lfs %+v, the tree's digest %s", api, s.RFilename, s.LFS, tree[entry].LFS.OID)
+				}
+			}
+			// Without blobs, the name alone, as the Hub answers.
+			var plain struct {
+				Siblings []map[string]any `json:"siblings"`
+			}
+			decode(t, do(t, http.MethodGet, in.URL+"/api/"+api+"/acme/tiny/revision/main", "", nil, nil), &plain)
+			for _, s := range plain.Siblings {
+				if len(s) != 1 || s["rfilename"] == nil {
+					t.Errorf("%s: without blobs=true, sibling %v", api, s)
+				}
+			}
+		}
+	})
+
 	// The dataset viewer is not implemented. What the datasets library asks
 	// of it is answered 404, which is what makes it read the repository's
 	// own files.

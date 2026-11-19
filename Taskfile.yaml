@@ -74,7 +74,7 @@ tasks:
       REGISTRY_TEST_S3_SECRET_KEY: anysecret
     cmds:
       - docker rm -f registry-test-s3 >/dev/null 2>&1 || true
-      - docker run -d --name registry-test-s3 -p 127.0.0.1:9005:8333 chrislusf/seaweedfs server -s3 -dir=/data
+      - docker run -d --name registry-test-s3 -p 127.0.0.1:9005:8333 chrislusf/seaweedfs:4.54 server -s3 -dir=/data
       - defer: docker rm -f registry-test-s3
       - for i in $(seq 1 40); do curl -fs -o /dev/null http://127.0.0.1:9005/ && break || sleep 1; done
       - go test -count=1 ./internal/blob/

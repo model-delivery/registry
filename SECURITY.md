@@ -16,6 +16,31 @@ ask not to be.
 
 The project is young. Security fixes go into the latest release only.
 
+## Verifying a release
+
+Every release lists a SHA-256 for each archive in `checksums.txt`:
+
+```bash
+sha256sum -c checksums.txt --ignore-missing
+```
+
+That shows the download is intact. To show it was built by this
+repository's release workflow from the tagged commit, releases after
+v0.3.1 also carry a signed build attestation, checked with the GitHub CLI:
+
+```bash
+gh attestation verify modelctl_<version>_linux_amd64.tar.gz -R model-delivery/registry
+```
+
+The container image carries its build provenance and a list of what it
+contains (an SBOM), from the same release on:
+
+```bash
+docker buildx imagetools inspect ghcr.io/model-delivery/registry:<version> --format '{{ json .Provenance }}'
+```
+
+The image's base images are pinned by digest in the `Dockerfile`.
+
 ## What the registry does and does not protect
 
 Knowing the design helps you deploy it safely.

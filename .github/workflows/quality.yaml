@@ -121,7 +121,7 @@ jobs:
       - run: pip install huggingface_hub
       - name: Start an S3-compatible server
         run: |
-          docker run -d --name s3 -p 127.0.0.1:9005:8333 chrislusf/seaweedfs server -s3 -dir=/data
+          docker run -d --name s3 -p 127.0.0.1:9005:8333 chrislusf/seaweedfs:4.54 server -s3 -dir=/data
           for i in $(seq 1 40); do curl -fs -o /dev/null http://127.0.0.1:9005/ && exit 0; sleep 1; done
           docker logs s3; exit 1
       # The only place multipart uploads are exercised.

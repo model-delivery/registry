@@ -2,23 +2,44 @@
 
 What exists today is listed in the [README](../README.md). This is what
 comes next, roughly in order. It is a statement of intent, not a promise
-of dates. Issues and pull requests that move an item forward are welcome.
+of dates. The order follows what people ask for: if an item matters to
+you, an issue saying how you would use it moves it up. Pull requests that
+move an item forward are welcome.
 
 ## Next
 
+The first three are about keeping independent copies of models, and the
+data they were trained on, that do not depend on one host.
+
+- **Datasets.** The same registry for dataset repositories: mirror them,
+  cache them on demand, and serve them to `datasets` and `hf download`.
+  Today the registry stores model repositories only.
+- **Keeping mirrors up to date.** A mirror is a snapshot of one revision,
+  and picking up a newer one means running `modelctl mirror` again. Two
+  additions:
+  - **Scheduled sync** for chosen repositories. A newer upstream revision
+    is recorded and the branch moves to it; earlier revisions stay, so
+    anything pinned to a revision id keeps getting the same files.
+  - **Mirror every branch and tag** of a repository in one command.
+- **Several upstreams.** A registry can already mirror from another
+  registry in place of Hugging Face. Let it have a list, tried in order,
+  so a chain of independent mirrors keeps working when one of them, or
+  the original, cannot be reached. Every file is checked against its
+  digest wherever it came from.
 - **Mirror selected files.** `modelctl mirror --include "*.gguf"` to fetch
   chosen files of a large repository ahead of time. Pull-through caching
   already fetches only the files that are downloaded; this is the same for
   the explicit command.
-- **Xet uploads.** Uploads from Hugging Face clients work today, but a
-  stock client needs `HF_HUB_DISABLE_XET=1` for large files. Speaking the
-  Xet protocol would remove that step.
-- **Datasets.** The same registry for dataset repositories.
 
 ## After that
 
-- **Scheduled sync.** Keep chosen mirrors up to date with upstream.
-- **Mirror every branch and tag** of a repository in one command.
+- **Xet uploads.** Uploads from Hugging Face clients work today, but a
+  stock client needs `HF_HUB_DISABLE_XET=1` for large files. Speaking the
+  Xet protocol would remove that step.
+- **Send a repository to another registry.** Mirroring pulls. The other
+  direction, copying a repository with its revision ids intact from one
+  registry to another you can write to, needs `modelctl pull` and
+  `modelctl push` today and gives the copy new revision ids.
 - **Resumable uploads** for `modelctl push`.
 - **A migration command** to move stored files between local disk and S3.
 - **Helm chart** for Kubernetes.

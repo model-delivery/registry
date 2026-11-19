@@ -5,14 +5,13 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -58,8 +57,7 @@ func TestVerifyCommand(t *testing.T) {
 	t.Run("a damaged file: names it and exits non-zero", func(t *testing.T) {
 		// Change the stored weights on disk, as a failing disk might.
 		weights := strings.Repeat("w", 4096)
-		sum := sha256.Sum256([]byte(weights))
-		digest := hex.EncodeToString(sum[:])
+		digest := kit.SHA256Hex(weights)
 		stored := filepath.Join(f.data, "blobs", "sha256", digest[:2], digest)
 		if err := os.WriteFile(stored, []byte(strings.Repeat("W", 4096)), 0o600); err != nil {
 			t.Fatal(err)

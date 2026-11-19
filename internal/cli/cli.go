@@ -3,6 +3,9 @@
 
 // Package cli implements the modelctl command line: the server
 // (modelctl serve) and the client commands that talk to it.
+//
+// A client command reads its flags, makes one call on internal/client and
+// prints the answer. It builds no request and decodes no response itself.
 package cli
 
 import (
@@ -12,13 +15,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -50,6 +53,23 @@ Client commands read MODELCTL_ENDPOINT (default http://localhost:8080) and
 MODELCTL_TOKEN. Add --json to any of them for machine-readable output.
 Run "modelctl <command> --help" for a command's flags.
 `
+
+// Defaults and formats of the client commands.
+const (
+	// defaultEndpoint is the registry a client command talks to when neither
+	// --endpoint nor MODELCTL_ENDPOINT names one.
+	defaultEndpoint = "http://localhost:8080"
+	// defaultBranch is the branch a push moves and a pull or mirror reads
+	// when none is named.
+	defaultBranch = "main"
+	// timeLayout is how a time is shown in a table, in the local zone.
+	timeLayout = "2006-01-02 15:04"
+	// The columns of a table: at least tableMinWidth wide, tabs every
+	// tableTabWidth, tablePadding spaces between them.
+	tableMinWidth = 0
+	tableTabWidth = 4
+	tablePadding  = 2
+)
 
 // env is what a command needs from its surroundings.
 type env struct {
@@ -113,11 +133,34 @@ type command struct {
 	endpoint string
 	token    string
 	jsonOut  bool
+	// notes is printed after the flags by --help.
+	notes string
+	// envErr is the first environment variable found with a value that
+	// cannot be read. It is reported by parse, after the flags, so that
+	// --help still works.
+	envErr error
 }
 
 func (e *env) envOr(key, fallback string) string {
 	if v := e.getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+// option resolves a client option the way every one of them is resolved:
+// what the flag was given, else the first of the environment variables
+// keys that is set, else fallback. The environment is read after the flags
+// are parsed and not as the flag's default, because a default is printed by
+// --help, and two of these options are tokens.
+func (e *env) option(flagValue, fallback string, keys ...string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	for _, key := range keys {
+		if v := e.getenv(key); v != "" {
+			return v
+		}
 	}
 	return fallback
 }
@@ -128,13 +171,16 @@ func newCommand(e *env, name, synopsis string) *command {
 	c.Usage = func() {
 		fmt.Fprintf(e.stderr, "usage: modelctl %s\n\nflags:\n", synopsis)
 		c.PrintDefaults()
+		if c.notes != "" {
+			fmt.Fprintf(e.stderr, "\n%s", c.notes)
+		}
 	}
 	return c
 }
 
 func newClientCommand(e *env, name, synopsis string) *command {
 	c := newCommand(e, name, synopsis)
-	c.StringVar(&c.endpoint, "endpoint", e.envOr("MODELCTL_ENDPOINT", "http://localhost:8080"), "registry URL (env MODELCTL_ENDPOINT)")
+	c.StringVar(&c.endpoint, "endpoint", "", "registry URL (env MODELCTL_ENDPOINT; default "+defaultEndpoint+")")
 	c.StringVar(&c.token, "token", "", "access token; prefer the environment variable MODELCTL_TOKEN, which does not show in the process list")
 	c.BoolVar(&c.jsonOut, "json", false, "print machine-readable JSON")
 	return c
@@ -157,6 +203,9 @@ func (c *command) parse(args []string, minArgs, maxArgs int) ([]string, error) {
 		pos = append(pos, c.Arg(0))
 		args = c.Args()[1:]
 	}
+	if c.envErr != nil {
+		return nil, c.envErr
+	}
 	if len(pos) < minArgs || len(pos) > maxArgs {
 		c.Usage()
 		return nil, usagef("expected %s, got %d", argCount(minArgs, maxArgs), len(pos))
@@ -172,11 +221,9 @@ func argCount(lo, hi int) string {
 }
 
 func (c *command) client() *client.Client {
-	token := c.token
-	if token == "" {
-		token = c.e.getenv("MODELCTL_TOKEN")
-	}
-	return client.New(c.endpoint, token)
+	return client.New(
+		c.e.option(c.endpoint, defaultEndpoint, "MODELCTL_ENDPOINT"),
+		c.e.option(c.token, "", "MODELCTL_TOKEN"))
 }
 
 func (c *command) printJSON(v any) error {
@@ -185,20 +232,22 @@ func (c *command) printJSON(v any) error {
 	return enc.Encode(v)
 }
 
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+// table starts a table on standard output. Cells are separated by tabs and
+// rows end with a newline; Flush writes it.
+func (c *command) table() *tabwriter.Writer {
+	return tabwriter.NewWriter(c.e.stdout, tableMinWidth, tableTabWidth, tablePadding, ' ', 0)
 }
 
-func short(sha string) string { return sha[:min(len(sha), 12)] }
+// warn prints what the registry said went wrong after it did what was
+// asked. The command still succeeded.
+func (c *command) warn(warning string) {
+	if warning != "" {
+		fmt.Fprintf(c.e.stderr, "Warning: %s\n", warning)
+	}
+}
+
+// localTime shows t in the local zone, to the minute.
+func localTime(t time.Time) string { return t.Local().Format(timeLayout) }
 
 // checkRepo rejects a malformed repository name before any request is made.
 func checkRepo(name string) error {
@@ -212,7 +261,7 @@ func checkRepo(name string) error {
 
 func cmdMirror(e *env, args []string) error {
 	c := newClientCommand(e, "mirror", "mirror <namespace/name> [flags]")
-	revision := c.String("revision", "main", "upstream branch, tag or revision id")
+	revision := c.String("revision", defaultBranch, "upstream branch, tag or revision id")
 	upToken := c.String("upstream-token", "", "token for the upstream hub, for private or gated repositories (env MODELCTL_UPSTREAM_TOKEN, then HF_TOKEN)")
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
@@ -221,18 +270,16 @@ func cmdMirror(e *env, args []string) error {
 	if err := checkRepo(pos[0]); err != nil {
 		return err
 	}
-	if *upToken == "" {
-		*upToken = e.envOr("MODELCTL_UPSTREAM_TOKEN", e.getenv("HF_TOKEN"))
-	}
-	done, err := c.client().Mirror(e.ctx, pos[0], *revision, *upToken, func(ev client.MirrorEvent) {
+	upstreamToken := e.option(*upToken, "", "MODELCTL_UPSTREAM_TOKEN", "HF_TOKEN")
+	done, err := c.client().Mirror(e.ctx, pos[0], *revision, upstreamToken, func(ev client.MirrorEvent) {
 		if c.jsonOut {
 			return
 		}
 		switch ev.Event {
-		case "start":
-			fmt.Fprintf(e.stderr, "Mirroring %s at revision %s: %d files, %s\n", ev.Repo, ev.SHA, ev.Files, humanBytes(ev.Bytes))
-		case "file":
-			fmt.Fprintf(e.stderr, "  %-10s %10s  %s\n", ev.Status, humanBytes(ev.Size), ev.Path)
+		case client.EventStart:
+			fmt.Fprintf(e.stderr, "Mirroring %s at revision %s: %d files, %s\n", ev.Repo, ev.SHA, ev.Files, kit.HumanBytes(ev.Bytes))
+		case client.EventFile:
+			c.progress(ev.Status, ev.Size, ev.Path)
 		}
 	})
 	if err != nil {
@@ -243,8 +290,16 @@ func cmdMirror(e *env, args []string) error {
 	}
 	fmt.Fprintf(e.stdout, "Mirrored %s at revision %s\n", done.Repo, done.SHA)
 	fmt.Fprintf(e.stdout, "%d files verified: %s downloaded, %s already stored\n",
-		done.Files, humanBytes(done.DownloadedBytes), humanBytes(done.ReusedBytes))
+		done.Files, kit.HumanBytes(done.DownloadedBytes), kit.HumanBytes(done.ReusedBytes))
 	return nil
+}
+
+// progress prints one file's line while a mirror, push or pull runs: what
+// happened to it, its size and its path. Nothing is printed with --json.
+func (c *command) progress(status string, size int64, path string) {
+	if !c.jsonOut {
+		fmt.Fprintf(c.e.stderr, "  %-10s %10s  %s\n", status, kit.HumanBytes(size), path)
+	}
 }
 
 // ---- push ----
@@ -256,7 +311,7 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 func cmdPush(e *env, args []string) error {
 	c := newClientCommand(e, "push", "push <directory> <namespace/name> [flags]")
-	branch := c.String("branch", "main", "branch to move to the new revision")
+	branch := c.String("branch", defaultBranch, "branch to move to the new revision")
 	message := c.String("message", "", "revision message")
 	merge := c.Bool("merge", false, "keep the branch's existing files and add or replace these (default: the directory becomes the whole revision)")
 	var tags stringList
@@ -274,14 +329,11 @@ func cmdPush(e *env, args []string) error {
 	res, err := c.client().Push(e.ctx, pos[0], pos[1], client.PushOptions{
 		Branch: *branch, Tags: tags, Message: *message, Merge: *merge,
 		Progress: func(p string, size int64, uploaded bool) {
-			if c.jsonOut {
-				return
-			}
 			status := "exists"
 			if uploaded {
 				status = "uploaded"
 			}
-			fmt.Fprintf(e.stderr, "  %-10s %10s  %s\n", status, humanBytes(size), p)
+			c.progress(status, size, p)
 		},
 	})
 	if err != nil {
@@ -298,7 +350,7 @@ func cmdPush(e *env, args []string) error {
 
 func cmdPull(e *env, args []string) error {
 	c := newClientCommand(e, "pull", "pull <namespace/name> [flags]")
-	revision := c.String("revision", "main", "branch, tag or revision id")
+	revision := c.String("revision", defaultBranch, "branch, tag or revision id")
 	dir := c.String("dir", "", "target directory (default: ./<name>)")
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
@@ -312,14 +364,11 @@ func cmdPull(e *env, args []string) error {
 		_, target, _ = strings.Cut(pos[0], "/")
 	}
 	rev, err := c.client().Pull(e.ctx, pos[0], *revision, target, func(p string, size int64, fetched bool) {
-		if c.jsonOut {
-			return
-		}
 		status := "up to date"
 		if fetched {
 			status = "downloaded"
 		}
-		fmt.Fprintf(e.stderr, "  %-10s %10s  %s\n", status, humanBytes(size), p)
+		c.progress(status, size, p)
 	})
 	if err != nil {
 		return err
@@ -338,37 +387,25 @@ func cmdList(e *env, args []string) error {
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
 	}
-	var out struct {
-		Repos []struct {
-			Name        string    `json:"name"`
-			Upstream    string    `json:"upstream"`
-			Revisions   int       `json:"revisions"`
-			StoredBytes int64     `json:"stored_bytes"`
-			UpdatedAt   time.Time `json:"updated_at"`
-		} `json:"repos"`
-	}
-	raw, err := c.client().Raw(e.ctx, http.MethodGet, "/api/v1/repos", nil)
+	list, err := c.client().ListRepos(e.ctx)
 	if err != nil {
 		return err
 	}
 	if c.jsonOut {
-		return c.printJSON(raw)
+		return c.printJSON(list.Raw)
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return err
-	}
-	if len(out.Repos) == 0 {
+	if len(list.Repos) == 0 {
 		fmt.Fprintln(e.stdout, "No repositories yet. Try: modelctl mirror <namespace/name>")
 		return nil
 	}
-	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+	tw := c.table()
 	fmt.Fprintln(tw, "REPOSITORY\tSOURCE\tREVISIONS\tSIZE\tUPDATED")
-	for _, r := range out.Repos {
+	for _, r := range list.Repos {
 		source := "push"
 		if r.Upstream != "" {
 			source = "mirror"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", r.Name, source, r.Revisions, humanBytes(r.StoredBytes), r.UpdatedAt.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", r.Name, source, r.Revisions, kit.HumanBytes(r.StoredBytes), localTime(r.UpdatedAt))
 	}
 	return tw.Flush()
 }
@@ -384,7 +421,7 @@ func cmdInspect(e *env, args []string) error {
 		return err
 	}
 	cl := c.client()
-	raw, err := cl.Raw(e.ctx, http.MethodGet, "/api/v1/repos/"+pos[0], nil)
+	d, err := cl.Repo(e.ctx, pos[0])
 	if err != nil {
 		return err
 	}
@@ -398,46 +435,31 @@ func cmdInspect(e *env, args []string) error {
 	}
 	if c.jsonOut {
 		if rev != nil {
-			return c.printJSON(map[string]any{"repository": raw, "revision": rev})
+			return c.printJSON(map[string]any{"repository": d.Raw, "revision": rev})
 		}
-		return c.printJSON(raw)
-	}
-	var d struct {
-		Name      string `json:"name"`
-		Upstream  string `json:"upstream"`
-		Refs      []struct{ Name, Kind, SHA string }
-		Revisions []struct {
-			SHA       string    `json:"sha"`
-			Source    string    `json:"source"`
-			Files     int       `json:"files"`
-			Bytes     int64     `json:"bytes"`
-			CreatedAt time.Time `json:"created_at"`
-		} `json:"revisions"`
-	}
-	if err := json.Unmarshal(raw, &d); err != nil {
-		return err
+		return c.printJSON(d.Raw)
 	}
 	fmt.Fprintf(e.stdout, "Repository: %s\n", d.Name)
 	if d.Upstream != "" {
 		fmt.Fprintf(e.stdout, "Mirror of:  %s/%s\n", d.Upstream, d.Name)
 	}
-	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+	tw := c.table()
 	fmt.Fprintln(tw, "\nREF\tKIND\tREVISION")
 	for _, r := range d.Refs {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", r.Name, r.Kind, r.SHA)
 	}
 	fmt.Fprintln(tw, "\nREVISION\tSOURCE\tFILES\tSIZE\tSTORED")
 	for _, r := range d.Revisions {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", r.SHA, r.Source, r.Files, humanBytes(r.Bytes), r.CreatedAt.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", r.SHA, r.Source, r.Files, kit.HumanBytes(r.Bytes), localTime(r.CreatedAt))
 	}
 	if rev != nil {
-		fmt.Fprintf(tw, "\nFILES AT %s\tSIZE\tSHA256\n", short(rev.SHA))
+		fmt.Fprintf(tw, "\nFILES AT %s\tSIZE\tSHA256\n", kit.Short(rev.SHA))
 		for _, f := range rev.Files {
 			digest := f.SHA256
 			if f.Pending {
 				digest = "(not fetched yet: fetched on first download)"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", f.Path, humanBytes(f.Size), digest)
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", f.Path, kit.HumanBytes(f.Size), digest)
 		}
 	}
 	return tw.Flush()
@@ -456,19 +478,15 @@ func cmdDelete(e *env, args []string) error {
 	if !*yes {
 		return usagef("deleting %s removes every revision and cannot be undone; pass --yes to confirm", pos[0])
 	}
-	var res struct {
-		Blobs int   `json:"blobs"`
-		Bytes int64 `json:"bytes"`
-	}
-	raw, err := c.client().Raw(e.ctx, http.MethodDelete, "/api/v1/repos/"+pos[0], nil)
+	res, err := c.client().DeleteRepo(e.ctx, pos[0])
 	if err != nil {
 		return err
 	}
 	if c.jsonOut {
-		return c.printJSON(raw)
+		return c.printJSON(res.Raw)
 	}
-	_ = json.Unmarshal(raw, &res)
-	fmt.Fprintf(e.stdout, "Deleted %s: freed %s in %d stored files\n", pos[0], humanBytes(res.Bytes), res.Blobs)
+	fmt.Fprintf(e.stdout, "Deleted %s: freed %s in %d stored files\n", pos[0], kit.HumanBytes(res.Bytes), res.Blobs)
+	c.warn(res.Warning)
 	return nil
 }
 
@@ -477,19 +495,15 @@ func cmdGC(e *env, args []string) error {
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
 	}
-	raw, err := c.client().Raw(e.ctx, http.MethodPost, "/api/v1/gc", nil)
+	res, err := c.client().GC(e.ctx)
 	if err != nil {
 		return err
 	}
 	if c.jsonOut {
-		return c.printJSON(raw)
+		return c.printJSON(res.Raw)
 	}
-	var res struct {
-		Blobs int   `json:"blobs"`
-		Bytes int64 `json:"bytes"`
-	}
-	_ = json.Unmarshal(raw, &res)
-	fmt.Fprintf(e.stdout, "Removed %d unreferenced stored files, freed %s\n", res.Blobs, humanBytes(res.Bytes))
+	fmt.Fprintf(e.stdout, "Removed %d unreferenced stored files, freed %s\n", res.Blobs, kit.HumanBytes(res.Bytes))
+	c.warn(res.Warning)
 	return nil
 }
 
@@ -502,47 +516,37 @@ func cmdToken(e *env, args []string) error {
 	switch args[0] {
 	case "create":
 		c := newClientCommand(e, "token create", "token create <name> [--role read|write|admin]")
-		role := c.String("role", "read", "read (download), write (also push and mirror) or admin (also delete and manage tokens)")
+		role := c.String("role", string(registry.RoleRead), "read (download), write (also push and mirror) or admin (also delete and manage tokens)")
 		pos, err := c.parse(args[1:], 1, 1)
 		if err != nil {
 			return err
 		}
-		raw, err := c.client().Raw(e.ctx, http.MethodPost, "/api/v1/tokens", map[string]string{"name": pos[0], "role": *role})
+		created, err := c.client().CreateToken(e.ctx, pos[0], *role)
 		if err != nil {
 			return err
 		}
 		if c.jsonOut {
-			return c.printJSON(raw)
+			return c.printJSON(created.Raw)
 		}
-		var out struct{ Token string }
-		_ = json.Unmarshal(raw, &out)
 		fmt.Fprintf(e.stderr, "Created %s token %q. It is shown only this once:\n", *role, pos[0])
-		fmt.Fprintln(e.stdout, out.Token)
+		fmt.Fprintln(e.stdout, created.Token)
 		return nil
 	case "list":
 		c := newClientCommand(e, "token list", "token list")
 		if _, err := c.parse(args[1:], 0, 0); err != nil {
 			return err
 		}
-		raw, err := c.client().Raw(e.ctx, http.MethodGet, "/api/v1/tokens", nil)
+		list, err := c.client().ListTokens(e.ctx)
 		if err != nil {
 			return err
 		}
 		if c.jsonOut {
-			return c.printJSON(raw)
+			return c.printJSON(list.Raw)
 		}
-		var out struct {
-			Tokens []struct {
-				Name      string    `json:"name"`
-				Role      string    `json:"role"`
-				CreatedAt time.Time `json:"created_at"`
-			} `json:"tokens"`
-		}
-		_ = json.Unmarshal(raw, &out)
-		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+		tw := c.table()
 		fmt.Fprintln(tw, "NAME\tROLE\tCREATED")
-		for _, t := range out.Tokens {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", t.Name, t.Role, t.CreatedAt.Local().Format("2006-01-02 15:04"))
+		for _, t := range list.Tokens {
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", t.Name, t.Role, localTime(t.CreatedAt))
 		}
 		return tw.Flush()
 	case "revoke":
@@ -551,12 +555,15 @@ func cmdToken(e *env, args []string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := c.client().Raw(e.ctx, http.MethodDelete, "/api/v1/tokens/"+pos[0], nil); err != nil && !errors.Is(err, io.EOF) {
+		if err := c.client().RevokeToken(e.ctx, pos[0]); err != nil {
 			return err
 		}
-		if !c.jsonOut {
-			fmt.Fprintf(e.stdout, "Revoked token %q\n", pos[0])
+		if c.jsonOut {
+			// The registry answers a revocation with no document, so this
+			// one is the command's own.
+			return c.printJSON(map[string]any{"name": pos[0], "revoked": true})
 		}
+		fmt.Fprintf(e.stdout, "Revoked token %q\n", pos[0])
 		return nil
 	}
 	return usagef("unknown subcommand %q: expected create, list or revoke", args[0])

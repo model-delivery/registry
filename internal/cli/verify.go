@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/model-delivery/registry/internal/client"
+	"github.com/model-delivery/registry/internal/kit"
 )
 
 // modelctl verify asks a running registry to re-read every stored file and
@@ -21,9 +22,9 @@ func cmdVerify(e *env, args []string) error {
 	var failed []client.VerifyEvent
 	done, err := c.client().Verify(e.ctx, func(ev client.VerifyEvent) {
 		switch {
-		case ev.Event == "start" && !c.jsonOut:
-			fmt.Fprintf(e.stderr, "Checking %d stored files, %s. This reads every one of them in full.\n", ev.Blobs, humanBytes(ev.Bytes))
-		case ev.Event == "blob" && ev.Status != "ok":
+		case ev.Event == client.EventStart && !c.jsonOut:
+			fmt.Fprintf(e.stderr, "Checking %d stored files, %s. This reads every one of them in full.\n", ev.Blobs, kit.HumanBytes(ev.Bytes))
+		case ev.Event == client.EventBlob && ev.Status != client.VerifyOK:
 			failed = append(failed, ev)
 			if c.jsonOut {
 				return
@@ -32,7 +33,7 @@ func cmdVerify(e *env, args []string) error {
 			if len(ev.Repos) > 0 {
 				used = "used by " + strings.Join(ev.Repos, ", ")
 			}
-			fmt.Fprintf(e.stdout, "%-10s  %s  %s\n            %s\n            %s\n", ev.Status, ev.SHA256, humanBytes(ev.Size), ev.Detail, used)
+			fmt.Fprintf(e.stdout, "%-10s  %s  %s\n            %s\n            %s\n", ev.Status, ev.SHA256, kit.HumanBytes(ev.Size), ev.Detail, used)
 		}
 	})
 	if err != nil {
@@ -51,7 +52,7 @@ func cmdVerify(e *env, args []string) error {
 			"docs/operations.md, \"Checking stored files\", says how to put each kind right", done.Failed, done.Blobs)
 	}
 	if !c.jsonOut {
-		fmt.Fprintf(e.stdout, "Verified %d stored files (%s): every one is present and matches its digest\n", done.Blobs, humanBytes(done.Bytes))
+		fmt.Fprintf(e.stdout, "Verified %d stored files (%s): every one is present and matches its digest\n", done.Blobs, kit.HumanBytes(done.Bytes))
 	}
 	return nil
 }

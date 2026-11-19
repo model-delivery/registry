@@ -6,7 +6,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,27 +15,10 @@ import (
 
 	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 )
 
 const backupAdmin = "md_admin_token_for_backup_tests"
-
-// s3Env is the server configuration for a registry on the fake S3 service.
-func s3Env(fake *blobtest.FakeS3, extra map[string]string) map[string]string {
-	env := map[string]string{
-		"REGISTRY_STORAGE":       "s3",
-		"REGISTRY_S3_ENDPOINT":   fake.Config.Endpoint,
-		"REGISTRY_S3_BUCKET":     fake.Config.Bucket,
-		"REGISTRY_S3_PREFIX":     "prod",
-		"REGISTRY_S3_ACCESS_KEY": fake.Config.AccessKey,
-		"REGISTRY_S3_SECRET_KEY": fake.Config.SecretKey,
-		"REGISTRY_S3_REGION":     "us-east-1",
-		"REGISTRY_ADMIN_TOKEN":   backupAdmin,
-	}
-	for k, v := range extra {
-		env[k] = v
-	}
-	return env
-}
 
 // ctl runs a client command against addr and returns exit code and output.
 func ctl(t *testing.T, addr, token string, args ...string) (int, string, string) {
@@ -55,7 +37,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 	fake := blobtest.NewFakeS3(t)
 	firstDisk := t.TempDir()
 
-	logs, addr, stop := runServe(t, firstDisk, s3Env(fake, nil))
+	logs, addr, stop := regtest.RunServe(t, Run, firstDisk, regtest.S3Env(fake, backupAdmin, nil))
 	if addr == "" {
 		t.Fatalf("serve did not start:\n%s", logs.String())
 	}
@@ -119,7 +101,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 
 	t.Run("restore --latest brings the registry back from the bucket", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		env := s3Env(fake, nil)
+		env := regtest.S3Env(fake, backupAdmin, nil)
 		code := Run(context.Background(), []string{"restore", "--latest", "--data", newDisk}, &stdout, &stderr, func(k string) string { return env[k] })
 		if code != 0 || !strings.Contains(stdout.String(), "1 repositories, 1 revisions") {
 			t.Fatalf("restore: %d %q %q", code, stdout.String(), stderr.String())
@@ -131,7 +113,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 			t.Fatalf("second restore: %d %q", code, stderr.String())
 		}
 
-		logs, addr, stop := runServe(t, newDisk, s3Env(fake, nil))
+		logs, addr, stop := regtest.RunServe(t, Run, newDisk, regtest.S3Env(fake, backupAdmin, nil))
 		if addr == "" {
 			t.Fatalf("serve after restore did not start:\n%s", logs.String())
 		}
@@ -152,7 +134,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 
 	t.Run("REGISTRY_RESTORE_IF_EMPTY does the same at start, once", func(t *testing.T) {
 		emptyDisk := t.TempDir()
-		logs, addr, stop := runServe(t, emptyDisk, s3Env(fake, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
+		logs, addr, stop := regtest.RunServe(t, Run, emptyDisk, regtest.S3Env(fake, backupAdmin, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
 		if addr == "" {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}
@@ -167,7 +149,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 			t.Fatalf("push: %s", errOut)
 		}
 		stop()
-		logs, addr, stop = runServe(t, emptyDisk, s3Env(fake, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
+		logs, addr, stop = regtest.RunServe(t, Run, emptyDisk, regtest.S3Env(fake, backupAdmin, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
 		defer stop()
 		if strings.Contains(logs.String(), "restored the metadata database") {
 			t.Fatal("a restart restored over an existing database")
@@ -179,7 +161,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 
 	t.Run("with no backup to restore, a registry simply starts new", func(t *testing.T) {
 		fresh := blobtest.NewFakeS3(t)
-		logs, addr, stop := runServe(t, t.TempDir(), s3Env(fresh, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), regtest.S3Env(fresh, backupAdmin, map[string]string{"REGISTRY_RESTORE_IF_EMPTY": "true"}))
 		if addr == "" {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}
@@ -193,7 +175,7 @@ func TestBackupThenLoseTheDiskThenRestore(t *testing.T) {
 func TestRestoreFromAFile(t *testing.T) {
 	t.Parallel()
 	src := t.TempDir()
-	logs, addr, stop := runServe(t, src, map[string]string{"REGISTRY_ADMIN_TOKEN": backupAdmin})
+	logs, addr, stop := regtest.RunServe(t, Run, src, map[string]string{"REGISTRY_ADMIN_TOKEN": backupAdmin})
 	if addr == "" {
 		t.Fatalf("serve did not start:\n%s", logs.String())
 	}
@@ -257,46 +239,56 @@ func TestScheduledBackupsRunAndPrune(t *testing.T) {
 	defer func() { _ = reg.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// The test is the clock: it sends each tick, and it reads each line the
+	// loop logs, which is how it knows the loop has finished with that tick.
+	// Nothing here waits for time to pass.
+	const keep = 2
+	tick := make(chan time.Time)
+	logged := make(logLines)
 	finished := make(chan struct{})
 	go func() {
-		// Backup names carry one-second resolution, so run slower than that.
-		runBackups(ctx, reg, 1100*time.Millisecond, 2, slog.New(slog.NewTextHandler(io.Discard, nil)))
-		close(finished)
+		defer close(finished)
+		runBackups(ctx, reg, tick, keep, slog.New(logged))
 	}()
-	deadline := time.Now().Add(20 * time.Second)
+
 	seen := map[string]bool{}
-	for len(seen) < 3 {
+	for n := 1; n <= keep+1; n++ {
+		tick <- time.Time{}
+		if line := <-logged; line.Level != slog.LevelInfo {
+			t.Fatalf("tick %d: the loop logged %q at level %s, want the backup it stored", n, line.Message, line.Level)
+		}
 		list, err := reg.Backups(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// A new backup is stored before the oldest is removed, so one more
-		// than the limit can be seen for a moment.
-		if len(list) > 3 {
-			t.Fatalf("%d backups present, limit is 2", len(list))
+		// The loop is back waiting for a tick, so nothing is in flight and
+		// the limit holds exactly.
+		if want := min(n, keep); len(list) != want {
+			t.Fatalf("after tick %d: %d backups stored, want %d (the limit is %d): %v", n, len(list), want, keep, list)
 		}
-		for _, b := range list {
-			seen[b.Name] = true
+		newest := list[len(list)-1].Name
+		if seen[newest] {
+			t.Fatalf("after tick %d: the newest backup is still %s; the tick stored nothing new", n, newest)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d scheduled backups ran", len(seen))
-		}
-		time.Sleep(100 * time.Millisecond)
+		seen[newest] = true
 	}
+
+	// The schedule stops when its context does.
 	cancel()
-	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the schedule did not stop when the server did")
-	}
-	// With the schedule stopped nothing is in flight: the limit holds exactly.
-	list, err := reg.Backups(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(list) > 2 {
-		t.Fatalf("%d backups kept, limit is 2", len(list))
-	}
+	<-finished
+}
+
+// logLines is a log handler that hands every record to whoever reads the
+// channel, and waits until it is read.
+type logLines chan slog.Record
+
+func (l logLines) Enabled(context.Context, slog.Level) bool { return true }
+func (l logLines) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l logLines) WithGroup(string) slog.Handler            { return l }
+func (l logLines) Handle(_ context.Context, r slog.Record) error {
+	l <- r
+	return nil
 }
 
 func TestBackupSettings(t *testing.T) {

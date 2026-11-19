@@ -8,17 +8,15 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/model-delivery/registry/internal/blob/blobtest"
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 	"github.com/model-delivery/registry/internal/server"
 )
 
@@ -31,21 +29,8 @@ type fixture struct {
 
 func newFixture(t *testing.T, upstream string) *fixture {
 	t.Helper()
-	data := t.TempDir()
-	reg, err := registry.Open(data, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	admin, err := reg.CreateToken(context.Background(), "admin", registry.RoleAdmin)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(server.New(reg, server.Config{AnonymousRead: true, Upstream: upstream}))
-	t.Cleanup(func() {
-		srv.Close()
-		_ = reg.Close()
-	})
-	return &fixture{url: srv.URL, admin: admin, reg: reg, data: data}
+	in := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: upstream})
+	return &fixture{url: in.URL, admin: in.Admin, reg: in.Reg, data: in.Data}
 }
 
 // run executes modelctl against the fixture and returns exit code, stdout
@@ -221,53 +206,22 @@ func TestTokenLifecycle(t *testing.T) {
 func TestServeWithS3Storage(t *testing.T) {
 	t.Parallel()
 	fake := blobtest.NewFakeS3(t)
-	env := map[string]string{
-		"REGISTRY_STORAGE":       "s3",
-		"REGISTRY_S3_ENDPOINT":   fake.Config.Endpoint,
-		"REGISTRY_S3_BUCKET":     fake.Config.Bucket,
-		"REGISTRY_S3_PREFIX":     "prod",
-		"REGISTRY_S3_ACCESS_KEY": fake.Config.AccessKey,
-		"REGISTRY_S3_SECRET_KEY": fake.Config.SecretKey,
-		"REGISTRY_S3_REGION":     "us-east-1",
-		"REGISTRY_ADMIN_TOKEN":   "md_admin_token_for_the_s3_test",
-	}
+	const admin = "md_admin_token_for_the_s3_test"
 	data := t.TempDir()
-	ctx, cancel := context.WithCancel(context.Background())
-	logs := &syncBuffer{}
-	done := make(chan int, 1)
-	go func() {
-		done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
-			func(k string) string { return env[k] })
-	}()
-	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
-	var addr string
-	for deadline := time.Now().Add(10 * time.Second); addr == ""; {
-		if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
-			addr = m[1]
-			break
-		}
-		select {
-		case code := <-done:
-			t.Fatalf("serve exited early with code %d:\n%s", code, logs.String())
-		case <-time.After(20 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("serve did not start:\n%s", logs.String())
-		}
+	logs, addr, stop := regtest.RunServe(t, Run, data, regtest.S3Env(fake, admin, nil))
+	if addr == "" {
+		t.Fatalf("serve exited early with code %d:\n%s", stop(), logs.String())
 	}
 
-	var stdout, stderr bytes.Buffer
-	clientEnv := map[string]string{"MODELCTL_ENDPOINT": "http://" + addr, "MODELCTL_TOKEN": env["REGISTRY_ADMIN_TOKEN"]}
-	code := Run(context.Background(), []string{"push", modelDir(t), "acme/tiny"}, &stdout, &stderr, func(k string) string { return clientEnv[k] })
-	if code != 0 {
-		t.Fatalf("push to an S3-backed registry failed: %s", stderr.String())
+	if code, _, errOut := ctl(t, addr, admin, "push", modelDir(t), "acme/tiny"); code != 0 {
+		t.Fatalf("push to an S3-backed registry failed: %s", errOut)
 	}
 	keys := fake.Keys(t)
 	if len(keys) != 2 {
 		t.Fatalf("bucket holds %v, want the two pushed files", keys)
 	}
 	for _, k := range keys {
-		if !strings.HasPrefix(k, "prod/sha256/") {
+		if !strings.HasPrefix(k, regtest.S3Prefix+"/sha256/") {
 			t.Errorf("object %q is not under the configured prefix", k)
 		}
 	}
@@ -278,8 +232,7 @@ func TestServeWithS3Storage(t *testing.T) {
 	if strings.Contains(logs.String(), fake.Config.SecretKey) {
 		t.Error("the S3 secret key was written to the log")
 	}
-	cancel()
-	if code := <-done; code != 0 {
+	if code := stop(); code != 0 {
 		t.Fatalf("serve exit code %d:\n%s", code, logs.String())
 	}
 }
@@ -314,69 +267,20 @@ func TestServeStorageConfigurationErrors(t *testing.T) {
 	}
 }
 
-// syncBuffer lets the test read what the server logs while it runs.
-type syncBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
-}
-
 func TestServeFirstStartAndRestart(t *testing.T) {
 	t.Parallel()
 	data := t.TempDir()
-	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
 	tokenRe := regexp.MustCompile(`md_[0-9a-f]{48}`)
 
-	serve := func(env map[string]string) (logs *syncBuffer, addr string, stop func() int) {
-		ctx, cancel := context.WithCancel(context.Background())
-		logs = &syncBuffer{}
-		done := make(chan int, 1)
-		go func() {
-			done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
-				func(k string) string { return env[k] })
-		}()
-		deadline := time.Now().Add(10 * time.Second)
-		for addr == "" {
-			if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
-				addr = m[1]
-				break
-			}
-			select {
-			case code := <-done:
-				t.Fatalf("serve exited early with code %d:\n%s", code, logs.String())
-			case <-time.After(20 * time.Millisecond):
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("serve did not start:\n%s", logs.String())
-			}
+	serve := func(env map[string]string) (logs *regtest.LogBuffer, addr string, stop func() int) {
+		logs, addr, stop = regtest.RunServe(t, Run, data, env)
+		if addr == "" {
+			t.Fatalf("serve exited early with code %d:\n%s", stop(), logs.String())
 		}
-		return logs, addr, func() int {
-			cancel()
-			return <-done
-		}
+		return logs, addr, stop
 	}
 	status := func(addr, path, token string) int {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+path, nil)
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode
+		return regtest.Status(t, "http://"+addr+path, token)
 	}
 
 	// First start mints an admin token and prints it.
@@ -420,51 +324,6 @@ func TestServeFirstStartAndRestart(t *testing.T) {
 	stop()
 }
 
-// runServe starts `modelctl serve` on a free port and returns its log, the
-// address it listens on ("" if it exited instead) and a function that stops
-// it and returns the exit code.
-func runServe(t *testing.T, data string, env map[string]string) (logs *syncBuffer, addr string, stop func() int) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	logs = &syncBuffer{}
-	done := make(chan int, 1)
-	go func() {
-		done <- Run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, &bytes.Buffer{}, logs,
-			func(k string) string { return env[k] })
-	}()
-	addrRe := regexp.MustCompile(`addr=(127\.0\.0\.1:\d+)`)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if m := addrRe.FindStringSubmatch(logs.String()); m != nil {
-			return logs, m[1], func() int { cancel(); return <-done }
-		}
-		select {
-		case code := <-done:
-			cancel()
-			return logs, "", func() int { return code }
-		case <-time.After(20 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatalf("serve neither started nor exited:\n%s", logs.String())
-		}
-	}
-}
-
-func httpStatus(t *testing.T, addr, path, token string) int {
-	t.Helper()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+path, nil)
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	return resp.StatusCode
-}
-
 // On a platform that collects logs, the admin token is supplied, usually
 // from a mounted secret, and must never be generated and printed.
 func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
@@ -483,12 +342,12 @@ func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
 	t.Run("token read from a file, as a mounted secret provides it", func(t *testing.T) {
 		t.Parallel()
 		// Secret files end with a newline; it is not part of the token.
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied+"\n")})
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied+"\n")})
 		if addr == "" {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}
 		defer stop()
-		if got := httpStatus(t, addr, "/api/v1/tokens", supplied); got != http.StatusOK {
+		if got := regtest.Status(t, "http://"+addr+"/api/v1/tokens", supplied); got != http.StatusOK {
 			t.Fatalf("token from the file was refused: %d", got)
 		}
 		if strings.Contains(logs.String(), supplied) || generated.MatchString(logs.String()) {
@@ -498,7 +357,7 @@ func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
 
 	t.Run("required but not supplied: refuses to start and prints no token", func(t *testing.T) {
 		t.Parallel()
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
 		if code := stop(); addr != "" || code == 0 {
 			t.Fatalf("serve started (addr %q, exit %d) without an admin token", addr, code)
 		}
@@ -512,7 +371,7 @@ func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
 
 	t.Run("required and supplied: starts", func(t *testing.T) {
 		t.Parallel()
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{
 			"REGISTRY_REQUIRE_ADMIN_TOKEN": "true", "REGISTRY_ADMIN_TOKEN_FILE": secretFile(t, supplied),
 		})
 		if addr == "" {
@@ -524,17 +383,17 @@ func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
 	t.Run("required, nothing supplied, but tokens exist from an earlier run: starts", func(t *testing.T) {
 		t.Parallel()
 		data := t.TempDir()
-		_, addr, stop := runServe(t, data, map[string]string{"REGISTRY_ADMIN_TOKEN": supplied})
+		_, addr, stop := regtest.RunServe(t, Run, data, map[string]string{"REGISTRY_ADMIN_TOKEN": supplied})
 		if addr == "" {
 			t.Fatal("first run did not start")
 		}
 		stop()
-		logs, addr, stop := runServe(t, data, map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
+		logs, addr, stop := regtest.RunServe(t, Run, data, map[string]string{"REGISTRY_REQUIRE_ADMIN_TOKEN": "true"})
 		if addr == "" {
 			t.Fatalf("restart refused although an admin token already exists:\n%s", logs.String())
 		}
 		defer stop()
-		if got := httpStatus(t, addr, "/api/v1/tokens", supplied); got != http.StatusOK {
+		if got := regtest.Status(t, "http://"+addr+"/api/v1/tokens", supplied); got != http.StatusOK {
 			t.Fatalf("existing admin token refused after restart: %d", got)
 		}
 	})
@@ -547,7 +406,7 @@ func TestServeAdminTokenForContainerPlatforms(t *testing.T) {
 	} {
 		t.Run("rejects "+name, func(t *testing.T) {
 			t.Parallel()
-			logs, addr, stop := runServe(t, t.TempDir(), env)
+			logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), env)
 			if code := stop(); addr != "" || code == 0 {
 				t.Fatalf("serve started (addr %q, exit %d)", addr, code)
 			}

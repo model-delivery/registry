@@ -218,7 +218,7 @@ All `admin`.
 |---|---|
 | `GET /api/v1/tokens` | List tokens: `name`, `role`, `created_at`. Secrets are never returned. |
 | `POST /api/v1/tokens` | Body `{"name": "ci", "role": "write"}`. Returns the token secret, once. |
-| `DELETE /api/v1/tokens/{name}` | Revoke. |
+| `DELETE /api/v1/tokens/{name}` | Revoke. Answers `204` with no body. |
 
 ## Backups
 

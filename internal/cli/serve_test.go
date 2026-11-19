@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/model-delivery/registry/internal/regtest"
 )
 
 func TestSizeLimitSettings(t *testing.T) {
@@ -63,12 +65,12 @@ func TestServeWarnsAboutAShortAdminToken(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": tc.token})
+			logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": tc.token})
 			if addr == "" {
 				t.Fatalf("serve did not start with a %d-character admin token:\n%s", len(tc.token), logs.String())
 			}
 			defer stop()
-			if got := httpStatus(t, addr, "/api/v1/tokens", tc.token); got != http.StatusOK {
+			if got := regtest.Status(t, "http://"+addr+"/api/v1/tokens", tc.token); got != http.StatusOK {
 				t.Fatalf("the supplied token was refused: %d", got)
 			}
 			out := logs.String()
@@ -94,7 +96,7 @@ func TestServeSizeLimits(t *testing.T) {
 
 	t.Run("REGISTRY_MAX_BLOB_BYTES refuses a larger upload", func(t *testing.T) {
 		t.Parallel()
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": admin, "REGISTRY_MAX_BLOB_BYTES": "1000"})
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": admin, "REGISTRY_MAX_BLOB_BYTES": "1000"})
 		if addr == "" {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}
@@ -111,7 +113,7 @@ func TestServeSizeLimits(t *testing.T) {
 		if code, _, errOut := hub.run(t, hub.admin, "push", src, "acme/tiny"); code != 0 {
 			t.Fatalf("seed the upstream: %s", errOut)
 		}
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{
 			"REGISTRY_ADMIN_TOKEN": admin, "REGISTRY_UPSTREAM": hub.url,
 			"REGISTRY_PULL_THROUGH": "true", "REGISTRY_PULL_THROUGH_MAX_FILE_BYTES": "1000",
 		})
@@ -119,7 +121,7 @@ func TestServeSizeLimits(t *testing.T) {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}
 		defer stop()
-		if got := httpStatus(t, addr, "/acme/tiny/resolve/main/config.json", ""); got != http.StatusOK {
+		if got := regtest.Status(t, "http://"+addr+"/acme/tiny/resolve/main/config.json", ""); got != http.StatusOK {
 			t.Fatalf("a small file: status %d", got)
 		}
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+"/acme/tiny/resolve/main/sub/weights.bin", nil)
@@ -136,7 +138,7 @@ func TestServeSizeLimits(t *testing.T) {
 
 	t.Run("neither set: no limit", func(t *testing.T) {
 		t.Parallel()
-		logs, addr, stop := runServe(t, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": admin})
+		logs, addr, stop := regtest.RunServe(t, Run, t.TempDir(), map[string]string{"REGISTRY_ADMIN_TOKEN": admin})
 		if addr == "" {
 			t.Fatalf("serve did not start:\n%s", logs.String())
 		}

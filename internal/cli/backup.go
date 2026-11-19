@@ -4,14 +4,10 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
-	"log/slog"
-	"net/http"
 	"os"
-	"text/tabwriter"
-	"time"
 
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 )
 
@@ -28,32 +24,16 @@ func cmdBackup(e *env, args []string) error {
 		if _, err := c.parse(args[1:], 0, 0); err != nil {
 			return err
 		}
-		raw, err := c.client().Raw(e.ctx, http.MethodPost, "/api/v1/backups", nil)
+		res, err := c.client().BackupNow(e.ctx)
 		if err != nil {
 			return err
 		}
 		if c.jsonOut {
-			return c.printJSON(raw)
+			return c.printJSON(res.Raw)
 		}
-		var out struct {
-			Backup struct {
-				Name string `json:"name"`
-				Size int64  `json:"size"`
-			} `json:"backup"`
-			Contents struct {
-				Repos     int `json:"repos"`
-				Revisions int `json:"revisions"`
-			} `json:"contents"`
-			// Warning is set when the backup was stored and something
-			// after that went wrong, such as removing old backups.
-			Warning string `json:"warning"`
-		}
-		_ = json.Unmarshal(raw, &out)
 		fmt.Fprintf(e.stdout, "Stored backup %s (%s): %d repositories, %d revisions\n",
-			out.Backup.Name, humanBytes(out.Backup.Size), out.Contents.Repos, out.Contents.Revisions)
-		if out.Warning != "" {
-			fmt.Fprintf(e.stderr, "Warning: %s\n", out.Warning)
-		}
+			res.Backup.Name, kit.HumanBytes(res.Backup.Size), res.Contents.Repos, res.Contents.Revisions)
+		c.warn(res.Warning)
 		return nil
 
 	case "list":
@@ -61,29 +41,21 @@ func cmdBackup(e *env, args []string) error {
 		if _, err := c.parse(args[1:], 0, 0); err != nil {
 			return err
 		}
-		raw, err := c.client().Raw(e.ctx, http.MethodGet, "/api/v1/backups", nil)
+		list, err := c.client().ListBackups(e.ctx)
 		if err != nil {
 			return err
 		}
 		if c.jsonOut {
-			return c.printJSON(raw)
+			return c.printJSON(list.Raw)
 		}
-		var out struct {
-			Backups []struct {
-				Name      string    `json:"name"`
-				Size      int64     `json:"size"`
-				CreatedAt time.Time `json:"created_at"`
-			} `json:"backups"`
-		}
-		_ = json.Unmarshal(raw, &out)
-		if len(out.Backups) == 0 {
+		if len(list.Backups) == 0 {
 			fmt.Fprintln(e.stdout, "No stored backups. Take one with: modelctl backup now")
 			return nil
 		}
-		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+		tw := c.table()
 		fmt.Fprintln(tw, "BACKUP\tSIZE\tCREATED")
-		for _, b := range out.Backups {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", b.Name, humanBytes(b.Size), b.CreatedAt.Local().Format("2006-01-02 15:04"))
+		for _, b := range list.Backups {
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", b.Name, kit.HumanBytes(b.Size), localTime(b.CreatedAt))
 		}
 		return tw.Flush()
 
@@ -93,7 +65,7 @@ func cmdBackup(e *env, args []string) error {
 		if err != nil {
 			return err
 		}
-		n, err := c.client().Download(e.ctx, "/api/v1/backup/snapshot", pos[0])
+		n, err := c.client().DownloadSnapshot(e.ctx, pos[0])
 		if err != nil {
 			return err
 		}
@@ -107,7 +79,7 @@ func cmdBackup(e *env, args []string) error {
 			return c.printJSON(map[string]any{"file": pos[0], "size": n, "contents": info})
 		}
 		fmt.Fprintf(e.stdout, "Saved a verified snapshot to %s (%s): %d repositories, %d revisions\n",
-			pos[0], humanBytes(n), info.Repos, info.Revisions)
+			pos[0], kit.HumanBytes(n), info.Repos, info.Revisions)
 		return nil
 	}
 	return usagef("unknown subcommand %q: expected now, list or download", args[0])
@@ -115,8 +87,9 @@ func cmdBackup(e *env, args []string) error {
 
 func cmdRestore(e *env, args []string) error {
 	c := newCommand(e, "restore", "restore <snapshot file> | --latest | --name <backup>   [flags]")
-	data := c.String("data", e.envOr("REGISTRY_DATA", "./data"), "data directory to restore into (env REGISTRY_DATA)")
-	storage := c.String("storage", e.envOr("REGISTRY_STORAGE", "filesystem"), "where stored backups are kept: filesystem or s3 (env REGISTRY_STORAGE), configured as for serve")
+	c.notes = restoreEnvOnlyNote
+	data := c.String("data", e.envOr("REGISTRY_DATA", defaultDataDir), "data directory to restore into (env REGISTRY_DATA)")
+	storage := c.storageFlags("where stored backups are kept: filesystem or s3 (env REGISTRY_STORAGE), configured as for serve")
 	latest := c.Bool("latest", false, "restore the newest backup in the registry's storage")
 	name := c.String("name", "", "restore this stored backup (see modelctl backup list)")
 	replace := c.Bool("replace", false, "restore over an existing database, which is kept beside it")
@@ -132,10 +105,9 @@ func cmdRestore(e *env, args []string) error {
 
 	var res registry.Restored
 	if fromStorage {
-		// The storage backend, quietly: its start-up line is not this
-		// command's output. Opening it removes nothing, so this is safe
+		// Opening the storage backend removes nothing, so this is safe
 		// beside a registry that is running on the same data directory.
-		store, _, err := openStore(e, *data, *storage, slog.New(slog.DiscardHandler))
+		store, err := storage.open(e, *data)
 		if err != nil {
 			return err
 		}

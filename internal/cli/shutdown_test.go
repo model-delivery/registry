@@ -5,8 +5,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -21,6 +19,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/registry"
 	"github.com/model-delivery/registry/internal/server"
 )
@@ -91,7 +90,6 @@ func heldHub(t *testing.T) (hubURL string, fetching chan struct{}) {
 	t.Helper()
 	const revision = "2222222222222222222222222222222222222222"
 	const size = 1 << 20
-	sum := sha256.Sum256([]byte("never sent in full"))
 	fetching = make(chan struct{})
 	var once sync.Once
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +99,7 @@ func heldHub(t *testing.T) (hubURL string, fetching chan struct{}) {
 		case strings.HasPrefix(r.URL.Path, "/api/models/acme/held/tree/"):
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"type": "file", "path": "model.bin", "size": size, "oid": strings.Repeat("a", 40),
-				"lfs": map[string]any{"oid": hex.EncodeToString(sum[:]), "size": size},
+				"lfs": map[string]any{"oid": kit.SHA256Hex("never sent in full"), "size": size},
 			}})
 		case strings.HasSuffix(r.URL.Path, "/model.bin"):
 			_, _ = io.WriteString(w, "the first bytes, and then nothing")
@@ -167,10 +165,13 @@ func TestServeStopsItsOwnWorkBeforeTheRegistryCloses(t *testing.T) { //nolint:pa
 	const grace = 20 * time.Second
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
+	// One tick, already due: the backup starts as soon as the loop does.
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
 	served := make(chan error, 1)
 	go func() {
 		served <- serve(ctx, &http.Server{Handler: handler, ReadHeaderTimeout: readHeaderTimeout}, ln, handler,
-			func(ctx context.Context) { runBackups(ctx, reg, 10*time.Millisecond, 0, log) }, grace, log)
+			func(ctx context.Context) { runBackups(ctx, reg, tick, 0, log) }, grace, log)
 	}()
 
 	// A client asks for a file the registry has to fetch, and waits.

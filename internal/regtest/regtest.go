@@ -145,19 +145,19 @@ const (
 )
 
 // RunServe starts `modelctl serve` on a free port with data as its data
-// directory and env as its environment. It returns the server's log, the
-// address it listens on, and a function that stops it and returns its exit
-// code. If the server exits instead of starting, addr is empty and stop
-// returns the code it exited with. A server still running when the test
-// ends is stopped then.
-func RunServe(t testing.TB, run RunFunc, data string, env map[string]string) (logs *LogBuffer, addr string, stop func() int) {
+// directory, env as its environment and flags as further arguments. It
+// returns the server's log, the address it listens on, and a function that
+// stops it and returns its exit code. If the server exits instead of
+// starting, addr is empty and stop returns the code it exited with. A
+// server still running when the test ends is stopped then.
+func RunServe(t testing.TB, run RunFunc, data string, env map[string]string, flags ...string) (logs *LogBuffer, addr string, stop func() int) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	logs = &LogBuffer{}
 	exited := make(chan int, 1)
+	args := append([]string{"serve", "--addr", "127.0.0.1:0", "--data", data}, flags...)
 	go func() {
-		exited <- run(ctx, []string{"serve", "--addr", "127.0.0.1:0", "--data", data}, io.Discard, logs,
-			func(k string) string { return env[k] })
+		exited <- run(ctx, args, io.Discard, logs, func(k string) string { return env[k] })
 	}()
 	var once sync.Once
 	var code int

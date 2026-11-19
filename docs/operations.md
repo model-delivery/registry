@@ -1,5 +1,28 @@
 # Operations
 
+## Settings
+
+`modelctl serve` takes each setting as a flag or as an environment
+variable, and `modelctl serve --help` lists them with their defaults. The
+[README](../README.md#configuration) has the table. Three things hold for
+all of them:
+
+- **A flag wins over its variable.** This document mostly shows the
+  variables, since that is how a container or a service unit is configured;
+  the flag of the same name does the same (`REGISTRY_BACKUP_INTERVAL` is
+  `--backup-interval`, `REGISTRY_S3_BUCKET` is `--s3-bucket`).
+- **Secrets have no flag.** The admin token, the upstream token and the S3
+  keys are read from the environment only, because a command line shows in
+  the process list and in shell history.
+- **A value the server cannot read stops it.** It exits with an error that
+  names the setting, instead of starting with something other than what
+  you wrote. That includes the on/off settings: `true`, `false`, `1`, `0`,
+  `yes`, `no`, `on` and `off` are accepted, in any case, and anything else
+  is an error. Before v0.3.1 any other value, `yes` and `on` among them,
+  was read as off without a word: `REGISTRY_REQUIRE_AUTH=yes` started a
+  registry open to everyone. If you upgrade and the server now refuses to
+  start over one of these, the setting was not in effect before.
+
 ## Sizing
 
 The registry itself is small: one process, tens of megabytes of memory,
@@ -30,6 +53,9 @@ For Cloudflare R2, the endpoint is `https://<account id>.r2.cloudflarestorage.co
 is `auto`. R2 does not charge for downloads, which makes it a good fit for redirected downloads
 (below).
 
+Everything here but the two keys can also be given as a flag:
+`--storage s3 --s3-bucket my-models --s3-endpoint ... --s3-region us-east-1`.
+
 The bucket must exist; the registry does not create it. It checks the
 bucket at start and exits with a clear message if it cannot reach it.
 
@@ -54,7 +80,8 @@ The registry needs these permissions on the bucket, and nothing more:
   (a mirror fetches four files in parallel).
 
 **Redirected downloads.** By default the registry streams files from the
-bucket to the client. Set `REGISTRY_S3_REDIRECT=true` to have it answer
+bucket to the client. Set `REGISTRY_S3_REDIRECT=true` (or pass
+`--s3-redirect`) to have it answer
 with a redirect to a signed bucket URL instead, valid for one hour, so
 clients download directly from the object store and the registry carries
 no file traffic. Use this when:
@@ -317,17 +344,19 @@ whether or not a file is ever downloaded. Close that with either or both
 of:
 
 - `--require-auth`, so only token holders can read, and therefore fetch;
-- `REGISTRY_PULL_THROUGH_ALLOW`, a comma-separated list of patterns over
-  the repository id, such as `meta-llama/*,google/*,*/*-GGUF`. Repositories
-  that match nothing are served only if already stored.
+- `--pull-through-allow` (or `REGISTRY_PULL_THROUGH_ALLOW`), a
+  comma-separated list of patterns over the repository id, such as
+  `meta-llama/*,google/*,*/*-GGUF`. Repositories that match nothing are
+  served only if already stored.
 
 The server logs a warning at start if pull-through is on with neither.
 
 An allow list limits which repositories can be fetched, not how much of
 them. Two further bounds:
 
-- `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` is the largest file fetched on
-  demand, in bytes; unset or `0` means no limit. A download of a larger
+- `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` (or
+  `--pull-through-max-file-bytes`) is the largest file fetched on demand,
+  in bytes; unset or `0` means no limit. A download of a larger
   file is refused with an error that names this setting and the
   `modelctl mirror` command that fetches the file deliberately. Listings
   and file metadata for such a file still answer.
@@ -383,8 +412,8 @@ The registry backs up the database itself. It does not copy model files.
 ### Scheduled backups
 
 ```bash
-REGISTRY_BACKUP_INTERVAL=1h   # off unless set; at least 1m
-REGISTRY_BACKUP_KEEP=48       # how many to keep (default 48; 0 keeps all)
+REGISTRY_BACKUP_INTERVAL=1h   # off unless set; at least 1m (--backup-interval)
+REGISTRY_BACKUP_KEEP=48       # how many to keep (default 48; 0 keeps all) (--backup-keep)
 ```
 
 Every interval the server takes a consistent snapshot while it keeps
@@ -430,8 +459,9 @@ modelctl restore --name registry-20261118T140000Z.db
 modelctl restore snap.db                # a downloaded snapshot
 ```
 
-`restore` takes `--data` and the same `REGISTRY_STORAGE` and
-`REGISTRY_S3_*` settings as `serve`, so it finds the stored backups. It
+`restore` takes `--data` and the same storage settings as `serve`
+(`--storage` and the `--s3-*` flags, or `REGISTRY_STORAGE` and the
+`REGISTRY_S3_*` variables), so it finds the stored backups. It
 verifies the snapshot first, and refuses a file that is damaged, is not a
 registry database, or was written by a newer version. It will not
 overwrite an existing database unless you pass `--replace`, and then the
@@ -445,7 +475,7 @@ the restore fails, the old database is put back where it was.
 With S3 storage the server's disk holds only the database. Set
 
 ```bash
-REGISTRY_RESTORE_IF_EMPTY=true
+REGISTRY_RESTORE_IF_EMPTY=true   # or pass --restore-if-empty
 ```
 
 and a server that starts with no database restores the newest stored
@@ -507,7 +537,18 @@ modelctl gc                            # removes files nothing references (faile
 ```
 
 `gc` leaves files newer than one hour alone, in case a push is still in
-progress.
+progress. `delete` leaves a file alone for the same hour only if a push or
+mirror has just stored it again or asked about it; a later `gc` removes it
+if nothing came to use it.
+
+If storage refuses to remove some of the files, the command has still done
+what it was asked (the repository is deleted, the rest is freed): it exits
+`0` and prints a warning on standard error, and the server's log has the
+reason. What was left behind is wasted space and nothing more: the
+registry has already dropped its record of those files, so no revision can
+refer to them, and a later `gc` does not look for them. The log names the
+first file that could not be removed, by its digest; once the storage is
+put right, remove what is left by hand.
 
 ## Checking stored files
 
@@ -607,8 +648,8 @@ small, and is held to that:
 
 | What | Limit |
 |---|---|
-| One uploaded file | `REGISTRY_MAX_BLOB_BYTES`, in bytes. Unset or `0`: no limit. |
-| One file fetched by pull-through | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES`. Unset or `0`: no limit. See [pull-through caching](#pull-through-caching). |
+| One uploaded file | `REGISTRY_MAX_BLOB_BYTES` (`--max-blob-bytes`), in bytes. Unset or `0`: no limit. |
+| One file fetched by pull-through | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` (`--pull-through-max-file-bytes`). Unset or `0`: no limit. See [pull-through caching](#pull-through-caching). |
 | A commit from a Hugging Face client (`hf upload`, `create_commit`) | 4 GiB for the whole request, which carries only the files of 10 MiB or less; larger files travel separately and are not counted. |
 | A JSON request to the API | 64 MiB, and the body must arrive within 30 seconds. |
 | A web UI form | 64 KiB, and the body must arrive within 30 seconds. |

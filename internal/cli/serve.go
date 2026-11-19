@@ -23,21 +23,81 @@ import (
 	"github.com/model-delivery/registry/internal/server"
 )
 
+// How the server is configured.
+//
+// Every setting that is not a secret has a flag and an environment
+// variable: the flag wins, and the variable is the flag's default, which
+// is why --help shows the value in effect. Secrets (the admin token, the
+// upstream token, the S3 keys) are read from the environment only, because
+// a command line shows in the process list and in shell history.
+
+// Defaults of the server's settings.
+const (
+	defaultAddr    = ":8080"
+	defaultDataDir = "./data"
+	// defaultBackupKeep is how many scheduled backups are kept: two days of
+	// hourly ones.
+	defaultBackupKeep = 48
+	// minBackupInterval is the most often scheduled backups may run.
+	minBackupInterval = time.Minute
+)
+
+// The kinds of storage for model files.
+const (
+	storageFilesystem = "filesystem"
+	storageS3         = "s3"
+)
+
+// What --help says about the settings that have no flag.
+const (
+	restoreEnvOnlyNote = `S3 keys are read from the environment only, never from flags, because a
+command line shows in the process list and in shell history:
+  REGISTRY_S3_ACCESS_KEY, REGISTRY_S3_SECRET_KEY
+      (or AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN)
+`
+	serveEnvOnlyNote = `Secrets are read from the environment only, never from flags, because a
+command line shows in the process list and in shell history:
+  REGISTRY_ADMIN_TOKEN        the admin token, applied at every start
+  REGISTRY_ADMIN_TOKEN_FILE   or a file that holds it, such as a mounted secret
+  REGISTRY_UPSTREAM_TOKEN     token for the upstream hub, for private and gated models
+  REGISTRY_S3_ACCESS_KEY, REGISTRY_S3_SECRET_KEY
+      (or AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN)
+`
+)
+
 func cmdServe(e *env, args []string) error {
 	c := newCommand(e, "serve", "serve [flags]")
-	addr := c.String("addr", e.envOr("REGISTRY_ADDR", ":8080"), "listen address (env REGISTRY_ADDR)")
-	data := c.String("data", e.envOr("REGISTRY_DATA", "./data"), "directory for the database and stored files (env REGISTRY_DATA)")
+	c.notes = serveEnvOnlyNote
+	addr := c.String("addr", e.envOr("REGISTRY_ADDR", defaultAddr), "listen address (env REGISTRY_ADDR)")
+	data := c.String("data", e.envOr("REGISTRY_DATA", defaultDataDir), "directory for the database and stored files (env REGISTRY_DATA)")
 	upstream := c.String("upstream", e.envOr("REGISTRY_UPSTREAM", mirror.DefaultEndpoint), "hub to mirror from (env REGISTRY_UPSTREAM)")
-	requireAuth := c.Bool("require-auth", envBool(e, "REGISTRY_REQUIRE_AUTH"), "require a token for downloads and browsing too (env REGISTRY_REQUIRE_AUTH)")
-	requireAdmin := c.Bool("require-admin-token", envBool(e, "REGISTRY_REQUIRE_ADMIN_TOKEN"), "refuse to start without a supplied admin token instead of generating one and printing it (env REGISTRY_REQUIRE_ADMIN_TOKEN); use where logs are collected")
-	pullThrough := c.Bool("pull-through", envBool(e, "REGISTRY_PULL_THROUGH"), "fetch a model from the upstream hub the first time a client asks for one the registry does not hold (env REGISTRY_PULL_THROUGH); limit which with REGISTRY_PULL_THROUGH_ALLOW")
-	storage := c.String("storage", e.envOr("REGISTRY_STORAGE", "filesystem"), "where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with REGISTRY_S3_* variables")
+	requireAuth := c.Bool("require-auth", c.envBool("REGISTRY_REQUIRE_AUTH"), "require a token for downloads and browsing too (env REGISTRY_REQUIRE_AUTH)")
+	requireAdmin := c.Bool("require-admin-token", c.envBool("REGISTRY_REQUIRE_ADMIN_TOKEN"), "refuse to start without a supplied admin token instead of generating one and printing it (env REGISTRY_REQUIRE_ADMIN_TOKEN); use where logs are collected")
+	pullThrough := c.Bool("pull-through", c.envBool("REGISTRY_PULL_THROUGH"), "fetch a model from the upstream hub the first time a client asks for one the registry does not hold (env REGISTRY_PULL_THROUGH); limit which with --pull-through-allow")
+	allowList := c.String("pull-through-allow", e.getenv("REGISTRY_PULL_THROUGH_ALLOW"), "repositories pull-through may fetch: comma-separated patterns over namespace/name, such as \"meta-llama/*,*/*-GGUF\"; empty allows all (env REGISTRY_PULL_THROUGH_ALLOW)")
+	pullMaxFile := c.Int64("pull-through-max-file-bytes", c.envBytes("REGISTRY_PULL_THROUGH_MAX_FILE_BYTES"), "largest file pull-through fetches on demand, in bytes; 0 for no limit (env REGISTRY_PULL_THROUGH_MAX_FILE_BYTES)")
+	maxBlob := c.Int64("max-blob-bytes", c.envBytes("REGISTRY_MAX_BLOB_BYTES"), "largest single file an upload may store, in bytes; 0 for no limit (env REGISTRY_MAX_BLOB_BYTES)")
+	envEvery, envKeep, err := backupSettings(e)
+	c.noteEnv(err)
+	backupEvery := c.Duration("backup-interval", envEvery, "take a metadata backup this often, such as 1h; at least a minute; 0 for no scheduled backups (env REGISTRY_BACKUP_INTERVAL)")
+	backupKeep := c.Int("backup-keep", envKeep, "how many stored backups to keep; 0 keeps every one (env REGISTRY_BACKUP_KEEP)")
+	restoreEmpty := c.Bool("restore-if-empty", c.envBool("REGISTRY_RESTORE_IF_EMPTY"), "when the data directory has no database, start from the newest stored backup (env REGISTRY_RESTORE_IF_EMPTY)")
+	storage := c.storageFlags("where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with the --s3-* flags")
+	s3Redirect := c.Bool("s3-redirect", c.envBool("REGISTRY_S3_REDIRECT"), "with s3 storage, answer downloads with a redirect to a signed URL on the object store instead of streaming them through the registry (env REGISTRY_S3_REDIRECT)")
 	if _, err := c.parse(args, 0, 0); err != nil {
 		return err
 	}
 	log := slog.New(slog.NewTextHandler(e.stderr, nil))
 
-	backupEvery, backupKeep, err := backupSettings(e)
+	if err := checkBackupSettings(*backupEvery, *backupKeep); err != nil {
+		return err
+	}
+	for name, limit := range map[string]int64{"--pull-through-max-file-bytes": *pullMaxFile, "--max-blob-bytes": *maxBlob} {
+		if limit < 0 {
+			return usagef("%s must be a whole number of bytes, 0 for no limit; got %d", name, limit)
+		}
+	}
+	allow, err := pullThroughAllow(*allowList)
 	if err != nil {
 		return err
 	}
@@ -47,11 +107,15 @@ func cmdServe(e *env, args []string) error {
 	if err := datadir.Dir(*data).ClearStaging(); err != nil {
 		return err
 	}
-	store, redirect, err := openStore(e, *data, *storage, log)
+	store, err := storage.open(e, *data)
 	if err != nil {
 		return err
 	}
-	if envBool(e, "REGISTRY_RESTORE_IF_EMPTY") {
+	redirect := *s3Redirect && *storage.kind == storageS3
+	if *storage.kind == storageS3 {
+		log.Info("storing model files in S3", "bucket", *storage.bucket, "endpoint", *storage.endpoint, "prefix", *storage.prefix, "redirect_downloads", redirect)
+	}
+	if *restoreEmpty {
 		if err := restoreIfEmpty(e, *data, store, log); err != nil {
 			return err
 		}
@@ -66,29 +130,10 @@ func cmdServe(e *env, args []string) error {
 	if err := bootstrapAdmin(e, reg, log, *requireAdmin); err != nil {
 		return err
 	}
-
-	var allow []string
-	for _, pattern := range strings.Split(e.getenv("REGISTRY_PULL_THROUGH_ALLOW"), ",") {
-		if pattern = strings.TrimSpace(pattern); pattern != "" {
-			if _, err := path.Match(pattern, "a/b"); err != nil {
-				return usagef("REGISTRY_PULL_THROUGH_ALLOW: %q is not a valid pattern", pattern)
-			}
-			allow = append(allow, pattern)
-		}
-	}
 	if *pullThrough && !*requireAuth && len(allow) == 0 {
 		// Anyone who can reach the registry can then make it download any
 		// public model, which is fine on a private network and not on a public one.
 		log.Warn("pull-through is on with open downloads and no allow list: anyone who can reach this registry can make it fetch and store any upstream model; set REGISTRY_REQUIRE_AUTH or REGISTRY_PULL_THROUGH_ALLOW unless the network is private")
-	}
-
-	pullMaxFile, err := envBytes(e, "REGISTRY_PULL_THROUGH_MAX_FILE_BYTES")
-	if err != nil {
-		return err
-	}
-	maxBlob, err := envBytes(e, "REGISTRY_MAX_BLOB_BYTES")
-	if err != nil {
-		return err
 	}
 
 	handler := server.New(reg, server.Config{
@@ -98,12 +143,12 @@ func cmdServe(e *env, args []string) error {
 		RedirectDownloads: redirect,
 		PullThrough:       *pullThrough,
 		PullThroughAllow:  allow,
-		BackupKeep:        backupKeep,
+		BackupKeep:        *backupKeep,
 		Version:           Version,
 		Logger:            log,
 
-		PullThroughMaxFileBytes: pullMaxFile,
-		MaxBlobBytes:            maxBlob,
+		PullThroughMaxFileBytes: *pullMaxFile,
+		MaxBlobBytes:            *maxBlob,
 	})
 	ln, err := (&net.ListenConfig{}).Listen(e.ctx, "tcp", *addr)
 	if err != nil {
@@ -117,9 +162,13 @@ func cmdServe(e *env, args []string) error {
 		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "version", Version)
 
 	var backups func(context.Context)
-	if backupEvery > 0 {
-		log.Info("scheduled metadata backups are on", "every", backupEvery.String(), "keep", backupKeep)
-		backups = func(ctx context.Context) { runBackups(ctx, reg, backupEvery, backupKeep, log) }
+	if *backupEvery > 0 {
+		log.Info("scheduled metadata backups are on", "every", backupEvery.String(), "keep", *backupKeep)
+		backups = func(ctx context.Context) {
+			ticker := time.NewTicker(*backupEvery)
+			defer ticker.Stop()
+			runBackups(ctx, reg, ticker.C, *backupKeep, log)
+		}
 	}
 	// The registry is closed (deferred, above) only after this returns.
 	return serve(e.ctx, srv, ln, handler, backups, shutdownGrace, log)
@@ -191,41 +240,68 @@ func serve(ctx context.Context, srv *http.Server, ln net.Listener, handler *serv
 	return failed
 }
 
-// openStore builds the storage backend the configuration names.
-func openStore(e *env, data, storage string, log *slog.Logger) (store blob.Store, redirect bool, err error) {
-	switch storage {
-	case "filesystem":
-		fs, err := blob.NewFS(data)
-		return fs, false, err
-	case "s3":
-		cfg := blob.S3Config{
-			Endpoint:     e.getenv("REGISTRY_S3_ENDPOINT"),
-			Region:       e.envOr("REGISTRY_S3_REGION", e.getenv("AWS_REGION")),
-			Bucket:       e.getenv("REGISTRY_S3_BUCKET"),
-			Prefix:       e.getenv("REGISTRY_S3_PREFIX"),
+// storageFlags are the settings that say where model files are kept. serve
+// and restore both take them, since both open the storage.
+type storageFlags struct {
+	kind, bucket, endpoint, region, prefix *string
+}
+
+// storageFlags declares --storage, with the given help text, and the
+// --s3-* flags.
+func (c *command) storageFlags(kindUsage string) *storageFlags {
+	e := c.e
+	return &storageFlags{
+		kind:     c.String("storage", e.envOr("REGISTRY_STORAGE", storageFilesystem), kindUsage),
+		bucket:   c.String("s3-bucket", e.getenv("REGISTRY_S3_BUCKET"), "with s3 storage: the bucket, which must exist (env REGISTRY_S3_BUCKET)"),
+		endpoint: c.String("s3-endpoint", e.getenv("REGISTRY_S3_ENDPOINT"), "with s3 storage: the service's URL; empty for AWS (env REGISTRY_S3_ENDPOINT)"),
+		region:   c.String("s3-region", e.envOr("REGISTRY_S3_REGION", e.getenv("AWS_REGION")), "with s3 storage: the region (env REGISTRY_S3_REGION, then AWS_REGION)"),
+		prefix:   c.String("s3-prefix", e.getenv("REGISTRY_S3_PREFIX"), "with s3 storage: a prefix for every object key, to share a bucket (env REGISTRY_S3_PREFIX)"),
+	}
+}
+
+// open builds the storage backend the settings name. The S3 keys are the
+// part of its configuration that has no flag.
+func (s *storageFlags) open(e *env, data string) (blob.Store, error) {
+	switch *s.kind {
+	case storageFilesystem:
+		return blob.NewFS(data)
+	case storageS3:
+		if *s.bucket == "" {
+			return nil, usagef("--storage s3 needs a bucket: set --s3-bucket or REGISTRY_S3_BUCKET")
+		}
+		return blob.NewS3(e.ctx, blob.S3Config{
+			Endpoint:     *s.endpoint,
+			Region:       *s.region,
+			Bucket:       *s.bucket,
+			Prefix:       *s.prefix,
 			AccessKey:    e.envOr("REGISTRY_S3_ACCESS_KEY", e.getenv("AWS_ACCESS_KEY_ID")),
 			SecretKey:    e.envOr("REGISTRY_S3_SECRET_KEY", e.getenv("AWS_SECRET_ACCESS_KEY")),
 			SessionToken: e.getenv("AWS_SESSION_TOKEN"),
 			StagingDir:   datadir.Dir(data).Staging(),
-		}
-		if cfg.Bucket == "" {
-			return nil, false, usagef("--storage s3 needs a bucket: set REGISTRY_S3_BUCKET")
-		}
-		s3, err := blob.NewS3(e.ctx, cfg)
-		if err != nil {
-			return nil, false, err
-		}
-		redirect = envBool(e, "REGISTRY_S3_REDIRECT")
-		log.Info("storing model files in S3", "bucket", cfg.Bucket, "endpoint", cfg.Endpoint, "prefix", cfg.Prefix, "redirect_downloads", redirect)
-		return s3, redirect, nil
+		})
 	}
-	return nil, false, usagef("unknown --storage %q: use filesystem or s3", storage)
+	return nil, usagef("unknown --storage %q: use %s or %s", *s.kind, storageFilesystem, storageS3)
 }
 
-// backupSettings reads the schedule for metadata backups: how often, and
-// how many to keep.
+// pullThroughAllow reads the allow list: patterns separated by commas.
+func pullThroughAllow(list string) ([]string, error) {
+	var allow []string
+	for _, pattern := range strings.Split(list, ",") {
+		if pattern = strings.TrimSpace(pattern); pattern == "" {
+			continue
+		}
+		if _, err := path.Match(pattern, "a/b"); err != nil {
+			return nil, usagef("REGISTRY_PULL_THROUGH_ALLOW (--pull-through-allow): %q is not a valid pattern", pattern)
+		}
+		allow = append(allow, pattern)
+	}
+	return allow, nil
+}
+
+// backupSettings reads the schedule for metadata backups from the
+// environment: how often, and how many to keep.
 func backupSettings(e *env) (every time.Duration, keep int, err error) {
-	keep = 48
+	keep = defaultBackupKeep
 	if v := e.getenv("REGISTRY_BACKUP_KEEP"); v != "" {
 		keep, err = strconv.Atoi(v)
 		if err != nil || keep < 0 {
@@ -234,23 +310,35 @@ func backupSettings(e *env) (every time.Duration, keep int, err error) {
 	}
 	if v := e.getenv("REGISTRY_BACKUP_INTERVAL"); v != "" {
 		every, err = time.ParseDuration(v)
-		if err != nil || every < time.Minute {
+		if err != nil || every < minBackupInterval {
 			return 0, 0, usagef("REGISTRY_BACKUP_INTERVAL must be a duration of at least a minute, such as 1h or 30m; got %q", v)
 		}
 	}
 	return every, keep, nil
 }
 
-// runBackups takes a metadata backup every interval until ctx ends. A
+// checkBackupSettings holds the schedule given by flags to the rules
+// backupSettings holds the environment to. An interval of 0 means no
+// scheduled backups.
+func checkBackupSettings(every time.Duration, keep int) error {
+	if keep < 0 {
+		return usagef("--backup-keep must be a number, 0 to keep every backup; got %d", keep)
+	}
+	if every != 0 && every < minBackupInterval {
+		return usagef("--backup-interval must be a duration of at least a minute, such as 1h or 30m; got %s", every)
+	}
+	return nil
+}
+
+// runBackups takes a metadata backup each time tick delivers, until ctx
+// ends. The caller owns the ticker, so a test can send the ticks itself. A
 // failed backup is logged and the schedule carries on.
-func runBackups(ctx context.Context, reg *registry.Registry, every time.Duration, keep int, log *slog.Logger) {
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
+func runBackups(ctx context.Context, reg *registry.Registry, tick <-chan time.Time, keep int, log *slog.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			res, err := reg.Backup(ctx, keep)
 			if err != nil {
 				log.Error("scheduled metadata backup failed", "error", err)
@@ -286,6 +374,29 @@ func restoreIfEmpty(e *env, data string, store blob.Store, log *slog.Logger) err
 	return nil
 }
 
+// noteEnv remembers the first environment variable whose value could not
+// be read, for parse to report.
+func (c *command) noteEnv(err error) {
+	if err != nil && c.envErr == nil {
+		c.envErr = err
+	}
+}
+
+// envBool reads an on/off variable to use as its flag's default. A value
+// that cannot be read is noted, and reported once the flags are parsed.
+func (c *command) envBool(key string) bool {
+	b, err := envBool(c.e, key)
+	c.noteEnv(err)
+	return b
+}
+
+// envBytes reads a size limit to use as its flag's default, likewise.
+func (c *command) envBytes(key string) int64 {
+	n, err := envBytes(c.e, key)
+	c.noteEnv(err)
+	return n
+}
+
 // envBytes reads an optional size limit in bytes; unset or 0 means none.
 func envBytes(e *env, key string) (int64, error) {
 	v := e.getenv(key)
@@ -299,9 +410,26 @@ func envBytes(e *env, key string) (int64, error) {
 	return n, nil
 }
 
-func envBool(e *env, key string) bool {
-	b, _ := strconv.ParseBool(e.getenv(key))
-	return b
+// envBool reads an on/off setting; unset means off. It accepts what
+// strconv.ParseBool does (1, t, true, 0, f, false, in its spellings) and
+// yes, no, on and off in any case. Anything else is an error: a setting
+// such as REGISTRY_REQUIRE_AUTH must not be quietly off because it was
+// written in a way this does not know.
+func envBool(e *env, key string) (bool, error) {
+	v := strings.TrimSpace(e.getenv(key))
+	if v == "" {
+		return false, nil
+	}
+	if b, err := strconv.ParseBool(v); err == nil {
+		return b, nil
+	}
+	switch strings.ToLower(v) {
+	case "yes", "on":
+		return true, nil
+	case "no", "off":
+		return false, nil
+	}
+	return false, usagef("%s must be true or false (1, t, yes and on are also read as true; 0, f, no and off as false); got %q", key, v)
 }
 
 // recommendedAdminTokenLen is the length below which a supplied admin token

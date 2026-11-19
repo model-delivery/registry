@@ -137,7 +137,9 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 
 ## Configuration
 
-`modelctl serve` is configured by flags or environment variables.
+`modelctl serve` is configured by flags or environment variables. Every
+setting that is not a secret has both; a flag wins over its variable.
+`modelctl serve --help` lists them all.
 
 | Flag | Environment | Default | |
 |---|---|---|---|
@@ -145,29 +147,40 @@ The REST API behind these commands is described in [docs/api.md](docs/api.md).
 | `--data` | `REGISTRY_DATA` | `./data` | Database and stored files |
 | `--upstream` | `REGISTRY_UPSTREAM` | `https://huggingface.co` | Hub to mirror from |
 | `--require-auth` | `REGISTRY_REQUIRE_AUTH` | `false` | Require a token for downloads and browsing too |
-| `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
-| | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
-| | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
-| `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
-| | `REGISTRY_MAX_BLOB_BYTES` | `0` (no limit) | Largest single file, in bytes, that an upload may store. Larger uploads are refused with `413` |
-| | `REGISTRY_ADMIN_TOKEN` | | Use this admin token instead of generating one |
-| | `REGISTRY_ADMIN_TOKEN_FILE` | | Read the admin token from this file (a mounted secret) |
 | `--require-admin-token` | `REGISTRY_REQUIRE_ADMIN_TOKEN` | `false` | Refuse to start without a supplied admin token instead of generating one and printing it. Use on Kubernetes and anywhere logs are collected |
-| | `REGISTRY_UPSTREAM_TOKEN` | | Default token for the upstream hub |
-| | `REGISTRY_BACKUP_INTERVAL` | off | Store a metadata backup this often, for example `1h` |
-| | `REGISTRY_BACKUP_KEEP` | `48` | How many stored backups to keep; `0` keeps all |
-| | `REGISTRY_RESTORE_IF_EMPTY` | `false` | At start, if there is no database, restore the newest stored backup |
+| `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
+| `--pull-through-allow` | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
+| `--pull-through-max-file-bytes` | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
+| `--max-blob-bytes` | `REGISTRY_MAX_BLOB_BYTES` | `0` (no limit) | Largest single file, in bytes, that an upload may store. Larger uploads are refused with `413` |
+| `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
+| `--backup-interval` | `REGISTRY_BACKUP_INTERVAL` | `0` (off) | Store a metadata backup this often, for example `1h`; at least a minute |
+| `--backup-keep` | `REGISTRY_BACKUP_KEEP` | `48` | How many stored backups to keep; `0` keeps all |
+| `--restore-if-empty` | `REGISTRY_RESTORE_IF_EMPTY` | `false` | At start, if there is no database, restore the newest stored backup |
 
-**S3 storage.** Set `REGISTRY_STORAGE=s3` and:
+An on/off variable accepts `true` and `false`, and also `1`, `0`, `yes`,
+`no`, `on` and `off`. Any other value stops the server at start with an
+error naming the variable; before v0.3.1 it was read as off.
+
+**Secrets** are read from the environment only. They have no flag, because
+a command line shows in the process list and in shell history.
 
 | Environment | |
 |---|---|
-| `REGISTRY_S3_BUCKET` | Required. The bucket must already exist. |
-| `REGISTRY_S3_ENDPOINT` | Service URL. Default `https://s3.amazonaws.com`. For other services, for example `https://<account>.r2.cloudflarestorage.com` or `http://seaweedfs:8333`. |
-| `REGISTRY_S3_REGION` | Region, when the service needs one. |
-| `REGISTRY_S3_ACCESS_KEY`, `REGISTRY_S3_SECRET_KEY` | Credentials. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are used if these are unset; with neither, the instance or pod role is used. |
-| `REGISTRY_S3_PREFIX` | Key prefix, to share a bucket. |
-| `REGISTRY_S3_REDIRECT` | `true` sends downloads to signed bucket URLs instead of streaming them through the registry. Clients must be able to reach the bucket. |
+| `REGISTRY_ADMIN_TOKEN` | Use this admin token instead of generating one |
+| `REGISTRY_ADMIN_TOKEN_FILE` | Read the admin token from this file (a mounted secret) |
+| `REGISTRY_UPSTREAM_TOKEN` | Default token for the upstream hub |
+| `REGISTRY_S3_ACCESS_KEY`, `REGISTRY_S3_SECRET_KEY` | Credentials for S3 storage. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`) are used if these are unset; with neither, the instance or pod role is used. |
+
+**S3 storage.** Set `--storage s3` (or `REGISTRY_STORAGE=s3`), the
+credentials above, and:
+
+| Flag | Environment | |
+|---|---|---|
+| `--s3-bucket` | `REGISTRY_S3_BUCKET` | Required. The bucket must already exist. |
+| `--s3-endpoint` | `REGISTRY_S3_ENDPOINT` | Service URL. Default `https://s3.amazonaws.com`. For other services, for example `https://<account>.r2.cloudflarestorage.com` or `http://seaweedfs:8333`. |
+| `--s3-region` | `REGISTRY_S3_REGION` | Region, when the service needs one. `AWS_REGION` is used if this is unset. |
+| `--s3-prefix` | `REGISTRY_S3_PREFIX` | Key prefix, to share a bucket. |
+| `--s3-redirect` | `REGISTRY_S3_REDIRECT` | Send downloads to signed bucket URLs instead of streaming them through the registry. Clients must be able to reach the bucket. |
 
 Metadata stays in SQLite in the data directory, so keep that directory on a
 persistent disk and back it up. See [docs/operations.md](docs/operations.md#s3-storage).
@@ -210,7 +223,7 @@ nothing from elsewhere. To serve models where there is no route to
 Hugging Face, mirror them on a connected machine and carry the data
 directory across, or `modelctl pull` there and `modelctl push` inside.
 
-**Backups.** Set `REGISTRY_BACKUP_INTERVAL=1h` and the registry stores a
+**Backups.** Set `--backup-interval 1h` and the registry stores a
 verified snapshot of its metadata next to the model files on that
 schedule; `modelctl backup` takes one on demand and `modelctl restore`
 puts one back. See [docs/operations.md](docs/operations.md#backup-and-restore).

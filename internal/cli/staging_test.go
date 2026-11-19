@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/model-delivery/registry/internal/registry"
+	"github.com/model-delivery/registry/internal/regtest"
 )
 
 // An upload being received lives in the data directory's tmp/. `modelctl
@@ -58,7 +59,7 @@ func TestOnlyServeClearsStaging(t *testing.T) {
 		t.Fatalf("restore left %d entries in tmp/, want only the upload in progress", len(entries))
 	}
 
-	logs, addr, stop := runServe(t, data, map[string]string{"REGISTRY_ADMIN_TOKEN": backupAdmin})
+	logs, addr, stop := regtest.RunServe(t, Run, data, map[string]string{"REGISTRY_ADMIN_TOKEN": backupAdmin})
 	if addr == "" {
 		t.Fatalf("serve did not start:\n%s", logs.String())
 	}

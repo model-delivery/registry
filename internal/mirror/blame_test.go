@@ -30,7 +30,11 @@ func (noRoom) Stage(context.Context, io.Reader, blob.Expect) (blob.Staged, error
 func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	files := map[string]string{"config.json": `{"a":1}`, "model.bin": "weights"}
+	// Each hub gets files of its own: the cases run at the same time, and
+	// one of them changes what its hub serves.
+	files := func() map[string]string {
+		return map[string]string{"config.json": `{"a":1}`, "model.bin": "weights"}
+	}
 
 	prepare := func(t *testing.T, h *hub) *Plan {
 		t.Helper()
@@ -45,17 +49,17 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 		t.Parallel()
 		cases := map[string]func(t *testing.T) error{
 			"it cannot be reached": func(t *testing.T) error {
-				h := newHub(t, files)
+				h := newHub(t, files())
 				h.Close()
 				_, err := Prepare(ctx, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")
 				return err
 			},
 			"it does not have the repository": func(t *testing.T) error {
-				_, err := Prepare(ctx, &Upstream{Endpoint: newHub(t, files).URL}, "acme/absent", "main")
+				_, err := Prepare(ctx, &Upstream{Endpoint: newHub(t, files()).URL}, "acme/absent", "main")
 				return err
 			},
 			"it answers with a server error": func(t *testing.T) error {
-				h := newHub(t, files)
+				h := newHub(t, files())
 				h.wrap = func(w http.ResponseWriter, _ *http.Request) bool {
 					http.Error(w, "down for maintenance", http.StatusServiceUnavailable)
 					return true
@@ -68,7 +72,7 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 				return err
 			},
 			"it sends content that is not what it listed": func(t *testing.T) error {
-				h := newHub(t, files)
+				h := newHub(t, files())
 				plan := prepare(t, h)
 				h.files["model.bin"] = "tampered"
 				_, err := plan.Execute(ctx, openRegistry(t), 1, nil)
@@ -78,7 +82,7 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 				return err
 			},
 			"it answers every request for a file with an error": func(t *testing.T) error {
-				h := newHub(t, files)
+				h := newHub(t, files())
 				plan := prepare(t, h)
 				h.wrap = func(w http.ResponseWriter, r *http.Request) bool {
 					if !strings.Contains(r.URL.Path, "/resolve/") {
@@ -120,7 +124,7 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = reg.Close() })
-		_, err = prepare(t, newHub(t, files)).Execute(ctx, reg, 1, nil)
+		_, err = prepare(t, newHub(t, files())).Execute(ctx, reg, 1, nil)
 		if err == nil || !strings.Contains(err.Error(), "no space left") {
 			t.Fatalf("got %v, want the store's failure", err)
 		}
@@ -131,7 +135,7 @@ func TestFailuresAreAttributedToTheUpstreamOrToTheRegistry(t *testing.T) {
 
 	t.Run("neither, when the caller gave up", func(t *testing.T) {
 		t.Parallel()
-		h := newHub(t, files)
+		h := newHub(t, files())
 		stopped, cancel := context.WithCancel(ctx)
 		cancel()
 		_, err := Prepare(stopped, &Upstream{Endpoint: h.URL}, "acme/tiny", "main")

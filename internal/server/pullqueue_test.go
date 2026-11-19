@@ -29,31 +29,42 @@ func TestPullQueueIsBounded(t *testing.T) {
 	release := make(chan struct{})
 	held := func(context.Context) error { <-release; return nil }
 
-	// Fill every slot and every place in the queue.
+	// Fill every slot first, then every place in the queue. In two steps:
+	// a job counts as waiting until it holds a slot, so starting them all
+	// at once can find the queue full while slots are still being taken.
 	const total = maxConcurrentPulls + maxWaitingPulls
 	var wg sync.WaitGroup
-	for i := range total {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := p.share(ctx, fmt.Sprintf("job-%d", i), held); err != nil {
-				t.Errorf("job %d: %v", i, err)
+	start := func(from, to int) {
+		for i := from; i < to; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := p.share(ctx, fmt.Sprintf("job-%d", i), held); err != nil {
+					t.Errorf("job %d: %v", i, err)
+				}
+			}()
+		}
+	}
+	settled := func(wantJobs, wantWaiting int) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			p.mu.Lock()
+			jobs, waiting := p.running, p.waiting
+			p.mu.Unlock()
+			if jobs == wantJobs && waiting == wantWaiting {
+				return
 			}
-		}()
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		p.mu.Lock()
-		jobs, waiting := p.running, p.waiting
-		p.mu.Unlock()
-		if jobs == total && waiting == maxWaitingPulls {
-			break
+			if time.Now().After(deadline) {
+				t.Fatalf("%d jobs and %d waiting, want %d and %d", jobs, waiting, wantJobs, wantWaiting)
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("queue never filled: %d jobs, %d waiting", jobs, waiting)
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
+	start(0, maxConcurrentPulls)
+	settled(maxConcurrentPulls, 0)
+	start(maxConcurrentPulls, total)
+	settled(total, maxWaitingPulls)
 
 	// One more distinct fetch is refused at once, without waiting.
 	if err := p.share(ctx, "one-too-many", held); !errors.Is(err, errPullBusy) {

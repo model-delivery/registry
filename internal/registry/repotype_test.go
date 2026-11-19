@@ -442,6 +442,32 @@ func TestUpgradeFromSchemaVersion2(t *testing.T) {
 	checkVersion2Contents(t, again)
 }
 
+// A backup taken by v0.3.1 (schema version 2) is accepted by restore, and
+// the restored data directory is upgraded when it is opened.
+func TestRestoreABackupOfSchemaVersion2(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	old := t.TempDir()
+	buildVersion2(t, old)
+
+	dataDir := t.TempDir()
+	info, _, err := Restore(ctx, dataDir, filepath.Join(old, "registry.db"), false)
+	if err != nil || info.SchemaVersion != 2 || info.Repos != 3 {
+		t.Fatalf("restore a version 2 backup: %+v, %v", info, err)
+	}
+	r, err := Open(dataDir, nil)
+	if err != nil {
+		t.Fatalf("open the restored data directory: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	checkVersion2Contents(t, r)
+	// And a backup taken now is of the new version.
+	res, err := r.Backup(ctx, 0)
+	if err != nil || res.Contents.SchemaVersion != schemaVersion {
+		t.Fatalf("a backup after the upgrade: %+v, %v", res, err)
+	}
+}
+
 // An upgrade that is interrupted leaves the database as it was, at its old
 // version, and the next start upgrades it.
 func TestInterruptedUpgradeLeavesTheOldVersion(t *testing.T) {

@@ -936,6 +936,9 @@ start that is interrupted leaves the old version to be upgraded again. A
 server refuses to open a data directory written by a newer version than
 itself, so take a backup before upgrading if you might need to go back.
 
+A backup taken by an older version can be restored by a newer one, and is
+upgraded when the server opens it.
+
 The version that added datasets (schema version 3) rebuilds the table of
 repositories and makes every existing repository a model. It also
 reserves the namespace `datasets`: a model already in it, say

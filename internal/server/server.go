@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/model-delivery/registry/internal/blob"
+	"github.com/model-delivery/registry/internal/kit"
 	"github.com/model-delivery/registry/internal/mirror"
 	"github.com/model-delivery/registry/internal/registry"
 )
@@ -143,13 +144,18 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	// a private registry holds. A scraper sends a token as a bearer token.
 	handle("GET /metrics", s.gate(registry.RoleRead, asAPI, s.serveMetrics))
 
-	// Registry API.
+	// Registry API. Models live under /api/v1/repos, as they always have,
+	// and datasets under /api/v1/datasets: the same routes and the same
+	// handlers, given the type.
 	api := func(minimum registry.Role, h http.HandlerFunc) http.Handler { return s.gate(minimum, asAPI, h) }
-	handle("GET /api/v1/repos", api(registry.RoleRead, s.apiListRepos))
-	handle("GET /api/v1/repos/{ns}/{name}", api(registry.RoleRead, s.apiGetRepo))
-	handle("GET /api/v1/repos/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision))
-	handle("POST /api/v1/repos/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit))
-	handle("DELETE /api/v1/repos/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo))
+	for _, typ := range []registry.RepoType{registry.TypeModel, registry.TypeDataset} {
+		root := apiRepoRoot(typ)
+		handle("GET "+root, api(registry.RoleRead, s.apiListRepos(typ)))
+		handle("GET "+root+"/{ns}/{name}", api(registry.RoleRead, s.apiGetRepo(typ)))
+		handle("GET "+root+"/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision(typ)))
+		handle("POST "+root+"/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit(typ)))
+		handle("DELETE "+root+"/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo(typ)))
+	}
 	handle("HEAD /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiStatBlob))
 	handle("PUT /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiPutBlob))
 	handle("POST /api/v1/mirror", api(registry.RoleWrite, s.apiMirror))
@@ -167,9 +173,11 @@ func New(reg *registry.Registry, cfg Config) *Server {
 
 	// Hugging Face compatible routes. Their paths carry percent-encoded
 	// revisions and repository ids of two segments, so they are parsed by
-	// hand instead of by mux patterns: hfModels does that for everything
-	// under /api/models/ and gates each route it finds with its own role.
-	handle("/api/models/", public(s.hfModels))
+	// hand instead of by mux patterns: hfRepos does that for everything
+	// under /api/models/ and /api/datasets/ and gates each route it finds
+	// with its own role. Spaces fall through to the "not implemented" below.
+	handle(hfModelsRoot, public(s.hfRepos))
+	handle(hfDatasetsRoot, public(s.hfRepos))
 	// Answers who a token is, so it authenticates by itself: 401 unless the
 	// request carries a token this registry issued. No role is needed to
 	// ask, and an open registry's anonymous read does not apply.
@@ -199,12 +207,16 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	handle("GET /ui/login", public(s.uiLoginForm))
 	handle("POST /ui/login", public(s.uiLogin))
 	handle("POST /ui/logout", public(s.uiLogout))
-	handle("GET /ui/repo/{ns}/{name}", s.gate(registry.RoleRead, asUI, s.uiRepo))
-	handle("POST /ui/repo/{ns}/{name}/delete", s.gate(registry.RoleAdmin, asUI, s.uiDeleteRepo))
+	for _, typ := range []registry.RepoType{registry.TypeModel, registry.TypeDataset} {
+		page := uiRepoRoot(typ)
+		handle("GET "+page+"{ns}/{name}", s.gate(registry.RoleRead, asUI, s.uiRepo(typ)))
+		handle("POST "+page+"{ns}/{name}/delete", s.gate(registry.RoleAdmin, asUI, s.uiDeleteRepo(typ)))
+	}
 
-	// Everything else: file downloads at /{ns}/{name}/resolve/{rev}/{path},
-	// the large-file batch, the UI home page and hub-style repository links.
-	// Like hfModels, root parses the path and gates what it finds.
+	// Everything else: file downloads at /{ns}/{name}/resolve/{rev}/{path}
+	// and /datasets/{ns}/{name}/resolve/..., the large-file batch, the UI
+	// home page and hub-style repository links. Like hfRepos, root parses
+	// the path and gates what it finds.
 	handle("/", public(s.root))
 
 	// Browsers may only make state-changing requests from our own pages.
@@ -245,31 +257,85 @@ func (s *Server) now() time.Time {
 // route below is gated with its own role where it is chosen.
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 	segs, ok := splitPath(r.URL.EscapedPath())
-	read := r.Method == http.MethodGet || r.Method == http.MethodHead
-	switch {
-	case !ok:
+	if !ok {
 		writeError(w, http.StatusBadRequest, "malformed path")
-	case len(segs) == 0 && !read, isLFSBatch(segs) && r.Method != http.MethodPost:
+		return
+	}
+	read := r.Method == http.MethodGet || r.Method == http.MethodHead
+	to := parseRootPath(segs)
+	switch {
+	case to.kind == rootHome && !read, to.kind == rootLFSBatch && r.Method != http.MethodPost:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	case len(segs) == 0:
+	case to.kind == rootHome:
 		s.gate(registry.RoleRead, asUI, s.uiIndex).ServeHTTP(w, r)
-	case isLFSBatch(segs):
-		repo := segs[0] + "/" + strings.TrimSuffix(segs[1], ".git")
-		s.gate(registry.RoleWrite, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfLFSBatch(w, r, repo) }).ServeHTTP(w, r)
-	case len(segs) >= 5 && segs[2] == "resolve":
-		s.gate(registry.RoleRead, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfResolve(w, r, segs) }).ServeHTTP(w, r)
-	case len(segs) == 2 && r.Method == http.MethodGet:
+	case to.kind == rootLFSBatch:
+		s.gate(registry.RoleWrite, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfLFSBatch(w, r, to.key()) }).ServeHTTP(w, r)
+	case to.kind == rootResolve:
+		rev, file := to.rest[0], strings.Join(to.rest[1:], "/")
+		s.gate(registry.RoleRead, asHF, func(w http.ResponseWriter, r *http.Request) { s.hfResolve(w, r, to.key(), rev, file) }).ServeHTTP(w, r)
+	case to.kind == rootRepoLink && r.Method == http.MethodGet:
 		// A hub-style link. It only points at the repository page, which is
 		// gated, and says nothing about whether the repository exists.
-		http.Redirect(w, r, "/ui/repo/"+url.PathEscape(segs[0])+"/"+url.PathEscape(segs[1]), http.StatusFound) // each segment may itself hold an encoded slash
+		http.Redirect(w, r, uiRepoRoot(to.typ)+url.PathEscape(to.ns)+"/"+url.PathEscape(to.name), http.StatusFound) // each segment may itself hold an encoded slash
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-// isLFSBatch reports whether segs is /{ns}/{name}.git/info/lfs/objects/batch.
-func isLFSBatch(segs []string) bool {
-	return len(segs) == 6 && strings.HasSuffix(segs[1], ".git") && strings.Join(segs[2:], "/") == "info/lfs/objects/batch"
+// rootKind is which of root's routes a path is.
+type rootKind int
+
+const (
+	rootOther    rootKind = iota // none: not found
+	rootHome                     // the web UI's home page, /
+	rootResolve                  // a file: {repo}/resolve/{rev}/{path...}
+	rootLFSBatch                 // the large-file batch: {repo}.git/info/lfs/objects/batch
+	rootRepoLink                 // a hub-style link to a repository: {repo}
+)
+
+// rootPath is what a path that no mux pattern claims addresses. root and
+// routeClass both read paths through parseRootPath, so that what is counted
+// is what is served.
+type rootPath struct {
+	kind     rootKind
+	typ      registry.RepoType
+	ns, name string
+	// rest is what follows "resolve": the revision, then the file's path.
+	rest []string
+}
+
+// key is the addressed repository's key.
+func (p rootPath) key() string { return registry.RepoKey(p.typ, p.ns+"/"+p.name) }
+
+// parseRootPath reads decoded path segments the way the Hub lays out its
+// addresses: a model at /{ns}/{name}/..., and a dataset at
+// /datasets/{ns}/{name}/.... A model whose namespace is literally
+// "datasets", recorded before that namespace was reserved, is still reached
+// at its own addresses, except where the path also reads as a dataset's.
+func parseRootPath(segs []string) rootPath {
+	if len(segs) == 0 {
+		return rootPath{kind: rootHome}
+	}
+	if segs[0] == kit.DatasetsSegment && len(segs) >= 3 {
+		if p := parseRepoPath(registry.TypeDataset, segs[1:]); p.kind != rootOther {
+			return p
+		}
+	}
+	return parseRepoPath(registry.TypeModel, segs)
+}
+
+// parseRepoPath reads segs, which begin with a repository's namespace and
+// name, as one of root's routes for a repository of type typ.
+func parseRepoPath(typ registry.RepoType, segs []string) rootPath {
+	switch {
+	case len(segs) == 6 && strings.HasSuffix(segs[1], ".git") && strings.Join(segs[2:], "/") == "info/lfs/objects/batch":
+		return rootPath{kind: rootLFSBatch, typ: typ, ns: segs[0], name: strings.TrimSuffix(segs[1], ".git")}
+	case len(segs) >= 5 && segs[2] == "resolve":
+		return rootPath{kind: rootResolve, typ: typ, ns: segs[0], name: segs[1], rest: segs[3:]}
+	case len(segs) == 2:
+		return rootPath{kind: rootRepoLink, typ: typ, ns: segs[0], name: segs[1]}
+	}
+	return rootPath{}
 }
 
 // splitPath splits an escaped URL path into decoded segments, so an

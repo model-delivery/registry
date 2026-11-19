@@ -13,7 +13,7 @@
   <tbody>
   {{range .Repos}}
   <tr>
-    <td><a href="{{repoURL .Name}}">{{.Name}}</a></td>
+    <td><a href="{{repoURL .Key}}">{{.Name}}</a>{{if not .Type.IsZero}} <span class="tag">{{.Type}}</span>{{end}}</td>
     <td>{{if .Upstream}}Mirror of {{.Upstream}}{{else}}Pushed here{{end}}</td>
     <td class="num">{{.Revisions}}</td>
     <td class="num">{{bytes .StoredBytes}}</td>

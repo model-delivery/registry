@@ -420,8 +420,18 @@ func TestUploadRepositoriesAndBranches(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(out, "/write/mine") {
 		t.Fatalf("create without a namespace: %d %s", status, out)
 	}
+	// A dataset is created as a dataset, at the Hub's address for one.
+	if status, out := create(in.Write, map[string]any{"name": "d", "organization": "acme", "type": "dataset"}); status != http.StatusOK ||
+		!strings.Contains(out, "/datasets/acme/d") {
+		t.Fatalf("create a dataset: %d %s", status, out)
+	}
+	if _, err := in.Reg.GetRepo(ctx, "datasets/acme/d"); err != nil {
+		t.Fatalf("the dataset was not recorded: %v", err)
+	}
+	if _, err := in.Reg.GetRepo(ctx, "acme/d"); err == nil {
+		t.Fatal("creating a dataset created a model")
+	}
 	for name, payload := range map[string]map[string]any{
-		"a dataset":            {"name": "d", "organization": "acme", "type": "dataset"},
 		"a space":              {"name": "s", "organization": "acme", "type": "space"},
 		"a bad name":           {"name": "has space", "organization": "acme"},
 		"a reserved namespace": {"name": "x", "organization": "api"},

@@ -72,13 +72,13 @@ var errNotFromUpstream = errors.New("this repository was not created from the up
 
 // errFileTooLarge refuses a file over the operator's pull-through limit.
 type errFileTooLarge struct {
-	repo, path  string
+	repo, path  string // repo is the repository's key
 	size, limit int64
 }
 
 func (e errFileTooLarge) Error() string {
 	return fmt.Sprintf("%s is %s, more than this registry fetches on demand (REGISTRY_PULL_THROUGH_MAX_FILE_BYTES is %d): "+
-		"raise that setting, or fetch the file ahead of time with `modelctl mirror %s`", e.path, kit.HumanBytes(e.size), e.limit, e.repo)
+		"raise that setting, or fetch the file ahead of time with `%s`", e.path, kit.HumanBytes(e.size), e.limit, mirrorCommand(e.repo))
 }
 
 const (
@@ -200,9 +200,13 @@ func newPuller(reg *registry.Registry, upstream func() *mirror.Upstream, allow [
 	}
 }
 
-// allowed reports whether repo may be fetched on demand. With no patterns
-// configured, every repository may. A pattern is a glob over the whole id,
-// for example "meta-llama/*" or "*/*-GGUF".
+// allowed reports whether the repository with key repo may be fetched on
+// demand. With no patterns configured, every repository may, models and
+// datasets. A pattern is a glob over the whole key, for example
+// "meta-llama/*" or "*/*-GGUF". The key of a dataset begins with
+// "datasets/" and a glob's * never matches a slash, so those patterns name
+// models only, as they always have, and "datasets/meta-llama/*" or
+// "datasets/*/*" name datasets.
 func (p *puller) allowed(repo string) bool {
 	if len(p.allow) == 0 {
 		return true
@@ -375,7 +379,7 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 		// this revision arrives here after that job has gone. Look again
 		// before asking the upstream a second time.
 		if c, err := p.reg.Resolve(ctx, repo, rev); err == nil {
-			return c.Repo, nil
+			return c.Key(), nil
 		}
 		plan, err := mirror.Prepare(ctx, p.upstream(), repo, rev)
 		if err != nil {
@@ -394,19 +398,19 @@ func (p *puller) ensure(ctx context.Context, repo, rev string) (string, error) {
 		// The upstream answers with its canonical id, which differs from
 		// what was asked for after a rename. The allow list covers the name
 		// the revision is stored under, not only the one in the request.
-		if plan.Info.ID != repo && !p.allowed(plan.Info.ID) {
+		if plan.Repo != repo && !p.allowed(plan.Repo) {
 			return "", fmt.Errorf("%w: %s is named %s upstream, which pull-through is not allowed to fetch",
-				mirror.ErrUpstreamNotFound, repo, plan.Info.ID)
+				mirror.ErrUpstreamNotFound, repo, plan.Repo)
 		}
 		c, err := plan.RecordLazy(ctx, p.reg)
 		if err != nil {
-			p.log.Warn("pull-through could not record the revision", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+			p.log.Warn("pull-through could not record the revision", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
 			return "", err
 		}
 		p.m.recorded.Inc()
-		p.log.Info("pull-through recorded a revision; its files are fetched on demand", "repo", c.Repo, "revision", rev,
+		p.log.Info("pull-through recorded a revision; its files are fetched on demand", "repo", c.Key(), "revision", rev,
 			"sha", c.SHA, "files", len(plan.Entries), "bytes", plan.Bytes())
-		return c.Repo, nil
+		return c.Key(), nil
 	})
 }
 
@@ -425,7 +429,7 @@ func (p *puller) ensureFile(ctx context.Context, c registry.Commit, f registry.F
 // the one in progress, and returns its job without waiting for it. With
 // streaming on, the job has a tail that requests can follow.
 func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.File) (*pullJob[struct{}], error) {
-	repo, err := p.reg.GetRepo(ctx, c.Repo)
+	repo, err := p.reg.GetRepo(ctx, c.Key())
 	if err != nil {
 		return nil, err
 	}
@@ -433,7 +437,7 @@ func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.Fi
 		return nil, errNotFromUpstream
 	}
 	if p.maxFileBytes > 0 && f.Size > p.maxFileBytes {
-		return nil, errFileTooLarge{repo: c.Repo, path: f.Path, size: f.Size, limit: p.maxFileBytes}
+		return nil, errFileTooLarge{repo: c.Key(), path: f.Path, size: f.Size, limit: p.maxFileBytes}
 	}
 	job := newJob[struct{}]()
 	job.started = p.m.fetchesStarted
@@ -449,17 +453,17 @@ func (p *puller) fetchFile(ctx context.Context, c registry.Commit, f registry.Fi
 			}
 		}
 	}
-	return joinJob(p, p.fileJobs, p.slots, c.Repo+"@"+c.SHA+":"+f.Path, job, func(ctx context.Context) (struct{}, error) {
+	return joinJob(p, p.fileJobs, p.slots, c.Key()+"@"+c.SHA+":"+f.Path, job, func(ctx context.Context) (struct{}, error) {
 		started := p.now()
 		downloaded, err := mirror.FetchFileFollowed(ctx, p.upstream(), p.reg, c, f, job.tail)
 		if err != nil {
-			p.log.Warn("pull-through could not fetch a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
+			p.log.Warn("pull-through could not fetch a file", "repo", c.Key(), "sha", c.SHA, "path", f.Path, "error", err)
 			return struct{}{}, err
 		}
 		if downloaded {
 			p.m.fetchedBytes.Add(f.Size)
 		}
-		p.log.Info("pull-through fetched a file", "repo", c.Repo, "sha", c.SHA, "path", f.Path, "bytes", f.Size,
+		p.log.Info("pull-through fetched a file", "repo", c.Key(), "sha", c.SHA, "path", f.Path, "bytes", f.Size,
 			"took", p.now().Sub(started).Round(time.Millisecond))
 		return struct{}{}, nil
 	})
@@ -489,7 +493,7 @@ func (p *puller) distrust(c registry.Commit, f registry.File, err error) {
 	}
 	p.mu.Unlock()
 	p.log.Warn("pull-through sent part of a file to clients before its fetch failed; until the registry restarts this file is verified before it is sent, and a request for part of it is answered with the whole",
-		"repo", c.Repo, "sha", c.SHA, "path", f.Path, "error", err)
+		"repo", c.Key(), "sha", c.SHA, "path", f.Path, "error", err)
 	if full {
 		p.log.Error("so many streamed fetches have failed that the registry now answers every request for part of a file with the whole file, until it restarts", "limit", maxDistrusted)
 	}
@@ -547,7 +551,7 @@ func (s *Server) resolve(ctx context.Context, repo, rev string) (registry.Commit
 	}
 	// Nothing is sent upstream that the registry itself would not accept
 	// as a name.
-	if registry.ValidateRepoName(repo) != nil || !validRevision(rev) || !s.puller.allowed(repo) {
+	if registry.ValidateRepoKey(repo) != nil || !validRevision(rev) || !s.puller.allowed(repo) {
 		return c, err
 	}
 	stored, pullErr := s.puller.ensure(ctx, repo, rev)

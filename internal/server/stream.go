@@ -222,7 +222,7 @@ func (s *Server) abortStream(r *http.Request, job *pullJob[struct{}], c registry
 		level, reason = s.log.Warn, "the upstream's content could not be fetched or did not match its digest"
 	}
 	level("aborted a download that was being sent while the file was fetched: "+reason,
-		"repo", c.Repo, "sha", c.SHA, "path", f.Path, "sent", sent, "size", f.Size, "url", r.URL.Path, "error", cause)
+		"repo", c.Key(), "sha", c.SHA, "path", f.Path, "sent", sent, "size", f.Size, "url", r.URL.Path, "error", cause)
 	panic(http.ErrAbortHandler)
 }
 

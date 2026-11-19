@@ -28,6 +28,13 @@ other Hugging Face compatible ones are described in
   server's log.
 - **Repository ids** are `namespace/name` and appear in paths as two
   segments.
+- **Models and datasets.** A repository is a model or a dataset, and a
+  model and a dataset of the same name are two repositories. Models are
+  under `/api/v1/repos`, as they have always been; datasets have the same
+  routes under `/api/v1/datasets` (see [Datasets](#datasets)). A document
+  that describes a dataset says so with `"type": "dataset"` (a repository)
+  or `"repo_type": "dataset"` (a revision or a mirror's progress); for a
+  model the field is absent, so model documents are unchanged.
 - **Revision** means a branch name, a tag name, or a 40-character revision
   id.
 
@@ -129,6 +136,39 @@ up space, are referenced by nothing, and are not in the counts. The
 registry keeps its record of them, so a later garbage collection removes
 them once storage allows it.
 
+## Datasets
+
+Every route above has a dataset twin under `/api/v1/datasets`, which
+takes the same requests and answers the same documents for a dataset:
+
+| | |
+|---|---|
+| `GET /api/v1/datasets` (read) | List datasets, as [List repositories](#list-repositories) lists models. Each has `"type": "dataset"`. |
+| `GET /api/v1/datasets/{namespace}/{name}` (read) | Inspect a dataset. |
+| `GET /api/v1/datasets/{namespace}/{name}/revisions/{revision}` (read) | Inspect a revision of a dataset; `repo_type` is `dataset`. |
+| `POST /api/v1/datasets/{namespace}/{name}/commits` (write) | Record a revision of a dataset, from files uploaded as under [Pushing](#pushing). Creates the dataset if it does not exist. |
+| `DELETE /api/v1/datasets/{namespace}/{name}` (admin) | Delete a dataset and free the stored files nothing else uses. |
+
+```bash
+curl $R/api/v1/datasets/acme/reviews/revisions/main
+```
+
+```json
+{"repo": "acme/reviews", "repo_type": "dataset", "sha": "5a1f...", "source": "mirror", "created_at": "...",
+ "files": [{"path": "data/train.csv", "size": 4120, "sha256": "...", "git_oid": "...", "lfs": false}]}
+```
+
+Stored files are shared: a file a model and a dataset both contain is
+stored once, and deleting either leaves it for the other. A dataset and a
+model of the same name never see each other's revisions, refs or files.
+
+A dataset is mirrored through `POST /api/v1/mirror` with `"type":
+"dataset"` (see [Mirroring](#mirroring)).
+
+`/api/v1/repos` lists and serves models only. A registry older than this
+one answers `404` to everything under `/api/v1/datasets`, so a dataset
+request never reaches a model of the same name by mistake.
+
 ## Pushing
 
 A push is two steps: upload the files, then record a revision that names
@@ -190,6 +230,7 @@ curl -N -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json
 | Field | |
 |---|---|
 | `repo` | Required. The repository id on the upstream hub. |
+| `type` | `dataset` to mirror a dataset; `model` (the default) for a model. Anything else is refused with `400`. |
 | `revision` | Branch, tag or revision id. Default `main`. |
 | `upstream_token` | Token for the upstream hub, for private or gated repositories. Used for this request only and not stored. |
 
@@ -206,7 +247,8 @@ denies access, cannot be reached or answers with an error. Otherwise it is
 ```
 
 (Eight more `file` lines are omitted here. `reused` means the registry
-already held those bytes and did not download them.)
+already held those bytes and did not download them.) For a dataset the
+`start` and `done` lines also carry `"repo_type": "dataset"`.
 
 A failure after the stream has started arrives as a final
 `{"event":"error","error":"..."}` line, and no revision is recorded. Always

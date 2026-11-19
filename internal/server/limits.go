@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/model-delivery/registry/internal/kit"
@@ -92,10 +91,10 @@ func isFileTransfer(r *http.Request) bool {
 	case http.MethodPut:
 		return true
 	case http.MethodPost:
-		// Parsed the way hfModels parses it: {ns}/{name}/commit/{rev}.
-		rest, under := strings.CutPrefix(r.URL.EscapedPath(), "/api/models/")
-		segs, ok := splitPath(rest)
-		return under && ok && len(segs) == 4 && segs[2] == "commit"
+		// Parsed the way hfRepos parses it: {ns}/{name}/commit/{rev}, for a
+		// model or a dataset.
+		_, segs, ok := hfAPIPath(r.URL.EscapedPath())
+		return ok && len(segs) == 4 && segs[2] == "commit"
 	}
 	return false
 }
@@ -156,6 +155,22 @@ func (s *Server) formValue(w http.ResponseWriter, r *http.Request, key string) s
 		return nil
 	})
 	return value
+}
+
+// formValues reads every value of key from a small form body, bounded as
+// formValue is. Unlike formValue it reports a body that could not be read,
+// since an empty answer would be taken for "none were asked for".
+func (s *Server) formValues(w http.ResponseWriter, r *http.Request, key string) ([]string, error) {
+	var values []string
+	err := s.smallBody(w, r, maxFormBytes, func(body io.ReadCloser) error {
+		r.Body = body
+		if err := r.ParseForm(); err != nil {
+			return err
+		}
+		values = r.PostForm[key]
+		return nil
+	})
+	return values, err
 }
 
 // errTooLarge refuses content over a configured size limit. It is answered

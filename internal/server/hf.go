@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,15 +21,56 @@ import (
 )
 
 // The routes in this file reproduce the part of the Hugging Face Hub HTTP
-// API that huggingface_hub uses to download a model:
+// API that huggingface_hub uses to download a model or a dataset:
 //
 //	GET  /api/models/{repo}[/revision/{rev}]   which revision, which files
 //	GET  /api/models/{repo}/tree/{rev}[/{dir}] file listing with digests
+//	POST /api/models/{repo}/paths-info/{rev}   the same, for named paths
 //	GET  /api/models/{repo}/refs               branches and tags
 //	HEAD /{repo}/resolve/{rev}/{file}          ETag, size, revision id
 //	GET  /{repo}/resolve/{rev}/{file}          the bytes, with Range support
 //
+// A dataset has the same routes with /api/datasets/ in place of
+// /api/models/, and /datasets/{repo}/resolve/ for its files: the Hub's own
+// addresses. One handler serves both types; the type comes from the path.
 // docs/compatibility.md records what is and is not covered.
+
+// hfModelsRoot and hfDatasetsRoot are where repositories of each type sit
+// in the Hub's API. A dataset's other addresses begin with
+// kit.DatasetsSegment.
+const (
+	hfModelsRoot   = "/api/models/"
+	hfDatasetsRoot = "/api/datasets/"
+)
+
+// hfAPIRoot is the root of the Hub's API for repositories of type typ.
+func hfAPIRoot(typ registry.RepoType) string {
+	if typ == registry.TypeDataset {
+		return hfDatasetsRoot
+	}
+	return hfModelsRoot
+}
+
+// hfAPIPath reads a path under /api/models/ or /api/datasets/ into the
+// repository type and the decoded segments after the root.
+func hfAPIPath(escaped string) (registry.RepoType, []string, bool) {
+	for _, typ := range []registry.RepoType{registry.TypeModel, registry.TypeDataset} {
+		if rest, under := strings.CutPrefix(escaped, hfAPIRoot(typ)); under {
+			segs, ok := splitPath(rest)
+			return typ, segs, ok
+		}
+	}
+	return "", nil, false
+}
+
+// mirrorCommand is the command that fetches the repository with key key
+// ahead of time, for messages that tell someone to run it.
+func mirrorCommand(key string) string {
+	if typ, name := registry.SplitRepoKey(key); typ == registry.TypeDataset {
+		return "modelctl mirror --repo-type dataset " + name
+	}
+	return "modelctl mirror " + key
+}
 
 const hfTime = "2006-01-02T15:04:05.000Z"
 
@@ -48,16 +90,21 @@ const (
 	xetExplanation = "/api/xet-is-not-supported/set-HF_HUB_DISABLE_XET=1-and-upload-again"
 )
 
-// hfModels routes a request under /api/models/. It checks nothing itself:
-// every route below goes through the gate with the role it needs, the
-// upload steps with write and the rest with read.
-func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
+// hfRepos routes a request under /api/models/ or /api/datasets/: the
+// repository's type comes from the path, and every route below serves both
+// types. It checks nothing itself: every route goes through the gate with
+// the role it needs, the upload steps with write and the rest with read.
+//
+// Anything the Hub's dataset viewer serves under /api/datasets/ (parquet,
+// croissant) is not implemented and answers 404, which is how the
+// datasets library learns to read the repository's own files instead.
+func (s *Server) hfRepos(w http.ResponseWriter, r *http.Request) {
 	route := func(minimum registry.Role, h http.HandlerFunc) { s.gate(minimum, asHF, h).ServeHTTP(w, r) }
 	answer := func(status int, msg string) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) { hfError(w, status, msg) }
 	}
 
-	segs, ok := splitPath(strings.TrimPrefix(r.URL.EscapedPath(), "/api/models"))
+	typ, segs, ok := hfAPIPath(r.URL.EscapedPath())
 	if !ok || len(segs) < 2 {
 		// A path that is not {namespace}/{name}/...: the listing and search
 		// at /api/models itself, an id of one segment, as old models on the
@@ -65,14 +112,18 @@ func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 		route(registry.RoleRead, answer(http.StatusNotFound, "not implemented: use namespace/name repository ids"))
 		return
 	}
-	repo, rest := segs[0]+"/"+segs[1], segs[2:]
+	repo, rest := registry.RepoKey(typ, segs[0]+"/"+segs[1]), segs[2:]
 	// is reports whether the path after the repository is {step}/{one segment}.
 	is := func(step string) bool { return len(rest) == 2 && rest[0] == step }
 
 	if r.Method == http.MethodPost {
 		// The upload steps (hfupload.go). Every POST here needs the write
-		// role, including one to a step that does not exist.
+		// role, including one to a step that does not exist, except
+		// paths-info, which only reads and is a POST because it carries a
+		// list of paths.
 		switch {
+		case is("paths-info"):
+			route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) { s.hfPathsInfo(w, r, repo, rest[1]) })
 		case is("preupload"):
 			route(registry.RoleWrite, func(w http.ResponseWriter, r *http.Request) { s.hfPreupload(w, r, repo, rest[1]) })
 		case is("commit"):
@@ -95,9 +146,9 @@ func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, xetExplanation, http.StatusTemporaryRedirect)
 		})
 	case len(rest) == 0:
-		route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) { s.hfModelInfo(w, r, repo, defaultBranch) })
+		route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) { s.hfRepoInfo(w, r, repo, defaultBranch) })
 	case is("revision"):
-		route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) { s.hfModelInfo(w, r, repo, rest[1]) })
+		route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) { s.hfRepoInfo(w, r, repo, rest[1]) })
 	case len(rest) >= 2 && rest[0] == "tree":
 		route(registry.RoleRead, func(w http.ResponseWriter, r *http.Request) {
 			s.hfTree(w, r, repo, rest[1], strings.Join(rest[2:], "/"))
@@ -109,7 +160,9 @@ func (s *Server) hfModels(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) hfModelInfo(w http.ResponseWriter, r *http.Request, repo, rev string) {
+// hfRepoInfo answers model_info, dataset_info and repo_info. repo is the
+// repository's key.
+func (s *Server) hfRepoInfo(w http.ResponseWriter, r *http.Request, repo, rev string) {
 	c, err := s.resolve(r.Context(), repo, rev)
 	if err != nil {
 		s.hfFail(w, r, err)
@@ -131,8 +184,13 @@ func (s *Server) hfModelInfo(w http.ResponseWriter, r *http.Request, repo, rev s
 	for i, f := range files {
 		siblings[i] = map[string]string{"rfilename": f.Path}
 	}
-	doc["id"] = repo
-	doc["modelId"] = repo
+	// The Hub names a repository by its id alone, whatever its type; only a
+	// model's description also carries modelId.
+	typ, name := registry.SplitRepoKey(repo)
+	doc["id"] = name
+	if typ.IsZero() {
+		doc["modelId"] = name
+	}
 	doc["sha"] = c.SHA
 	doc["siblings"] = siblings
 	doc["private"] = false
@@ -194,8 +252,7 @@ func (s *Server) hfTree(w http.ResponseWriter, r *http.Request, repo, rev, dir s
 			d := prefix + rel[:i]
 			if !dirs[d] {
 				dirs[d] = true
-				sum := sha1.Sum([]byte(c.SHA + ":" + d)) //nolint:gosec // see import note.
-				out = append(out, hfTreeEntry{Type: hfEntryDirectory, OID: hex.EncodeToString(sum[:]), Path: d})
+				out = append(out, dirEntry(c, d))
 			}
 			if !deep {
 				break
@@ -204,17 +261,67 @@ func (s *Server) hfTree(w http.ResponseWriter, r *http.Request, repo, rev, dir s
 		if !deep && strings.Contains(rel, "/") {
 			continue
 		}
-		e := hfTreeEntry{Type: hfEntryFile, OID: f.GitOID, Size: f.Size, Path: f.Path}
-		if f.LFS {
-			e.LFS = &hfLFS{OID: f.SHA256, Size: f.Size, PointerSize: lfsPointerSize(f)}
-		}
-		out = append(out, e)
+		out = append(out, fileEntry(f))
 	}
 	if dir != "" && len(out) == 0 {
 		s.hfFail(w, r, fmt.Errorf("%w: %s", registry.ErrEntryNotFound, dir))
 		return
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	writeJSON(w, http.StatusOK, out)
+}
+
+// fileEntry is how the Hub lists a file in a tree or paths-info answer.
+func fileEntry(f registry.File) hfTreeEntry {
+	e := hfTreeEntry{Type: hfEntryFile, OID: f.GitOID, Size: f.Size, Path: f.Path}
+	if f.LFS {
+		e.LFS = &hfLFS{OID: f.SHA256, Size: f.Size, PointerSize: lfsPointerSize(f)}
+	}
+	return e
+}
+
+// dirEntry is how the Hub lists a directory of revision c. The registry
+// keeps no tree objects, so its id is a stable stand-in.
+func dirEntry(c registry.Commit, d string) hfTreeEntry {
+	sum := sha1.Sum([]byte(c.SHA + ":" + d)) //nolint:gosec // see import note.
+	return hfTreeEntry{Type: hfEntryDirectory, OID: hex.EncodeToString(sum[:]), Path: d}
+}
+
+// hfPathsInfo answers get_paths_info, which HfFileSystem also calls: the
+// tree entries of the paths named in the form field "paths", in the order
+// named. A path that is neither a file nor a directory of the revision is
+// left out, as the Hub does. "expand" (last commit, security scan) is not
+// supported and ignored; the entries are those of a plain listing.
+func (s *Server) hfPathsInfo(w http.ResponseWriter, r *http.Request, repo, rev string) {
+	paths, err := s.formValues(w, r, "paths")
+	if err != nil {
+		hfError(w, http.StatusBadRequest, "could not read the form: "+err.Error())
+		return
+	}
+	c, err := s.resolve(r.Context(), repo, rev)
+	if err != nil {
+		s.hfFail(w, r, err)
+		return
+	}
+	files, err := s.reg.Files(r.Context(), c)
+	if err != nil {
+		s.hfFail(w, r, err)
+		return
+	}
+	out := []hfTreeEntry{}
+	for _, p := range paths {
+		p = strings.Trim(p, "/")
+		if p == "" {
+			continue
+		}
+		i, found := sort.Find(len(files), func(i int) int { return strings.Compare(p, files[i].Path) })
+		switch {
+		case found:
+			out = append(out, fileEntry(files[i]))
+		case slices.ContainsFunc(files, func(f registry.File) bool { return strings.HasPrefix(f.Path, p+"/") }):
+			out = append(out, dirEntry(c, p))
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -250,13 +357,13 @@ func (s *Server) hfRefs(w http.ResponseWriter, r *http.Request, repoName string)
 	writeJSON(w, http.StatusOK, out)
 }
 
-// hfResolve serves a file. segs is {ns, name, "resolve", rev, path...}.
-func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string) {
+// hfResolve serves a file: filePath at revision rev of the repository with
+// key repo.
+func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, repo, rev, filePath string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		hfError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	repo, rev, filePath := segs[0]+"/"+segs[1], segs[3], strings.Join(segs[4:], "/")
 	c, err := s.resolve(r.Context(), repo, rev)
 	if err != nil {
 		s.hfFail(w, r, err)
@@ -296,7 +403,7 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 		}
 		if s.puller == nil {
 			writeHFError(w, http.StatusNotFound, hfCodeEntryNotFound, fmt.Sprintf(
-				"%s is listed in this revision but was never fetched from upstream, and pull-through is off: run `modelctl mirror %s` or turn pull-through on", filePath, repo), nil)
+				"%s is listed in this revision but was never fetched from upstream, and pull-through is off: run `%s` or turn pull-through on", filePath, mirrorCommand(repo)), nil)
 			return
 		}
 		// The file is fetched, by this request or by the fetch already in
@@ -323,7 +430,7 @@ func (s *Server) hfResolve(w http.ResponseWriter, r *http.Request, segs []string
 				hfError(w, http.StatusForbidden, err.Error())
 			case errors.Is(err, errNotFromUpstream):
 				writeHFError(w, http.StatusNotFound, hfCodeEntryNotFound, fmt.Sprintf(
-					"%s is listed in this revision but was never fetched, and %s was created in this registry, so pull-through does not fetch into it: run `modelctl mirror %s`", filePath, repo, repo), nil)
+					"%s is listed in this revision but was never fetched, and %s was created in this registry, so pull-through does not fetch into it: run `%s`", filePath, repo, mirrorCommand(repo)), nil)
 			default:
 				// The upstream's failure or the registry's own: pullFailure
 				// says which, and only the first is described to the client.

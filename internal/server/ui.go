@@ -39,8 +39,21 @@ var uiFuncs = template.FuncMap{
 	},
 }
 
-// repoPage is the address of a repository's page in the web UI.
-func repoPage(name string) string { return "/ui/repo/" + kit.EscapePath(name) }
+// uiRepoRoot is where the pages of repositories of type typ are in the web
+// UI: /ui/repo/ for models, as before datasets existed, and /ui/dataset/
+// for datasets.
+func uiRepoRoot(typ registry.RepoType) string {
+	if typ == registry.TypeDataset {
+		return "/ui/dataset/"
+	}
+	return "/ui/repo/"
+}
+
+// repoPage is the address of the page of the repository with key key.
+func repoPage(key string) string {
+	typ, name := registry.SplitRepoKey(key)
+	return uiRepoRoot(typ) + kit.EscapePath(name)
+}
 
 var uiPages = func() map[string]*template.Template {
 	out := map[string]*template.Template{}
@@ -133,13 +146,19 @@ func (s *Server) uiIndex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
-	name := repoParam(r)
-	detail, err := s.describeRepo(r.Context(), name)
+// uiRepo shows a repository of type typ.
+func (s *Server) uiRepo(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { s.showRepo(w, r, repoParam(r, typ)) }
+}
+
+// showRepo renders the page of the repository with key key.
+func (s *Server) showRepo(w http.ResponseWriter, r *http.Request, key string) {
+	detail, err := s.describeRepo(r.Context(), key)
 	if err != nil {
 		s.uiError(w, r, err)
 		return
 	}
+	name := detail.Name
 	if len(detail.Revisions) == 0 {
 		s.render(w, r, http.StatusOK, "error.html", name, map[string]any{
 			"Error": "This repository has no revisions yet. Upload to it with `hf upload` or `modelctl push`.",
@@ -156,7 +175,7 @@ func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	c, err := s.reg.Resolve(r.Context(), name, rev)
+	c, err := s.reg.Resolve(r.Context(), key, rev)
 	if err != nil {
 		s.uiError(w, r, err)
 		return
@@ -192,27 +211,31 @@ func (s *Server) uiRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) uiDeleteRepo(w http.ResponseWriter, r *http.Request) {
-	name := repoParam(r)
-	// Typing the name guards against deleting the wrong repository.
-	if s.formValue(w, r, "confirm") != name {
-		http.Redirect(w, r, repoPage(name)+"?notice="+noticeNotDeleted, http.StatusSeeOther)
-		return
+// uiDeleteRepo deletes a repository of type typ.
+func (s *Server) uiDeleteRepo(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := repoParam(r, typ)
+		// Typing the name guards against deleting the wrong repository. The
+		// type is in the page's address, so the name is what is typed.
+		if _, name := registry.SplitRepoKey(key); s.formValue(w, r, "confirm") != name {
+			http.Redirect(w, r, repoPage(key)+"?notice="+noticeNotDeleted, http.StatusSeeOther)
+			return
+		}
+		res, err := s.reg.DeleteRepo(r.Context(), key)
+		// As in apiDeleteRepo: once the deletion has committed the repository
+		// is gone, whatever then happens to the files it held.
+		notice := noticeDeleted
+		switch {
+		case errors.Is(err, registry.ErrBlobsNotFreed):
+			s.logNotFreed(err, "repo", key)
+			notice = noticeDeletedPartly
+		case err != nil:
+			s.uiError(w, r, err)
+			return
+		}
+		s.log.Info("repository deleted", "repo", key, "blobs_freed", res.Blobs, "bytes_freed", res.Bytes, "via", "ui")
+		http.Redirect(w, r, "/?notice="+notice, http.StatusSeeOther)
 	}
-	res, err := s.reg.DeleteRepo(r.Context(), name)
-	// As in apiDeleteRepo: once the deletion has committed the repository
-	// is gone, whatever then happens to the files it held.
-	notice := noticeDeleted
-	switch {
-	case errors.Is(err, registry.ErrBlobsNotFreed):
-		s.logNotFreed(err, "repo", name)
-		notice = noticeDeletedPartly
-	case err != nil:
-		s.uiError(w, r, err)
-		return
-	}
-	s.log.Info("repository deleted", "repo", name, "blobs_freed", res.Blobs, "bytes_freed", res.Bytes, "via", "ui")
-	http.Redirect(w, r, "/?notice="+notice, http.StatusSeeOther)
 }
 
 func (s *Server) uiLoginForm(w http.ResponseWriter, r *http.Request) {

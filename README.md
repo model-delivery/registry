@@ -153,7 +153,7 @@ setting that is not a secret has both; a flag wins over its variable.
 | `--require-auth` | `REGISTRY_REQUIRE_AUTH` | `false` | Require a token for downloads and browsing too |
 | `--require-admin-token` | `REGISTRY_REQUIRE_ADMIN_TOKEN` | `false` | Refuse to start without a supplied admin token instead of generating one and printing it. Use on Kubernetes and anywhere logs are collected |
 | `--pull-through` | `REGISTRY_PULL_THROUGH` | `false` | Fetch a model from the upstream hub the first time a client asks for one the registry does not hold |
-| `--pull-through-allow` | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*` |
+| `--pull-through-allow` | `REGISTRY_PULL_THROUGH_ALLOW` | all | Comma-separated patterns limiting which repositories pull-through may fetch, for example `meta-llama/*,google/*`. A dataset is matched as `datasets/namespace/name`, so `datasets/acme/*` names datasets and `acme/*` models only |
 | `--pull-through-max-file-bytes` | `REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` | `0` (no limit) | Largest file, in bytes, that pull-through fetches on demand. Larger files are refused with an error naming `modelctl mirror` |
 | `--pull-through-stream` | `REGISTRY_PULL_THROUGH_STREAM` | `true` | Send a file to the clients waiting for it while pull-through is still fetching it, holding back its end until it is verified. `false` sends nothing until the file is stored. See [the first download](docs/operations.md#the-first-download-of-a-file) |
 | `--max-blob-bytes` | `REGISTRY_MAX_BLOB_BYTES` | `0` (no limit) | Largest single file, in bytes, that an upload may store. Larger uploads are refused with `413` |

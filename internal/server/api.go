@@ -26,7 +26,21 @@ const defaultBranch = "main"
 // written to the client before the file fetches that report them wait too.
 const mirrorEventBuffer = 64
 
-func repoParam(r *http.Request) string { return r.PathValue("ns") + "/" + r.PathValue("name") }
+// apiRepoRoot is where repositories of type typ live in the registry's API:
+// /api/v1/repos for models, as before datasets existed, and
+// /api/v1/datasets for datasets.
+func apiRepoRoot(typ registry.RepoType) string {
+	if typ == registry.TypeDataset {
+		return "/api/v1/datasets"
+	}
+	return "/api/v1/repos"
+}
+
+// repoParam is the key of the repository of type typ that a route's
+// {ns}/{name} names.
+func repoParam(r *http.Request, typ registry.RepoType) string {
+	return registry.RepoKey(typ, r.PathValue("ns")+"/"+r.PathValue("name"))
+}
 
 func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := s.readJSON(w, r, maxJSONBytes, v, true); err != nil {
@@ -36,13 +50,22 @@ func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool 
 	return true
 }
 
-func (s *Server) apiListRepos(w http.ResponseWriter, r *http.Request) {
-	repos, err := s.reg.ListRepos(r.Context())
-	if err != nil {
-		s.fail(w, r, err)
-		return
+// apiListRepos lists the repositories of type typ.
+func (s *Server) apiListRepos(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		all, err := s.reg.ListRepos(r.Context())
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		repos := []registry.RepoSummary{}
+		for _, repo := range all {
+			if repo.Type == typ {
+				repos = append(repos, repo)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
 }
 
 // repoDetail is the body of GET /api/v1/repos/{repo}.
@@ -69,13 +92,15 @@ func (s *Server) describeRepo(ctx context.Context, name string) (repoDetail, err
 	return repoDetail{Repo: repo, Refs: refs, Revisions: commits}, nil
 }
 
-func (s *Server) apiGetRepo(w http.ResponseWriter, r *http.Request) {
-	d, err := s.describeRepo(r.Context(), repoParam(r))
-	if err != nil {
-		s.fail(w, r, err)
-		return
+func (s *Server) apiGetRepo(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		d, err := s.describeRepo(r.Context(), repoParam(r, typ))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, d)
 	}
-	writeJSON(w, http.StatusOK, d)
 }
 
 // revisionDetail is the body of GET /api/v1/repos/{repo}/revisions/{rev}.
@@ -84,18 +109,20 @@ type revisionDetail struct {
 	Files []registry.File `json:"files"`
 }
 
-func (s *Server) apiGetRevision(w http.ResponseWriter, r *http.Request) {
-	c, err := s.resolve(r.Context(), repoParam(r), r.PathValue("rev"))
-	if err != nil {
-		s.fail(w, r, err)
-		return
+func (s *Server) apiGetRevision(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := s.resolve(r.Context(), repoParam(r, typ), r.PathValue("rev"))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		files, err := s.reg.Files(r.Context(), c)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, revisionDetail{Commit: c, Files: files})
 	}
-	files, err := s.reg.Files(r.Context(), c)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, revisionDetail{Commit: c, Files: files})
 }
 
 // commitRequest is the body of POST /api/v1/repos/{repo}/commits.
@@ -112,29 +139,31 @@ type commitRequest struct {
 	} `json:"files"`
 }
 
-func (s *Server) apiCommit(w http.ResponseWriter, r *http.Request) {
-	var req commitRequest
-	if !s.decodeBody(w, r, &req) {
-		return
+func (s *Server) apiCommit(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req commitRequest
+		if !s.decodeBody(w, r, &req) {
+			return
+		}
+		if req.Branch == "" {
+			req.Branch = defaultBranch
+		}
+		in := registry.CommitInput{Repo: repoParam(r, typ), Branch: req.Branch, Tags: req.Tags, Message: req.Message,
+			Source: registry.SourcePush, Merge: req.Merge}
+		for _, f := range req.Files {
+			// Pushed files are recorded the way the hub records LFS files, so
+			// clients identify them by SHA-256.
+			in.Files = append(in.Files, registry.File{Path: f.Path, SHA256: f.SHA256, LFS: true})
+		}
+		c, err := s.reg.Commit(r.Context(), in)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		s.m.commits.With(sourcePush).Inc()
+		s.log.Info("revision recorded", "repo", c.Key(), "sha", c.SHA, "branch", req.Branch)
+		writeJSON(w, http.StatusCreated, c)
 	}
-	if req.Branch == "" {
-		req.Branch = defaultBranch
-	}
-	in := registry.CommitInput{Repo: repoParam(r), Branch: req.Branch, Tags: req.Tags, Message: req.Message,
-		Source: registry.SourcePush, Merge: req.Merge}
-	for _, f := range req.Files {
-		// Pushed files are recorded the way the hub records LFS files, so
-		// clients identify them by SHA-256.
-		in.Files = append(in.Files, registry.File{Path: f.Path, SHA256: f.SHA256, LFS: true})
-	}
-	c, err := s.reg.Commit(r.Context(), in)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	s.m.commits.With(sourcePush).Inc()
-	s.log.Info("revision recorded", "repo", c.Repo, "sha", c.SHA, "branch", req.Branch)
-	writeJSON(w, http.StatusCreated, c)
 }
 
 // uploaded counts a file that an upload sent and the registry stored.
@@ -184,17 +213,20 @@ func (s *Server) logNotFreed(notFreed error, attrs ...any) {
 	}
 }
 
-func (s *Server) apiDeleteRepo(w http.ResponseWriter, r *http.Request) {
-	res, err := s.reg.DeleteRepo(r.Context(), repoParam(r))
-	// The deletion is one transaction, and freeing the repository's files
-	// comes after it. A failure there leaves the repository deleted, which
-	// is what the caller asked for and is told.
-	if err != nil && !errors.Is(err, registry.ErrBlobsNotFreed) {
-		s.fail(w, r, err)
-		return
+func (s *Server) apiDeleteRepo(typ registry.RepoType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		repo := repoParam(r, typ)
+		res, err := s.reg.DeleteRepo(r.Context(), repo)
+		// The deletion is one transaction, and freeing the repository's files
+		// comes after it. A failure there leaves the repository deleted, which
+		// is what the caller asked for and is told.
+		if err != nil && !errors.Is(err, registry.ErrBlobsNotFreed) {
+			s.fail(w, r, err)
+			return
+		}
+		s.log.Info("repository deleted", "repo", repo, "blobs_freed", res.Blobs, "bytes_freed", res.Bytes)
+		s.answerFreed(w, res, err, deleteWarning)
 	}
-	s.log.Info("repository deleted", "repo", repoParam(r), "blobs_freed", res.Blobs, "bytes_freed", res.Bytes)
-	s.answerFreed(w, res, err, deleteWarning)
 }
 
 func (s *Server) apiStatBlob(w http.ResponseWriter, r *http.Request) {
@@ -246,8 +278,10 @@ func (s *Server) apiPutBlob(w http.ResponseWriter, r *http.Request) {
 
 // mirrorRequest is the body of POST /api/v1/mirror.
 type mirrorRequest struct {
-	Repo     string `json:"repo"`
-	Revision string `json:"revision"`
+	Repo string `json:"repo"`
+	// Type is "dataset" for a dataset; empty or "model" for a model.
+	Type     registry.RepoType `json:"type"`
+	Revision string            `json:"revision"`
 	// UpstreamToken authenticates to the upstream hub for private or gated
 	// repositories. It is used for this request only and never stored.
 	UpstreamToken string `json:"upstream_token"`
@@ -262,13 +296,23 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
+	typ, err := registry.ParseRepoType(string(req.Type))
+	if err == nil {
+		// The name on its own first: one of more segments must not pass for
+		// another type's key.
+		err = registry.ValidateRepoName(req.Repo)
+	}
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	up := s.upstream()
 	if req.UpstreamToken != "" {
 		up.Token = req.UpstreamToken
 	}
 	// Resolve upstream before answering, so a wrong name or a missing
 	// token comes back as a proper HTTP error.
-	plan, err := mirror.Prepare(r.Context(), up, req.Repo, req.Revision)
+	plan, err := mirror.Prepare(r.Context(), up, registry.RepoKey(typ, req.Repo), req.Revision)
 	if err != nil {
 		s.fail(w, r, upstreamFailure(err))
 		return
@@ -337,13 +381,13 @@ func (s *Server) mirrorFailure(plan *mirror.Plan, err error) string {
 	case mirror.FromUpstream(err) && status == http.StatusInternalServerError:
 		// The upstream's doing, of a kind with no status of its own: a
 		// dropped connection, an error answer.
-		s.log.Warn("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+		s.log.Warn("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
 		return "mirror failed: " + err.Error()
 	case status == http.StatusInternalServerError:
-		s.log.Error("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+		s.log.Error("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
 		return mirrorFailedLocally
 	}
-	s.log.Warn("mirror failed", "repo", plan.Info.ID, "sha", plan.Info.SHA, "error", err)
+	s.log.Warn("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
 	return err.Error()
 }
 

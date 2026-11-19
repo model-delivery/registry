@@ -35,6 +35,14 @@ Free space equal to the largest single file is needed on the same volume
 while that file is being received, because uploads are written to
 `data/tmp/` and then moved into place.
 
+**Datasets can be far larger than models.** A dataset repository on the
+Hub can hold terabytes in thousands of files, and `modelctl mirror
+--repo-type dataset` copies a whole revision. Check a dataset's size
+upstream before mirroring it; with pull-through, set
+`REGISTRY_PULL_THROUGH_MAX_FILE_BYTES` and an allow list (below) so a
+request cannot start a fetch you did not plan for. Models and datasets
+share the store: a file both contain is kept once.
+
 ## S3 storage
 
 To keep model files in an object store instead of on the server's disk:
@@ -261,6 +269,24 @@ for every mirror.
 Once mirrored, the model is governed by your registry's access settings.
 Honour the model's licence and access terms.
 
+## Mirroring datasets
+
+A dataset repository is mirrored the same way, with the hf CLI's
+`--repo-type dataset`:
+
+```bash
+modelctl mirror --repo-type dataset acme/reviews --revision main
+```
+
+The registry asks the upstream for the dataset at its dataset addresses
+(`/api/datasets/...`, `/datasets/.../resolve/...`), verifies every file
+against its digest, and records it as a dataset under the upstream's
+revision id. A model and a dataset of the same name are separate
+repositories: mirroring one never touches the other. `push`, `pull`,
+`inspect`, `list` and `delete` take `--repo-type dataset` too, and
+clients reach the dataset with `repo_type="dataset"` (see
+[compatibility.md](compatibility.md#datasets)).
+
 ## Pull-through caching
 
 With `--pull-through` (or `REGISTRY_PULL_THROUGH=true`) the registry fills
@@ -430,6 +456,14 @@ of:
   comma-separated list of patterns over the repository id, such as
   `meta-llama/*,google/*,*/*-GGUF`. Repositories that match nothing are
   served only if already stored.
+
+  A pattern is matched against a repository's address on the Hub without
+  the host: `namespace/name` for a model, `datasets/namespace/name` for a
+  dataset. A `*` never matches a `/`, so `meta-llama/*` and `*/*-GGUF`
+  name models only, as they did before the registry held datasets, and
+  datasets are named with the `datasets/` prefix: `datasets/acme/*` for
+  one namespace's datasets, `datasets/*/*` for all of them. With no allow
+  list at all, both models and datasets are fetched.
 
 The server logs a warning at start if pull-through is on with neither.
 
@@ -881,9 +915,17 @@ minimum that makes sense; raise it a little).
 ## Upgrading
 
 Replace the binary or the image and restart. The database schema is
-versioned; a newer server upgrades it at start. A server refuses to open a
-data directory written by a newer version than itself, so take a backup
-before upgrading if you might need to go back.
+versioned; a newer server upgrades it at start, in one transaction, so a
+start that is interrupted leaves the old version to be upgraded again. A
+server refuses to open a data directory written by a newer version than
+itself, so take a backup before upgrading if you might need to go back.
+
+The version that added datasets (schema version 3) rebuilds the table of
+repositories and makes every existing repository a model. It also
+reserves the namespace `datasets`: a model already in it, say
+`datasets/old`, stays readable at its usual addresses and can be deleted,
+but takes no new revisions; push its content to another name to keep
+working on it.
 
 ## Limits
 

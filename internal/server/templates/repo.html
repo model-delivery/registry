@@ -1,16 +1,16 @@
 {{define "content"}}
 {{$host := .Host}}{{$admin := .IsAdmin}}
 {{with .Data}}
-{{$repo := .Repo.Name}}{{$sha := .Commit.SHA}}{{$names := .RefNames}}
-<h1>{{$repo}}</h1>
+{{$repo := .Repo.Name}}{{$key := .Repo.Key}}{{$dataset := not .Repo.Type.IsZero}}{{$sha := .Commit.SHA}}{{$names := .RefNames}}
+<h1>{{$repo}}{{if $dataset}} <span class="tag">{{.Repo.Type}}</span>{{end}}</h1>
 <p class="meta">
-  {{if .Repo.Upstream}}Mirror of <a href="{{.Repo.Upstream}}/{{$repo}}" rel="noreferrer">{{.Repo.Upstream}}/{{$repo}}</a>{{else}}Pushed to this registry{{end}}
+  {{if .Repo.Upstream}}Mirror of <a href="{{.Repo.Upstream}}/{{$key}}" rel="noreferrer">{{.Repo.Upstream}}/{{$key}}</a>{{else}}Pushed to this registry{{end}}
   {{if .Pipeline}} · {{.Pipeline}}{{end}}{{if .Library}} · {{.Library}}{{end}}{{if .License}} · license {{.License}}{{end}}
 </p>
 
 <h2>Download</h2>
 <pre>export HF_ENDPOINT={{$host}}
-hf download {{$repo}} --revision {{$sha}}</pre>
+hf download {{$repo}}{{if $dataset}} --repo-type dataset{{end}} --revision {{$sha}}</pre>
 <p class="hint">Any tool built on <code>huggingface_hub</code> works the same way. The revision id pins exactly these files.</p>
 
 <h2>Files in <code title="{{$sha}}">{{short $sha}}</code>{{range index $names $sha}} <span class="tag">{{.}}</span>{{end}}</h2>
@@ -20,7 +20,7 @@ hf download {{$repo}} --revision {{$sha}}</pre>
   <tbody>
   {{range .Files}}
   <tr>
-    <td><a href="{{fileURL $repo $sha .Path}}">{{.Path}}</a></td>
+    <td><a href="{{fileURL $key $sha .Path}}">{{.Path}}</a></td>
     <td class="num">{{bytes .Size}}</td>
     <td>{{if .Pending}}<span class="tag" title="Listed from upstream. Its content is fetched the first time someone downloads it.">fetched on demand</span>{{else}}<code title="{{.SHA256}}">{{short .SHA256}}</code>{{end}}</td>
   </tr>
@@ -47,7 +47,7 @@ hf download {{$repo}} --revision {{$sha}}</pre>
 
 {{if $admin}}
 <h2>Delete repository</h2>
-<form class="danger" method="post" action="{{repoURL $repo}}/delete">
+<form class="danger" method="post" action="{{repoURL $key}}/delete">
   <p>Removes every revision of <strong>{{$repo}}</strong> and frees files no other repository uses. This cannot be undone.</p>
   <label for="confirm">Type the repository name to confirm</label>
   <input id="confirm" name="confirm" autocomplete="off" required placeholder="{{$repo}}">

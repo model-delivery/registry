@@ -77,6 +77,21 @@ func TestRouteClass(t *testing.T) {
 		{http.MethodGet, "/a//b", routeOther},
 		{http.MethodGet, "/acme/tiny/resolve/main/%00", routeDownload},
 		{"PROPFIND", "/acme/tiny/resolve/main/config.json", routeDownload},
+
+		// Datasets, at the Hub's dataset addresses.
+		{http.MethodGet, "/datasets/acme/tiny/resolve/main/data/train.csv", routeDownload},
+		{http.MethodPost, "/api/datasets/acme/tiny/commit/main", routeUpload},
+		{http.MethodGet, "/api/v1/datasets", routeAPI},
+		{http.MethodDelete, "/api/v1/datasets/acme/tiny", routeAPI},
+		{http.MethodGet, "/api/datasets/acme/tiny/tree/main", routeHF},
+		{http.MethodPost, "/api/datasets/acme/tiny/paths-info/main", routeHF},
+		{http.MethodPost, "/datasets/acme/tiny.git/info/lfs/objects/batch", routeHF},
+		{http.MethodGet, "/ui/dataset/acme/tiny", routeUI},
+		{http.MethodGet, "/datasets/acme/tiny", routeUI},
+		// A model in the datasets namespace, recorded before it was reserved.
+		{http.MethodGet, "/datasets/legacy/resolve/main/config.json", routeDownload},
+		{http.MethodGet, "/datasets/legacy", routeUI},
+		{http.MethodGet, "/info?dataset=acme/tiny", routeOther},
 	}
 	classes := []string{routeDownload, routeUpload, routeAPI, routeTask, routeHF, routeUI, routeProbe, routeOther}
 	for _, tc := range cases {

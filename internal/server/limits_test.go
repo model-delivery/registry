@@ -390,6 +390,16 @@ func TestFileTransfersHaveNoBodyDeadline(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a commit carrying files, to a dataset", func(t *testing.T) {
+		t.Parallel()
+		lines := commitBody(t, header("slow", ""), inlineFile("train.csv", strings.Repeat("c", 5000)))
+		raw, _ := io.ReadAll(lines)
+		resp := do(t, http.MethodPost, in.URL+"/api/datasets/acme/slow-commit/commit/main", in.Write,
+			&slowly{content: string(raw), pause: pause}, map[string]string{"Content-Type": "application/x-ndjson"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d (%s)", resp.StatusCode, body(t, resp))
+		}
+	})
 }
 
 // The deadline is for the request body only. A response that takes longer

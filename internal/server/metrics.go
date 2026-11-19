@@ -287,14 +287,15 @@ func routeClass(r *http.Request) string {
 	}
 	// What root routes, parsed the way root parses it.
 	segs, ok := splitPath(r.URL.EscapedPath())
-	switch {
-	case !ok:
+	if !ok {
 		return routeOther
-	case len(segs) >= 5 && segs[2] == "resolve":
+	}
+	switch parseRootPath(segs).kind {
+	case rootResolve:
 		return routeDownload
-	case isLFSBatch(segs):
+	case rootLFSBatch:
 		return routeHF
-	case len(segs) == 2:
+	case rootRepoLink:
 		return routeUI // a hub-style link to a repository page
 	}
 	return routeOther

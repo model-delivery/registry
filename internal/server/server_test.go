@@ -236,8 +236,10 @@ func TestAccessControl(t *testing.T) {
 	private := regtest.Start(t, server.Config{AnonymousRead: false})
 	for _, in := range []*regtest.Instance{open, private} {
 		push(t, in, "acme/tiny", modelFiles, client.PushOptions{})
+		push(t, in, "datasets/acme/tiny", modelFiles, client.PushOptions{})
 	}
 	blobURL := "/api/v1/blobs/" + kit.SHA256Hex("new")
+	pathsInfo := "paths=config.json"
 
 	type attempt struct {
 		name   string
@@ -377,6 +379,62 @@ func TestAccessControl(t *testing.T) {
 		// Fixed answers that say nothing about what the registry holds.
 		{"private: xet explanation", private, http.MethodGet, "/api/xet-is-not-supported/x", none, "", 400},
 		{"private: unimplemented API route", private, http.MethodGet, "/api/something-else", none, "", 404},
+
+		// paths-info reads, though it is a POST: the read rule, for both types.
+		{"open: anonymous model paths-info", open, http.MethodPost, "/api/models/acme/tiny/paths-info/main", none, pathsInfo, 200},
+		{"private: anonymous model paths-info", private, http.MethodPost, "/api/models/acme/tiny/paths-info/main", none, pathsInfo, 401},
+		{"private: read token model paths-info", private, http.MethodPost, "/api/models/acme/tiny/paths-info/main", read, pathsInfo, 200},
+		{"open: anonymous dataset paths-info", open, http.MethodPost, "/api/datasets/acme/tiny/paths-info/main", none, pathsInfo, 200},
+		{"private: anonymous dataset paths-info", private, http.MethodPost, "/api/datasets/acme/tiny/paths-info/main", none, pathsInfo, 401},
+		{"private: read token dataset paths-info", private, http.MethodPost, "/api/datasets/acme/tiny/paths-info/main", read, pathsInfo, 200},
+
+		// Datasets: every route a model has, with the same rules.
+		{"open: anonymous dataset download", open, http.MethodGet, "/datasets/acme/tiny/resolve/main/config.json", none, "", 200},
+		{"private: anonymous dataset download", private, http.MethodGet, "/datasets/acme/tiny/resolve/main/config.json", none, "", 401},
+		{"private: unknown token dataset download", private, http.MethodGet, "/datasets/acme/tiny/resolve/main/config.json", foreign, "", 401},
+		{"private: read token dataset download", private, http.MethodGet, "/datasets/acme/tiny/resolve/main/config.json", read, "", 200},
+		{"private: anonymous dataset file metadata", private, http.MethodHead, "/datasets/acme/tiny/resolve/main/config.json", none, "", 401},
+		{"open: anonymous dataset info", open, http.MethodGet, "/api/datasets/acme/tiny/revision/main", none, "", 200},
+		{"private: anonymous dataset info", private, http.MethodGet, "/api/datasets/acme/tiny/revision/main", none, "", 401},
+		{"private: read token dataset info", private, http.MethodGet, "/api/datasets/acme/tiny", read, "", 200},
+		{"private: anonymous dataset tree", private, http.MethodGet, "/api/datasets/acme/tiny/tree/main", none, "", 401},
+		{"private: anonymous dataset refs", private, http.MethodGet, "/api/datasets/acme/tiny/refs", none, "", 401},
+		{"private: read token dataset refs", private, http.MethodGet, "/api/datasets/acme/tiny/refs", read, "", 200},
+		{"private: anonymous dataset xet token", private, http.MethodGet, "/api/datasets/acme/tiny/xet-write-token/main", none, "", 401},
+		{"private: anonymous dataset viewer route", private, http.MethodGet, "/api/datasets/acme/tiny/parquet", none, "", 401},
+		{"open: anonymous dataset viewer route", open, http.MethodGet, "/api/datasets/acme/tiny/parquet", none, "", 404},
+		{"open: anonymous dataset preupload", open, http.MethodPost, "/api/datasets/acme/tiny/preupload/main", none, `{}`, 401},
+		{"open: read token dataset preupload", open, http.MethodPost, "/api/datasets/acme/tiny/preupload/main", read, `{}`, 403},
+		{"open: anonymous dataset HF commit", open, http.MethodPost, "/api/datasets/acme/tiny/commit/main", none, `{}`, 401},
+		{"open: read token dataset HF commit", open, http.MethodPost, "/api/datasets/acme/tiny/commit/main", read, `{}`, 403},
+		{"open: read token dataset create branch", open, http.MethodPost, "/api/datasets/acme/tiny/branch/dev", read, `{}`, 403},
+		{"open: anonymous POST to an unknown dataset route", open, http.MethodPost, "/api/datasets/acme/tiny/anything/else", none, `{}`, 401},
+		{"open: read token create dataset", open, http.MethodPost, "/api/repos/create", read, `{"name":"x","organization":"acme","type":"dataset"}`, 403},
+		{"open: anonymous dataset large-file batch", open, http.MethodPost, "/datasets/acme/tiny.git/info/lfs/objects/batch", none, `{"operation":"upload"}`, 401},
+		{"open: read token dataset large-file batch", open, http.MethodPost, "/datasets/acme/tiny.git/info/lfs/objects/batch", read, `{"operation":"upload"}`, 403},
+		{"open: write token dataset large-file batch", open, http.MethodPost, "/datasets/acme/tiny.git/info/lfs/objects/batch", write, `{"operation":"upload"}`, 200},
+		{"open: anonymous dataset list", open, http.MethodGet, "/api/v1/datasets", none, "", 200},
+		{"private: anonymous dataset list", private, http.MethodGet, "/api/v1/datasets", none, "", 401},
+		{"private: read token dataset list", private, http.MethodGet, "/api/v1/datasets", read, "", 200},
+		{"private: anonymous dataset inspect", private, http.MethodGet, "/api/v1/datasets/acme/tiny", none, "", 401},
+		{"private: read token dataset inspect", private, http.MethodGet, "/api/v1/datasets/acme/tiny", read, "", 200},
+		{"private: anonymous dataset revision", private, http.MethodGet, "/api/v1/datasets/acme/tiny/revisions/main", none, "", 401},
+		{"private: read token dataset revision", private, http.MethodGet, "/api/v1/datasets/acme/tiny/revisions/main", read, "", 200},
+		{"open: anonymous dataset commit", open, http.MethodPost, "/api/v1/datasets/acme/x/commits", none, `{}`, 401},
+		{"open: read token dataset commit", open, http.MethodPost, "/api/v1/datasets/acme/x/commits", read, `{}`, 403},
+		{"open: anonymous dataset mirror", open, http.MethodPost, "/api/v1/mirror", none, `{"repo":"a/b","type":"dataset"}`, 401},
+		{"open: read token dataset mirror", open, http.MethodPost, "/api/v1/mirror", read, `{"repo":"a/b","type":"dataset"}`, 403},
+		{"open: anonymous dataset delete", open, http.MethodDelete, "/api/v1/datasets/acme/tiny", none, "", 401},
+		{"open: write token dataset delete", open, http.MethodDelete, "/api/v1/datasets/acme/tiny", write, "", 403},
+		{"open: dataset page", open, http.MethodGet, "/ui/dataset/acme/tiny", none, "", 200},
+		{"private: dataset page", private, http.MethodGet, "/ui/dataset/acme/tiny", none, "", 303},
+		{"private: dataset page, read token", private, http.MethodGet, "/ui/dataset/acme/tiny", read, "", 200},
+		{"private: hub-style dataset link", private, http.MethodGet, "/datasets/acme/tiny", none, "", 302},
+		{"open: anonymous dataset UI delete", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", none, "", 403},
+		{"open: write token dataset UI delete", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", write, "", 403},
+		{"open: admin dataset UI delete without the typed name", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", admin, "", 303},
+		// Spaces are not supported: the fixed "not implemented".
+		{"private: spaces", private, http.MethodGet, "/api/spaces/acme/tiny", none, "", 404},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -394,6 +452,9 @@ func TestAccessControl(t *testing.T) {
 	// After all the refused attempts the repository is still there.
 	if _, err := open.Reg.Resolve(context.Background(), "acme/tiny", "main"); err != nil {
 		t.Fatalf("repository damaged by refused requests: %v", err)
+	}
+	if _, err := open.Reg.Resolve(context.Background(), "datasets/acme/tiny", "main"); err != nil {
+		t.Fatalf("dataset damaged by refused requests: %v", err)
 	}
 }
 

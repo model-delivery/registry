@@ -37,6 +37,11 @@ import (
 //	PUT  <signed url from the batch answer>     send one large file
 //	POST /api/models/{repo}/commit/{rev}        record the revision
 //
+// A dataset is uploaded the same way, through the same handlers, at the
+// Hub's dataset addresses: "type": "dataset" in the create request,
+// /api/datasets/{repo}/... and /datasets/{repo}.git/... ; each handler is
+// given the repository's key, which carries the type.
+//
 // Files up to inlineUploadMax travel inside the commit request. Larger ones
 // use the git-lfs batch protocol, which names every file by its SHA-256:
 // exactly how the registry stores them, so each upload is verified against
@@ -91,8 +96,9 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 		hfError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
-	if req.Type != "" && req.Type != "model" {
-		hfError(w, http.StatusBadRequest, "this registry stores model repositories only, not "+req.Type+"s")
+	typ, err := registry.ParseRepoType(req.Type)
+	if err != nil {
+		hfError(w, http.StatusBadRequest, "this registry stores models and datasets, not "+req.Type+"s")
 		return
 	}
 	namespace := req.Organization
@@ -101,16 +107,19 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 		// caller's own. Here the caller is a token, so its name stands in.
 		namespace = s.identity(r).Name
 	}
-	repo := namespace + "/" + req.Name
+	name := namespace + "/" + req.Name
+	if err := registry.ValidateRepoName(name); err != nil {
+		hfError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid repository id: use namespace/name with letters, digits, '.', '_' or '-'", name))
+		return
+	}
+	repo := registry.RepoKey(typ, name)
 	created, err := s.reg.CreateRepo(r.Context(), repo)
 	if err != nil {
-		if errors.Is(err, registry.ErrInvalid) {
-			hfError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid repository id: use namespace/name with letters, digits, '.', '_' or '-'", repo))
-			return
-		}
 		s.hfFail(w, r, err)
 		return
 	}
+	// The repository's address on the Hub, which is its key: the client
+	// reads the type back from it.
 	address := baseURL(r) + "/" + repo
 	if !created {
 		// Clients that pass exist_ok treat 409 as success. The body names
@@ -119,7 +128,7 @@ func (s *Server) hfCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("repository created", "repo", repo)
-	writeJSON(w, http.StatusOK, map[string]string{"url": address, "name": repo, "id": repo})
+	writeJSON(w, http.StatusOK, map[string]string{"url": address, "name": name, "id": name})
 }
 
 // hfValidateYAML accepts any model card. The Hub checks the card's
@@ -164,8 +173,9 @@ func (s *Server) uploadTargetOK(w http.ResponseWriter, r *http.Request, repo, re
 	switch {
 	case r.URL.Query().Get("create_pr") != "":
 		hfError(w, http.StatusBadRequest, "this registry has no pull requests: upload to a branch instead of passing create_pr")
-	case registry.ValidateRepoName(repo) != nil:
-		hfError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid repository id: use namespace/name", repo))
+	case registry.ValidateRepoKey(repo) != nil:
+		_, name := registry.SplitRepoKey(repo)
+		hfError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid repository id: use namespace/name", name))
 	case registry.IsSHA(rev):
 		hfError(w, http.StatusBadRequest, "a revision id cannot be uploaded to: revisions never change. Upload to a branch such as main")
 	default:
@@ -374,7 +384,7 @@ func (s *Server) hfCommit(w http.ResponseWriter, r *http.Request, repo, rev stri
 		return
 	}
 	s.m.commits.With(sourcePush).Inc()
-	s.log.Info("revision recorded", "repo", c.Repo, "sha", c.SHA, "branch", rev, "via", "hugging face upload")
+	s.log.Info("revision recorded", "repo", c.Key(), "sha", c.SHA, "branch", rev, "via", "hugging face upload")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":    true,
 		"commitOid":  c.SHA,

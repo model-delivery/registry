@@ -35,6 +35,9 @@ Server:
 
 Client:
   modelctl mirror <repo>              copy a repository from the upstream hub into the registry
+                                      (--all-refs: every branch and tag; --follow: keep it up to date)
+  modelctl follow list|stop           show or stop what the registry keeps up to date
+  modelctl sync <repo>|--all          check followed repositories against the upstream now
   modelctl push <dir> <repo>          upload a directory as a new revision
   modelctl pull <repo>                download a revision and verify it
   modelctl list                       list repositories
@@ -51,8 +54,8 @@ Recovery (registry stopped):
 
 Client commands read MODELCTL_ENDPOINT (default http://localhost:8080) and
 MODELCTL_TOKEN. Add --json to any of them for machine-readable output.
-mirror, push, pull, list, inspect and delete work on models; add
---repo-type dataset to work on datasets instead, as with hf.
+mirror, push, pull, list, inspect, delete, follow stop and sync work on
+models; add --repo-type dataset to work on datasets instead, as with hf.
 Run "modelctl <command> --help" for a command's flags.
 `
 
@@ -93,6 +96,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 		"serve": cmdServe, "mirror": cmdMirror, "push": cmdPush, "pull": cmdPull, "list": cmdList,
 		"inspect": cmdInspect, "delete": cmdDelete, "token": cmdToken, "gc": cmdGC,
 		"backup": cmdBackup, "restore": cmdRestore, "verify": cmdVerify,
+		"follow": cmdFollow, "sync": cmdSync,
 	}
 	switch args[0] {
 	case "help", "-h", "--help":
@@ -303,6 +307,8 @@ func cmdMirror(e *env, args []string) error {
 	c := newClientCommand(e, "mirror", "mirror <namespace/name> [flags]")
 	revision := c.String("revision", defaultBranch, "upstream branch, tag or revision id")
 	upToken := c.String("upstream-token", "", "token for the upstream hub, for private or gated repositories (env MODELCTL_UPSTREAM_TOKEN, then HF_TOKEN)")
+	allRefs := c.Bool("all-refs", false, "mirror every branch and tag the upstream has, instead of one revision")
+	follow := c.Bool("follow", false, "then keep the repository up to date with the upstream: the --revision branch, or every branch and tag with --all-refs")
 	typeFlag := c.repoTypeFlag()
 	pos, err := c.parse(args, 1, 1)
 	if err != nil {
@@ -312,7 +318,18 @@ func cmdMirror(e *env, args []string) error {
 	if err != nil {
 		return err
 	}
+	revisionGiven := false
+	c.Visit(func(f *flag.Flag) { revisionGiven = revisionGiven || f.Name == "revision" })
+	switch {
+	case *allRefs && revisionGiven:
+		return usagef("--all-refs mirrors every branch and tag; leave out --revision")
+	case *follow && !*allRefs && registry.IsSHA(*revision):
+		return usagef("--follow keeps a branch up to date, and a revision id never moves; name a branch with --revision, or use --all-refs")
+	}
 	upstreamToken := e.option(*upToken, "", "MODELCTL_UPSTREAM_TOKEN", "HF_TOKEN")
+	if *allRefs {
+		return c.mirrorAllRefs(key, upstreamToken, *follow)
+	}
 	done, err := c.client().Mirror(e.ctx, key, *revision, upstreamToken, func(ev client.MirrorEvent) {
 		if c.jsonOut {
 			return
@@ -328,11 +345,17 @@ func cmdMirror(e *env, args []string) error {
 		return err
 	}
 	if c.jsonOut {
-		return c.printJSON(done)
+		if err := c.printJSON(done); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(e.stdout, "Mirrored %s at revision %s\n", shown(done.Repo, done.RepoType), done.SHA)
+		fmt.Fprintf(e.stdout, "%d files verified: %s downloaded, %s already stored\n",
+			done.Files, kit.HumanBytes(done.DownloadedBytes), kit.HumanBytes(done.ReusedBytes))
 	}
-	fmt.Fprintf(e.stdout, "Mirrored %s at revision %s\n", shown(done.Repo, done.RepoType), done.SHA)
-	fmt.Fprintf(e.stdout, "%d files verified: %s downloaded, %s already stored\n",
-		done.Files, kit.HumanBytes(done.DownloadedBytes), kit.HumanBytes(done.ReusedBytes))
+	if *follow {
+		return c.startFollowing(key, client.FollowOptions{Branch: *revision})
+	}
 	return nil
 }
 

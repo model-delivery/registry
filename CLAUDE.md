@@ -52,7 +52,7 @@ Read `docs/architecture.md` before changing anything structural, and
 - `internal/client` — the Go client for `/api/v1`. It shares only the HTTP
   API with the server and imports no other package here but `internal/kit`.
 - `internal/cli` — the command line: `serve.go` (the server and its
-  settings), `cli.go`, `backup.go` and `verify.go` (the client commands,
+  settings), `cli.go`, `follow.go`, `backup.go` and `verify.go` (the client commands,
   each a call on `internal/client`, and `restore`, which works on a data
   directory with the registry stopped).
 - `internal/kit` — the few helpers more than one package needs (showing a

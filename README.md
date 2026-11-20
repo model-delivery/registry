@@ -96,7 +96,8 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 
 | | |
 |---|---|
-| **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id. Private and gated repositories work with your Hugging Face token. |
+| **Mirror** | Copy a repository from Hugging Face (or any compatible hub) at a branch, tag or revision id, or every branch and tag in one command. Private and gated repositories work with your Hugging Face token. |
+| **Keep up to date** | Follow a mirrored repository and the registry checks the upstream on a schedule, or when CI tells it to, and mirrors what has moved: branches move forward, earlier revisions stay, tags never move and nothing is ever deleted. |
 | **Datasets** | Everything here works for dataset repositories too: mirror, cache on demand, push, pull, upload and serve them to `snapshot_download(repo_type="dataset")`, `hf download --repo-type dataset` and `load_dataset`. A model and a dataset of the same name are two repositories. |
 | **Cache on demand** | Optionally, let the registry fetch from Hugging Face what it does not have: the file listing the first time a model is asked for, and each file the first time it is downloaded. Point your tools at the registry and it fills itself, one requested file at a time. |
 | **Serve** | Existing clients download through the Hugging Face compatible API, including range requests. |
@@ -115,6 +116,8 @@ docker exec -e MODELCTL_TOKEN=md_... registry /modelctl mirror openai-community/
 ```
 modelctl serve                      run the registry
 modelctl mirror <repo>              copy a repository from the upstream hub
+modelctl follow list|stop           show or stop what the registry keeps up to date
+modelctl sync <repo>|--all          check followed repositories against the upstream now
 modelctl push <dir> <repo>          upload a directory as a new revision
 modelctl pull <repo>                download a revision and verify it
 modelctl list                       list repositories
@@ -129,13 +132,16 @@ modelctl restore <file>|--latest    put a backup back (registry stopped)
 
 Client commands read `MODELCTL_ENDPOINT` (default `http://localhost:8080`)
 and `MODELCTL_TOKEN`. Every one accepts `--json` for scripts. `mirror`,
-`push`, `pull`, `list`, `inspect` and `delete` work on models unless given
-`--repo-type dataset`, the same flag `hf download` and `hf upload` take.
+`push`, `pull`, `list`, `inspect`, `delete`, `follow stop` and `sync` work
+on models unless given `--repo-type dataset`, the same flag `hf download`
+and `hf upload` take.
 
 ```bash
 modelctl mirror meta-llama/Llama-3.2-1B --upstream-token "$HF_TOKEN"   # gated repository
 modelctl mirror openai-community/gpt2 --revision <branch, tag or 40-character revision id>
 modelctl mirror --repo-type dataset stanfordnlp/imdb                    # a dataset
+modelctl mirror openai-community/gpt2 --all-refs --follow               # every branch and tag, kept up to date
+modelctl sync openai-community/gpt2                                     # check it now, from CI
 modelctl push ./my-model my-team/my-model --tag v1.0 --message "first release"
 modelctl push ./my-data my-team/my-data --repo-type dataset
 modelctl pull my-team/my-model --revision v1.0 --dir ./out
@@ -285,10 +291,15 @@ Details, including the exact routes, are in
 - **One server.** Model files can be in S3, but metadata is a SQLite file
   on the server's disk, so you run a single instance. No replication or
   high availability yet.
-- **A mirror is a point-in-time copy.** Run `modelctl mirror` again to pick
-  up a newer upstream revision. There is no automatic sync. Pull-through
-  caching fetches what the registry lacks, but it never refreshes a branch
-  it already holds.
+- **Keeping mirrors up to date is opt-in, per repository.** A mirror is a
+  copy of what it fetched until you follow it (`modelctl mirror --follow`)
+  and set `REGISTRY_SYNC_INTERVAL`, or ask for a sync. A sync only adds:
+  a branch or tag deleted upstream stays in the registry, and a tag moved
+  upstream is reported, not moved. Pull-through caching fetches what the
+  registry lacks, but it never refreshes a branch it already holds; see
+  [keeping mirrors up to date](docs/operations.md#keeping-mirrors-up-to-date).
+- **One upstream.** Every mirror, sync and pull-through fetch goes to the
+  one hub `REGISTRY_UPSTREAM` names.
 - **`modelctl mirror` copies whole revisions.** To fetch only some files of
   a repository, use pull-through caching, which fetches each file when it
   is first downloaded.

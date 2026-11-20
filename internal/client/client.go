@@ -564,26 +564,202 @@ type MirrorEvent struct {
 	DownloadedBytes int64    `json:"downloaded_bytes"`
 	ReusedBytes     int64    `json:"reused_bytes"`
 	Error           string   `json:"error"`
+	// On an EventRef line of a mirror of every ref: the ref (in Ref), its
+	// Kind, its Outcome, where the registry's ref was before (Previous)
+	// and why, for anything but mirrored and unchanged (Detail).
+	Kind     string `json:"kind"`
+	Outcome  string `json:"outcome"`
+	Previous string `json:"previous"`
+	Detail   string `json:"detail"`
+	// Refs is every ref's result, on the EventDone line of a mirror of
+	// every ref.
+	Refs []RefResult `json:"refs"`
+}
+
+// EventRef is the line of a mirror of every ref that reports one ref.
+const EventRef = "ref"
+
+// What a mirror of every ref, or a sync, did with a ref (RefResult.Outcome).
+const (
+	RefMirrored        = "mirrored"
+	RefUnchanged       = "unchanged"
+	RefTagMoved        = "tag_moved"
+	RefConflict        = "conflict"
+	RefDeletedUpstream = "deleted_upstream"
+	RefFailed          = "failed"
+)
+
+// RefResult is what a mirror of every ref, or a sync, did with one ref.
+type RefResult struct {
+	Name string `json:"name"`
+	// Kind is "branch" or "tag".
+	Kind    string `json:"kind"`
+	Outcome string `json:"outcome"`
+	// SHA is the revision the upstream's ref points at; Previous the one
+	// the registry's pointed at before.
+	SHA      string `json:"sha"`
+	Previous string `json:"previous"`
+	// Detail says why, for every outcome but mirrored and unchanged.
+	Detail string `json:"detail"`
+}
+
+// mirrorRequest is the body of a mirror request for the repository with
+// key repo.
+func mirrorRequest(repo, revision, upstreamToken string, allRefs bool) (request, error) {
+	body := map[string]any{"repo": repo, "upstream_token": upstreamToken}
+	if allRefs {
+		body["all_refs"] = true
+	} else {
+		body["revision"] = revision
+	}
+	if name, dataset := kit.SplitKey(repo); dataset {
+		// Only a dataset names its type, so a model's request is what it
+		// always was; a registry too old for datasets refuses the field.
+		body["repo"], body["type"] = name, string(Dataset)
+	}
+	return jsonRequest(http.MethodPost, "/api/v1/mirror", body)
+}
+
+// mirrorCut is what a mirror is told when its stream stops early.
+var mirrorCut = cutShort{
+	lost:  "connection to registry lost during mirror",
+	ended: "registry closed the connection before the mirror finished",
 }
 
 // Mirror asks the registry to import repo@revision from its upstream and
 // reports progress as it happens. repo is a key (RepoKey), so a dataset is
 // "datasets/namespace/name". It returns the final "done" event.
 func (c *Client) Mirror(ctx context.Context, repo, revision, upstreamToken string, progress func(MirrorEvent)) (MirrorEvent, error) {
-	body := map[string]string{"repo": repo, "revision": revision, "upstream_token": upstreamToken}
-	if name, dataset := kit.SplitKey(repo); dataset {
-		// Only a dataset names its type, so a model's request is what it
-		// always was; a registry too old for datasets refuses the field.
-		body["repo"], body["type"] = name, string(Dataset)
-	}
-	req, err := jsonRequest(http.MethodPost, "/api/v1/mirror", body)
+	req, err := mirrorRequest(repo, revision, upstreamToken, false)
 	if err != nil {
 		return MirrorEvent{}, err
 	}
-	return stream(ctx, c, req, cutShort{
-		lost:  "connection to registry lost during mirror",
-		ended: "registry closed the connection before the mirror finished",
-	}, progress)
+	return stream(ctx, c, req, mirrorCut, progress)
+}
+
+// MirrorAllRefs asks the registry to import every branch and tag of repo
+// from its upstream, reporting progress as it happens: the start and file
+// lines of each revision fetched, and an EventRef line per ref. It returns
+// the final "done" event, whose Refs says how each ref went; a ref that
+// failed is reported there, not as the error.
+func (c *Client) MirrorAllRefs(ctx context.Context, repo, upstreamToken string, progress func(MirrorEvent)) (MirrorEvent, error) {
+	req, err := mirrorRequest(repo, "", upstreamToken, true)
+	if err != nil {
+		return MirrorEvent{}, err
+	}
+	return stream(ctx, c, req, mirrorCut, progress)
+}
+
+// ---- keeping mirrors up to date ----
+
+// FollowOptions says what a followed repository follows: one branch, or
+// every branch and tag. Neither set follows its only branch, or main.
+type FollowOptions struct {
+	Branch  string `json:"branch,omitempty"`
+	AllRefs bool   `json:"all_refs,omitempty"`
+}
+
+// FollowEntry is a followed repository and how its checks have gone.
+type FollowEntry struct {
+	Name string   `json:"name"`
+	Type RepoType `json:"type,omitempty"` // Dataset, or empty for a model
+	// Branch is the followed branch; empty when AllRefs is set.
+	Branch    string    `json:"branch"`
+	AllRefs   bool      `json:"all_refs"`
+	CreatedAt time.Time `json:"created_at"`
+	// The times are zero until each has happened.
+	LastCheck   time.Time `json:"last_check"`
+	LastSuccess time.Time `json:"last_success"`
+	LastChange  time.Time `json:"last_change"`
+	LastError   string    `json:"last_error"`
+	LastErrorAt time.Time `json:"last_error_at"`
+	// Failures is how many checks in a row have failed.
+	Failures int `json:"failures"`
+	// NextCheck is when the registry's schedule checks it next; zero when
+	// it has none.
+	NextCheck time.Time `json:"next_check"`
+}
+
+// Key is the followed repository's key (RepoKey).
+func (f FollowEntry) Key() string { return RepoKey(f.Type, f.Name) }
+
+// Followed is the answer to Follow: the repository's entry.
+type Followed struct {
+	FollowEntry
+	Raw json.RawMessage `json:"-"`
+}
+
+// Follow has the registry keep the repository with key repo up to date
+// with its upstream. Only a repository created by mirroring or
+// pull-through can be followed.
+func (c *Client) Follow(ctx context.Context, repo string, opt FollowOptions) (Followed, error) {
+	var out Followed
+	raw, err := c.document(ctx, http.MethodPost, repoPath(repo)+"/follow", opt, &out)
+	out.Raw = raw
+	return out, err
+}
+
+// Unfollow stops keeping the repository with key repo up to date. The
+// registry answers with no document.
+func (c *Client) Unfollow(ctx context.Context, repo string) error {
+	resp, err := c.do(ctx, request{method: http.MethodDelete, path: repoPath(repo) + "/follow"})
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// FollowList is the registry's followed repositories.
+type FollowList struct {
+	Follows []FollowEntry `json:"follows"`
+	// IntervalSeconds is the registry's sync schedule; 0 when it has none.
+	IntervalSeconds int64           `json:"interval_seconds"`
+	Raw             json.RawMessage `json:"-"`
+}
+
+// ListFollows lists the followed repositories, models and datasets.
+func (c *Client) ListFollows(ctx context.Context) (FollowList, error) {
+	var out FollowList
+	raw, err := c.document(ctx, http.MethodGet, "/api/v1/follows", nil, &out)
+	out.Raw = raw
+	return out, err
+}
+
+// SyncResult is what a check of a followed repository did.
+type SyncResult struct {
+	Name            string          `json:"name"`
+	Type            RepoType        `json:"type,omitempty"`
+	CheckedAt       time.Time       `json:"checked_at"`
+	Changed         bool            `json:"changed"`
+	Refs            []RefResult     `json:"refs"`
+	DownloadedBytes int64           `json:"downloaded_bytes"`
+	Raw             json.RawMessage `json:"-"`
+}
+
+// Sync has the registry check the followed repository with key repo
+// against its upstream now, and returns when the check is over. A check
+// that failed is an *APIError with the reason.
+func (c *Client) Sync(ctx context.Context, repo string) (SyncResult, error) {
+	var out SyncResult
+	raw, err := c.document(ctx, http.MethodPost, repoPath(repo)+"/sync", nil, &out)
+	out.Raw = raw
+	return out, err
+}
+
+// SyncQueued is the answer to SyncAll: the keys of the repositories whose
+// checks were started.
+type SyncQueued struct {
+	Queued []string        `json:"queued"`
+	Raw    json.RawMessage `json:"-"`
+}
+
+// SyncAll has the registry start a check of every followed repository. It
+// returns at once; the checks take their turns on the registry.
+func (c *Client) SyncAll(ctx context.Context) (SyncQueued, error) {
+	var out SyncQueued
+	raw, err := c.document(ctx, http.MethodPost, "/api/v1/sync", nil, &out)
+	out.Raw = raw
+	return out, err
 }
 
 func (e MirrorEvent) outcome() (kind, failure string) { return e.Event, e.Error }

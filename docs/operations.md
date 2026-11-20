@@ -315,6 +315,15 @@ REGISTRY_SYNC_INTERVAL=1h   # off unless set; at least 5m (--sync-interval)
 ```
 
 ```bash
+modelctl mirror acme/tiny --follow                       # mirror main and follow it
+modelctl mirror --repo-type dataset acme/reviews --all-refs --follow   # every branch and tag
+modelctl follow list                                     # what is followed, and how it went
+modelctl follow stop acme/tiny
+```
+
+The same through the API:
+
+```bash
 # Follow the branch that was mirrored (main), or every branch and tag.
 curl -X POST -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/follow -d '{}'
 curl -X POST -H "Authorization: Bearer $T" $R/api/v1/datasets/acme/reviews/follow -d '{"all_refs": true}'
@@ -325,6 +334,11 @@ curl -X DELETE -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/follow
 Following needs a token with the `write` role; the list is open to anyone
 who may read. The follow list is kept in the metadata database, so it
 survives a restart and is in every backup.
+
+`modelctl mirror --all-refs` without `--follow` mirrors every branch and
+tag once, with the same rules as a sync (below). It prints each ref's
+outcome and exits non-zero if any ref failed; the refs that succeeded are
+kept, and running it again retries the rest.
 
 **What can be followed.** A repository created by mirroring or by
 pull-through, model or dataset. A repository created here by a push or an
@@ -354,6 +368,8 @@ for example from a job that runs after you publish a model upstream, ask
 for a check instead of waiting for the schedule:
 
 ```bash
+modelctl sync acme/tiny          # waits; exits non-zero if the check failed
+modelctl sync --all              # starts a check of every followed repository
 curl -X POST -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/sync     # waits, answers with what it did
 curl -X POST -H "Authorization: Bearer $T" $R/api/v1/sync                     # every followed repository; answers at once
 ```

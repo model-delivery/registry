@@ -681,3 +681,26 @@ func TestMirrorAllRefsWithOneFailing(t *testing.T) {
 		t.Fatalf("all_refs with a revision: %d", resp.StatusCode)
 	}
 }
+
+// The repository page says whether the repository is followed and how its
+// last check went.
+func TestRepositoryPageShowsTheFollow(t *testing.T) {
+	t.Parallel()
+	hub := newSyncHub(t)
+	push(t, hub.inst, "datasets/acme/tiny", modelFiles, client.PushOptions{})
+	local := regtest.Start(t, server.Config{AnonymousRead: true, Upstream: hub.url})
+	mirrorMain(t, local, "datasets/acme/tiny")
+	if page := body(t, do(t, http.MethodGet, local.URL+"/ui/dataset/acme/tiny", "", nil, nil)); strings.Contains(page, "Kept up to date") {
+		t.Fatal("a repository that is not followed is shown as followed")
+	}
+	mustFollow(t, local, "datasets/acme/tiny", `{}`)
+	if page := body(t, do(t, http.MethodGet, local.URL+"/ui/dataset/acme/tiny", "", nil, nil)); !strings.Contains(page, "Kept up to date with the upstream: branch <code>main</code>") || !strings.Contains(page, "not synced yet") {
+		t.Fatalf("page before a sync:\n%s", page)
+	}
+	if status, _ := syncNow(t, local, "datasets/acme/tiny"); status != http.StatusOK {
+		t.Fatalf("sync: %d", status)
+	}
+	if page := body(t, do(t, http.MethodGet, local.URL+"/ui/dataset/acme/tiny", "", nil, nil)); !strings.Contains(page, "last synced") {
+		t.Fatalf("page after a sync:\n%s", page)
+	}
+}

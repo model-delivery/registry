@@ -205,9 +205,19 @@ func (s *Server) showRepo(w http.ResponseWriter, r *http.Request, key string) {
 		_ = json.Unmarshal([]byte(c.UpstreamInfo), &upstream)
 	}
 	license, _ := upstream.CardData.License.(string)
+	// Whether the repository is kept up to date, and how that last went.
+	var follow *registry.Follow
+	switch f, err := s.reg.GetFollow(r.Context(), key); {
+	case err == nil:
+		follow = &f
+	case !errors.Is(err, registry.ErrNotFollowed):
+		s.uiError(w, r, err)
+		return
+	}
 	s.render(w, r, http.StatusOK, "repo.html", name, map[string]any{
 		"Repo": detail, "Commit": c, "Files": files, "Total": total, "RefNames": names,
 		"Pipeline": upstream.PipelineTag, "Library": upstream.LibraryName, "License": license,
+		"Follow": follow,
 	})
 }
 

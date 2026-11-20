@@ -479,6 +479,9 @@ listing, one of the upstream slots the pull-through coordinator uses
 fetch more at once than those slots allow, and a sync holds at most one
 file slot of the four.
 
+The web UI's repository page shows whether the repository is followed,
+what it follows, when it last synced and changed, and the last failure.
+
 A sync and pull-through do not otherwise meet. Pull-through still never
 refreshes a branch it holds; a followed branch moves only when a sync
 mirrors the revision the upstream now points it at.

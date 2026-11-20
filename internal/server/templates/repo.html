@@ -7,6 +7,14 @@
   {{if .Repo.Upstream}}Mirror of <a href="{{.Repo.Upstream}}/{{$key}}" rel="noreferrer">{{.Repo.Upstream}}/{{$key}}</a>{{else}}Pushed to this registry{{end}}
   {{if .Pipeline}} · {{.Pipeline}}{{end}}{{if .Library}} · {{.Library}}{{end}}{{if .License}} · license {{.License}}{{end}}
 </p>
+{{with .Follow}}
+<p class="meta">
+  Kept up to date with the upstream: {{if .AllRefs}}every branch and tag{{else}}branch <code>{{.Branch}}</code>{{end}}
+  · {{if .LastSuccess.IsZero}}not synced yet{{else}}last synced <span title="{{date .LastSuccess}}">{{$.Ago .LastSuccess}}</span>{{end}}
+  {{if not .LastChange.IsZero}} · last changed <span title="{{date .LastChange}}">{{$.Ago .LastChange}}</span>{{end}}
+  {{if .LastError}} · <strong>last check failed {{$.Ago .LastErrorAt}}:</strong> {{.LastError}}{{end}}
+</p>
+{{end}}
 
 <h2>Download</h2>
 <pre>export HF_ENDPOINT={{$host}}

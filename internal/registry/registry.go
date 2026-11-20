@@ -42,7 +42,7 @@ var (
 )
 
 // schemaVersion is the database layout this version reads and writes.
-const schemaVersion = 3
+const schemaVersion = 4
 
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
@@ -245,8 +245,8 @@ func ownerOnly(paths ...string) {
 func (r *Registry) Close() error { return r.db.Close() }
 
 // migrate brings the database to schemaVersion. Each step keeps everything
-// the one before it left: versions 1 and 2 only add tables, and version 3
-// rebuilds one table row for row (typesSchema).
+// the one before it left: versions 1, 2 and 4 only add tables, and version
+// 3 rebuilds one table row for row (typesSchema).
 //
 // All the steps and the new version number are one transaction, so an
 // interrupted migration (a crash, a full disk, a failed step) leaves the
@@ -273,6 +273,8 @@ func (r *Registry) migrate(hook stepHook) error {
 		pendingSchema,
 		// Version 3 makes a repository's type part of its identity.
 		typesSchema,
+		// Version 4 adds the follow list (follow.go).
+		followsSchema,
 	}
 	// One connection for the whole migration: foreign keys are switched off
 	// on it, which SQLite allows only outside a transaction, so that

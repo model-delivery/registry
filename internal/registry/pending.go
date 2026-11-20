@@ -38,6 +38,7 @@ CREATE TABLE pending_files (
 type LazyInput struct {
 	Repo         string // the repository's key (RepoKey)
 	Branch       string // moved to the revision; empty records the revision only
+	Tags         []string
 	SHA          string // the upstream revision id
 	Message      string
 	Upstream     string
@@ -54,7 +55,8 @@ type LazyInput struct {
 }
 
 // CommitLazy records a revision whose files are all pending. If the
-// revision is already recorded, complete or not, only the branch is moved.
+// revision is already recorded, complete or not, only the branch is moved
+// and the tags created.
 func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error) {
 	if err := ValidateRepoKey(in.Repo); err != nil {
 		return Commit{}, err
@@ -62,7 +64,7 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 	if !IsSHA(in.SHA) {
 		return Commit{}, errRevisionID()
 	}
-	if err := validateTarget(in.Branch, nil); err != nil {
+	if err := validateTarget(in.Branch, in.Tags); err != nil {
 		return Commit{}, err
 	}
 	if len(in.Files) == 0 {
@@ -108,6 +110,9 @@ func (r *Registry) CommitLazy(ctx context.Context, in LazyInput) (Commit, error)
 		}
 	}
 	if err := moveBranch(ctx, tx, repoID, in.Branch, in.SHA, now); err != nil {
+		return Commit{}, err
+	}
+	if err := createTags(ctx, tx, repoID, in.Tags, in.SHA, now); err != nil {
 		return Commit{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -202,6 +207,9 @@ type CompleteInput struct {
 	SHA  string
 	// Branch to move to the revision. Empty moves none.
 	Branch string
+	// Tags to create at the revision. A tag that exists and names another
+	// revision is a conflict, and nothing changes.
+	Tags []string
 	// Upstream, when set, is recorded as where the repository comes from.
 	Upstream string
 	// Files of the revision whose content is now stored: Path, and the
@@ -225,7 +233,7 @@ func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Comm
 	if !IsSHA(in.SHA) {
 		return Commit{}, errRevisionID()
 	}
-	if err := validateTarget(in.Branch, nil); err != nil {
+	if err := validateTarget(in.Branch, in.Tags); err != nil {
 		return Commit{}, err
 	}
 
@@ -275,6 +283,9 @@ func (r *Registry) CompleteRevision(ctx context.Context, in CompleteInput) (Comm
 		}
 	}
 	if err := moveBranch(ctx, tx, c.RepoID, in.Branch, c.SHA, now); err != nil {
+		return Commit{}, err
+	}
+	if err := createTags(ctx, tx, c.RepoID, in.Tags, c.SHA, now); err != nil {
 		return Commit{}, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -69,7 +69,8 @@ The tables of `registry.db` are `repos`, `commits` (revisions), `files`
 (one row per file of a revision, pointing at a blob), `pending_files`
 (files a revision lists whose content has not been fetched; see
 [Pull-through caching](#pull-through-caching)), `refs`, `blobs` (what is
-stored, and when it was last written or asked about) and `tokens`.
+stored, and when it was last written or asked about), `follows` (followed
+repositories and how their last checks went) and `tokens`.
 
 ### Models and datasets
 
@@ -108,9 +109,11 @@ dataset viewer, a separate service, is not reproduced; see
 
 The database records its layout in SQLite's `user_version`, and opening
 it brings an older one up to date before anything reads it. Version 1 is
-the original layout, version 2 adds `pending_files`, and version 3 adds a
-repository's type: SQLite cannot change which columns a table is unique
-on, so `repos` is rebuilt, every row copied with its id and made a model.
+the original layout, version 2 adds `pending_files`, version 3 adds a
+repository's type (SQLite cannot change which columns a table is unique
+on, so `repos` is rebuilt, every row copied with its id and made a model),
+and version 4 adds `follows`, the list of repositories kept up to date
+with their upstream (see [Keeping mirrors up to date](#keeping-mirrors-up-to-date)).
 All the steps and the new version number are one transaction, run with
 foreign keys off on that connection (or dropping the old table would
 delete every revision) and checked with `PRAGMA foreign_key_check` before

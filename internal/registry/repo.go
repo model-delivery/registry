@@ -384,6 +384,27 @@ func (r *Registry) Refs(ctx context.Context, repo Repo) ([]Ref, error) {
 	return out, rows.Err()
 }
 
+// Ref returns one branch or tag of the repository with key key. A ref that
+// does not exist is ErrRevisionNotFound, as it is for Resolve.
+func (r *Registry) Ref(ctx context.Context, key, name string) (Ref, error) {
+	typ, repoName := SplitRepoKey(key)
+	ref := Ref{Name: name}
+	var updated string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT f.kind, f.sha, f.updated_at FROM refs f JOIN repos r ON r.id = f.repo_id
+		 WHERE r.type = ? AND r.name = ? AND f.name = ?`, typ, repoName, name).Scan(&ref.Kind, &ref.SHA, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Ref{}, fmt.Errorf("%w: %s@%s", ErrRevisionNotFound, key, name)
+	}
+	if err != nil {
+		return Ref{}, err
+	}
+	if ref.UpdatedAt, err = parseTime(updated); err != nil {
+		return Ref{}, err
+	}
+	return ref, nil
+}
+
 // CommitSummary is a revision plus the size of its file list.
 type CommitSummary struct {
 	Commit

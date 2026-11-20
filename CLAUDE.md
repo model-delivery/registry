@@ -28,8 +28,9 @@ Read `docs/architecture.md` before changing anything structural, and
 - `internal/registry` — repositories, immutable revisions, refs and tokens:
   `registry.go` (opening, blobs, garbage collection, tokens), `repo.go`
   (reading), `commit.go` (recording a revision), `pending.go` (files listed
-  from upstream and not fetched yet), `backup.go` (metadata backup and
-  restore), `verify.go` (re-checking every stored file).
+  from upstream and not fetched yet), `follow.go` (the follow list:
+  repositories kept up to date with their upstream), `backup.go` (metadata
+  backup and restore), `verify.go` (re-checking every stored file).
 - `internal/mirror` — imports a revision from an upstream hub: `mirror.go`
   (the plan and its execution), `upstream.go` (the hub's API, resumed
   downloads), `guard.go` (where the upstream may send the registry).
@@ -105,7 +106,7 @@ are exercised), `task build`, `task docker`.
 - **A schema change is one more migration step** (`migrate` in
   `registry.go`), run in the same transaction as the others and the new
   version number, and it gets a test that opens a database written in the
-  previous layout (`TestUpgradeFromSchemaVersion2` is the pattern).
+  previous layout (`TestUpgradeFromSchemaVersion3` is the pattern).
 - **Revisions are immutable.** A revision's id and what it lists (each
   path with its size and digest) never change; new content is a new
   revision; only refs move, and tags never move. Never update or delete a

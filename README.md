@@ -167,6 +167,7 @@ setting that is not a secret has both; a flag wins over its variable.
 | `--storage` | `REGISTRY_STORAGE` | `filesystem` | Where model files are kept: `filesystem` or `s3` |
 | `--backup-interval` | `REGISTRY_BACKUP_INTERVAL` | `0` (off) | Store a metadata backup this often, for example `1h`; at least a minute |
 | `--backup-keep` | `REGISTRY_BACKUP_KEEP` | `48` | How many stored backups to keep; `0` keeps all |
+| `--sync-interval` | `REGISTRY_SYNC_INTERVAL` | `0` (off) | Check each followed repository against the upstream this often and mirror what has moved, for example `1h`; at least five minutes. See [keeping mirrors up to date](docs/operations.md#keeping-mirrors-up-to-date) |
 | `--restore-if-empty` | `REGISTRY_RESTORE_IF_EMPTY` | `false` | At start, if there is no database, restore the newest stored backup |
 
 An on/off variable accepts `true` and `false`, and also `1`, `0`, `yes`,

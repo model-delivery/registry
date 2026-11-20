@@ -237,6 +237,7 @@ func TestServeHelpListsEverySetting(t *testing.T) {
 		"max-blob-bytes":              "REGISTRY_MAX_BLOB_BYTES",
 		"backup-interval":             "REGISTRY_BACKUP_INTERVAL",
 		"backup-keep":                 "REGISTRY_BACKUP_KEEP",
+		"sync-interval":               "REGISTRY_SYNC_INTERVAL",
 		"restore-if-empty":            "REGISTRY_RESTORE_IF_EMPTY",
 		"storage":                     "REGISTRY_STORAGE",
 		"s3-bucket":                   "REGISTRY_S3_BUCKET",

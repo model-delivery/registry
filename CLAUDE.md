@@ -39,8 +39,10 @@ Read `docs/architecture.md` before changing anything structural, and
 - `internal/server` — HTTP. `server.go` has the route table, the access
   gate and the error writers. Then one file per surface: `hf.go` (Hugging
   Face download routes), `hfupload.go` (Hugging Face upload routes),
-  `pullthrough.go` (fetching from upstream on demand), `stream.go`
-  (sending a file to clients while it is fetched), `api.go` and
+  `pullthrough.go` (fetching from upstream on demand), `sync.go` (checking
+  followed repositories against their upstream, on a schedule and when
+  asked), `stream.go` (sending a file to clients while it is fetched),
+  `api.go` and
   `backup.go` (`/api/v1`), `ui.go` plus `templates/` and `static/` (web
   UI), `limits.go` (bounds on request bodies), `metrics.go` (every metric
   of `GET /metrics`, and the handler that counts requests).
@@ -194,10 +196,10 @@ are exercised), `task build`, `task docker`.
   (Hugging Face routes), which apply this; `writeError` and `hfError` are
   for fixed messages only.
 - **Work that outlives a request runs on the server's lifetime**, never on
-  `context.Background()`. Pull-through jobs do (`puller.ctx`), and
-  `Server.Shutdown` cancels and waits for them; `serve` in
-  `internal/cli/serve.go` waits for that and for the backup loop before the
-  registry is closed. `TestServeStopsItsOwnWorkBeforeTheRegistryCloses` is
+  `context.Background()`. Pull-through jobs do (`puller.ctx`), and so do
+  syncs and their schedule (`syncer.ctx`); `Server.Shutdown` cancels and
+  waits for them; `serve` in `internal/cli/serve.go` waits for that and for
+  the backup loop before the registry is closed. `TestServeStopsItsOwnWorkBeforeTheRegistryCloses` is
   where a new kind of background work joins.
 - **A client command is one call on `internal/client`.** It builds no
   path and decodes no response itself; a new request is a new typed method
@@ -230,8 +232,8 @@ are exercised), `task build`, `task docker`.
   works, `test/e2e` must exercise it, for each repository type claimed.
 - **A test that needs a clock or a schedule supplies it.** Hand the code
   under test its clock or its ticks (`server.Config.Now`, the tick channel
-  of `runBackups`) and wait on what it does, rather than sleeping until it
-  has probably happened. `TestScheduledBackupsRunAndPrune` is the pattern.
+  of `runBackups`, `server.Config.SyncTicks`) and wait on what it does,
+  rather than sleeping until it has probably happened. `TestScheduledBackupsRunAndPrune` is the pattern.
 - `go test ./...` must pass with no network, no Python and no Docker.
 
 ## Ownership

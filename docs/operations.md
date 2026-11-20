@@ -303,6 +303,105 @@ itself (which answers `404`), and never to a host you do not run: that
 host would be handed the tokens of everyone who loads a dataset. A
 wildcard record for the domain covers that name too.
 
+## Keeping mirrors up to date
+
+A mirror is a copy of the revisions it fetched. To keep a repository in
+step with its upstream, *follow* it: the registry then asks the upstream,
+on a schedule or when told to, what the followed refs point at, and
+mirrors whatever has moved.
+
+```bash
+REGISTRY_SYNC_INTERVAL=1h   # off unless set; at least 5m (--sync-interval)
+```
+
+```bash
+# Follow the branch that was mirrored (main), or every branch and tag.
+curl -X POST -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/follow -d '{}'
+curl -X POST -H "Authorization: Bearer $T" $R/api/v1/datasets/acme/reviews/follow -d '{"all_refs": true}'
+curl $R/api/v1/follows                                        # what is followed, and how it went
+curl -X DELETE -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/follow
+```
+
+Following needs a token with the `write` role; the list is open to anyone
+who may read. The follow list is kept in the metadata database, so it
+survives a restart and is in every backup.
+
+**What can be followed.** A repository created by mirroring or by
+pull-through, model or dataset. A repository created here by a push or an
+upload is refused: the registry never adds upstream content to a
+repository that was not created from the upstream, the rule pull-through
+follows too. A followed repository follows one branch (by default the one
+it has, or `main`) or every branch and tag the upstream has.
+
+**What a check does.** It asks the upstream for the repository's branches
+and tags, one small request. A followed ref that the registry already has
+at the same revision is left alone. One that is new, or a branch that has
+moved, has its revision mirrored in full: every file is verified, the
+files the registry already stores are not fetched again, and only when the
+whole revision is stored does the branch move. A sync is a mirror, not a
+listing: after it, the new revision is available offline.
+
+**The schedule.** Every `REGISTRY_SYNC_INTERVAL` each followed repository
+is checked. Each one has its own place within the interval, so
+repositories followed together are not all checked at once, and they are
+checked one at a time. A check fetches one file at a time, and takes the
+same upstream slots as pull-through fetches, so a sync never holds more
+than one of the four and never starves the downloads clients are waiting
+on. Leave the variable unset to sync only when asked.
+
+**Sync now, from CI or a webhook.** When you know the upstream has moved,
+for example from a job that runs after you publish a model upstream, ask
+for a check instead of waiting for the schedule:
+
+```bash
+curl -X POST -H "Authorization: Bearer $T" $R/api/v1/repos/acme/tiny/sync     # waits, answers with what it did
+curl -X POST -H "Authorization: Bearer $T" $R/api/v1/sync                     # every followed repository; answers at once
+```
+
+The first answers when the check is over: `200` with each ref's outcome,
+or `502` (the upstream's doing) or `500` (the registry's) when it failed,
+so `curl -f` fails the job. It needs a token with the `write` role.
+
+**What a sync never does.**
+
+- It never removes or changes an earlier revision. A revision id that was
+  valid stays valid, and serves the same files: anything pinned to a
+  revision id is unaffected by a sync.
+- It never deletes anything. A branch or tag deleted upstream stays in the
+  registry, at the revision it had; the check reports it as
+  `deleted_upstream`. Delete the repository if you want it gone.
+- It never moves a tag. A tag that the upstream has moved to another
+  revision is reported (`tag_moved`, naming both revisions, and a warning
+  in the log) and the registry's tag stays where it was. Follow a branch if
+  you want to track something that moves.
+
+**What failures look like.** A check that fails is recorded against the
+repository: the follow list shows `last_error`, `last_error_at` and how
+many checks in a row have failed, and the log has a `sync failed` line. If
+the upstream caused it (unreachable, an error answer, a file that did not
+match its digest, a followed branch the upstream no longer has), the
+reason is shown; a failure of the registry's own (a full disk) is shown as
+no more than that, and logged in full. A failed check records no revision
+and moves no branch: a file that does not verify leaves the branch where
+it was. A repository whose checks keep failing is checked less often,
+twice the wait after each failure, up to a day, while the others go on as
+usual; the first check that succeeds puts it back on the interval. The
+metrics `modelregistry_sync_failures_total` and
+`modelregistry_sync_oldest_success_age_seconds` are what to alert on (see
+[Monitoring](#monitoring)).
+
+**Private and gated repositories** are checked with the server's
+`REGISTRY_UPSTREAM_TOKEN`. A token passed to one mirror request is not
+stored, so a scheduled sync cannot use it.
+
+**Pull-through and followed repositories.** Pull-through still never
+refreshes a branch on its own: a request for a branch the registry holds
+is answered with what it holds. A followed branch is refreshed by its sync
+and by nothing else. Following a repository that pull-through created
+works the same as following a mirror; each revision a sync brings in is
+stored in full, while the revisions pull-through listed keep fetching
+their files on demand.
+
 ## Pull-through caching
 
 With `--pull-through` (or `REGISTRY_PULL_THROUGH=true`) the registry fills
@@ -342,7 +441,8 @@ What to expect:
 - **It fills gaps; it does not refresh.** A branch the registry already
   holds is served as recorded, even if it has moved upstream. Clients that
   pin a revision id always get exactly that revision. To pick up a newer
-  `main`, run `modelctl mirror`.
+  `main`, run `modelctl mirror`, or follow the repository (see
+  [Keeping mirrors up to date](#keeping-mirrors-up-to-date)).
 - **A file that was never downloaded still depends on the upstream.** If
   the upstream is unreachable, files already fetched are served and the
   others fail with an error saying so. To make a whole revision available
@@ -829,7 +929,7 @@ not what it holds, and it does not grow with the number of models.
 |---|---|---|---|
 | `modelregistry_build_info` | gauge | `version` | Always `1`; the label is the running version. |
 | `modelregistry_process_start_time_seconds` | gauge | | When the server started (Unix time). |
-| `modelregistry_http_requests_total` | counter | `route`, `method`, `code` | Requests answered. `route` is one of `download` (a file of a revision), `upload` (a request whose body is model content), `api` (`/api/v1`), `task` (the API requests that last as long as their job: mirror, verify, snapshot download), `hf` (Hugging Face metadata and upload steps), `ui`, `probe` (`/healthz` and `/metrics`), `other`. `method` is `GET`, `HEAD`, `POST`, `PUT`, `DELETE` or `other`. `code` is `1xx` to `5xx`. A series appears once a request of its kind has been answered. |
+| `modelregistry_http_requests_total` | counter | `route`, `method`, `code` | Requests answered. `route` is one of `download` (a file of a revision), `upload` (a request whose body is model content), `api` (`/api/v1`), `task` (the API requests that last as long as their job: mirror, verify, snapshot download, syncing one repository), `hf` (Hugging Face metadata and upload steps), `ui`, `probe` (`/healthz` and `/metrics`), `other`. `method` is `GET`, `HEAD`, `POST`, `PUT`, `DELETE` or `other`. `code` is `1xx` to `5xx`. A series appears once a request of its kind has been answered. |
 | `modelregistry_http_requests_in_flight` | gauge | | Requests being answered now, the scrape among them. |
 | `modelregistry_http_request_duration_seconds` | histogram | `route` | How long requests took, for the routes `api`, `hf`, `ui`, `probe` and `other`. Transfers (`download`, `upload`) and `task` requests are not timed: they last as long as the file or the job. |
 | `modelregistry_download_requests_total` | counter | `cache` | `GET` requests for a file: `hit` when its content was already stored, `miss` when it had to be fetched from the upstream first (whether or not the fetch then succeeded). `HEAD` requests are not counted. |
@@ -852,6 +952,12 @@ not what it holds, and it does not grow with the number of models.
 | `modelregistry_mirrors_started_total` | counter | | Mirror requests that began copying a revision. |
 | `modelregistry_mirrors_total` | counter | `outcome` | Mirrors finished: `succeeded` or `failed`. |
 | `modelregistry_mirror_fetched_bytes_total` | counter | | Bytes downloaded from the upstream by mirrors that succeeded. |
+| `modelregistry_sync_checks_total` | counter | | Checks of a followed repository that finished, scheduled and asked for, whatever came of them. A check cut short by the server stopping is not counted. |
+| `modelregistry_sync_changes_total` | counter | | Checks that added or moved a ref. |
+| `modelregistry_sync_failures_total` | counter | `outcome` | Checks that failed: `upstream` (unreachable, or an error answer), `verification` (content did not match its digest), `not_found` (the upstream does not have the repository or the followed branch), `local` (the registry failed). |
+| `modelregistry_sync_fetched_bytes_total` | counter | | Bytes downloaded from the upstream by checks. |
+| `modelregistry_followed_repositories` | gauge | | Repositories on the follow list. |
+| `modelregistry_sync_oldest_success_age_seconds` | gauge | | Seconds since the followed repository that has gone longest without a successful check last had one (or was followed, if it never has); `0` when none is followed. |
 | `modelregistry_repositories` | gauge | | Repositories held. |
 | `modelregistry_revisions` | gauge | | Revisions recorded, over all repositories. |
 | `modelregistry_storage_blobs` | gauge | `backend` | Stored files, each distinct content once. `backend` is `filesystem` or `s3` (`other` is never seen outside tests). |
@@ -899,6 +1005,11 @@ groups:
       # Clients are being turned away because fetches are queued up.
       - alert: RegistryFetchQueueFull
         expr: increase(modelregistry_pullthrough_queue_full_total[10m]) > 0
+      # A followed repository has not synced for three intervals (here,
+      # REGISTRY_SYNC_INTERVAL=1h). The log line "sync failed" names it.
+      - alert: RegistryMirrorNotSyncing
+        expr: modelregistry_sync_oldest_success_age_seconds > 3 * 3600
+        for: 10m
 ```
 
 Three more that cost nothing to add: `modelregistry_verify_last_run_blobs{status!="ok"} > 0`
@@ -913,9 +1024,11 @@ line of that failure.
 ## Stopping the server
 
 `modelctl serve` stops on an interrupt or `SIGTERM`. It stops accepting
-requests, cancels the pull-through fetches in progress and a scheduled
-backup if one is running, and waits up to 30 seconds for those and for
-transfers in flight before it exits. A client that was waiting on a fetch
+requests, cancels the pull-through fetches in progress, a sync of a
+followed repository and a scheduled backup if one is running, and waits up
+to 30 seconds for those and for transfers in flight before it exits. A
+sync that was cut short records nothing and moves no ref; the next check
+starts it again. A client that was waiting on a fetch
 is answered `503` with `Retry-After`; the fetch starts again on its next
 request. A client that was being sent a file while it was fetched has its
 download cut short, as it would be by a failed fetch (see

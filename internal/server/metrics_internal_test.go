@@ -55,6 +55,11 @@ func TestRouteClass(t *testing.T) {
 
 		{http.MethodPost, "/api/v1/mirror", routeTask},
 		{http.MethodPost, "/api/v1/verify", routeTask},
+		{http.MethodPost, "/api/v1/repos/acme/tiny/sync", routeTask},
+		{http.MethodPost, "/api/v1/datasets/acme/tiny/sync", routeTask},
+		{http.MethodPost, "/api/v1/sync", routeAPI},
+		{http.MethodGet, "/api/v1/repos/acme/sync", routeAPI},
+		{http.MethodPost, "/api/v1/repos/acme/tiny/follow", routeAPI},
 		{http.MethodGet, "/api/v1/backups/snapshot", routeTask},
 		{http.MethodGet, "/api/v1/backup/snapshot", routeTask},
 

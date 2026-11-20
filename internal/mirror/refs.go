@@ -117,30 +117,37 @@ func (r RefsResult) DoneEvent() RefsDone {
 		Bytes: r.DownloadedBytes + r.ReusedBytes, DownloadedBytes: r.DownloadedBytes, ReusedBytes: r.ReusedBytes}, Refs: r.Refs}
 }
 
+// ListRefs asks the upstream for the branches and tags of the repository
+// whose key is key, branches first. Every failure is the upstream's.
+func ListRefs(ctx context.Context, up *Upstream, key string, slot Slot) ([]UpstreamRef, error) {
+	if err := registry.ValidateRepoKey(key); err != nil {
+		return nil, err
+	}
+	var listed []UpstreamRef
+	err := hold(ctx, slot, func() (err error) {
+		listed, err = up.refs(ctx, key)
+		return err
+	})
+	return listed, blame(err)
+}
+
 // MirrorRefs mirrors the refs spec names of the repository whose key is
-// key: one branch, or every branch and tag the upstream lists. Each ref's
-// revision is fetched in full and verified (files already stored are not
-// fetched again), and the ref recorded: a branch as a branch, a tag as a
-// tag.
+// key, as listed (ListRefs, asked just before): one branch, or every branch
+// and tag. Each ref's revision is fetched in full and verified (files
+// already stored are not fetched again), and the ref recorded: a branch as
+// a branch, a tag as a tag.
 //
-// The error is for a mirror that could not start: the upstream's refs
-// could not be listed, or the registry's could not be read. Everything
-// after that is reported per ref in the result. Progress, when set in opt,
-// receives each revision's start and file lines and a ref line per ref; the
-// done line is the caller's to send (RefsResult.DoneEvent).
-func MirrorRefs(ctx context.Context, up *Upstream, reg *registry.Registry, key string, spec registry.FollowSpec, opt Options) (RefsResult, error) {
+// The error is for a mirror that could not start, because the registry's
+// refs could not be read. Everything after that is reported per ref in the
+// result. Progress, when set in opt, receives each revision's start and
+// file lines and a ref line per ref; the done line is the caller's to send
+// (RefsResult.DoneEvent).
+func MirrorRefs(ctx context.Context, up *Upstream, reg *registry.Registry, key string, spec registry.FollowSpec, listed []UpstreamRef, opt Options) (RefsResult, error) {
 	if err := registry.ValidateRepoKey(key); err != nil {
 		return RefsResult{}, err
 	}
 	if spec.AllRefs == (spec.Branch != "") {
 		return RefsResult{}, fmt.Errorf("%w: mirror one branch or every branch and tag", registry.ErrInvalid)
-	}
-	var listed []UpstreamRef
-	if err := hold(ctx, opt.ListingSlot, func() (err error) {
-		listed, err = up.refs(ctx, key)
-		return err
-	}); err != nil {
-		return RefsResult{}, blame(err)
 	}
 	held := map[string]registry.Ref{}
 	switch repo, err := reg.GetRepo(ctx, key); {

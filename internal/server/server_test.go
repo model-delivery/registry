@@ -433,6 +433,33 @@ func TestAccessControl(t *testing.T) {
 		{"open: anonymous dataset UI delete", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", none, "", 403},
 		{"open: write token dataset UI delete", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", write, "", 403},
 		{"open: admin dataset UI delete without the typed name", open, http.MethodPost, "/ui/dataset/acme/tiny/delete", admin, "", 303},
+		// Keeping mirrors up to date: the follow list reads like browsing;
+		// following, unfollowing and syncing need the write role. A
+		// repository pushed here cannot be followed (409) and is not
+		// followed (404), which is how a request that got past the gate shows.
+		{"open: anonymous follow list", open, http.MethodGet, "/api/v1/follows", none, "", 200},
+		{"private: anonymous follow list", private, http.MethodGet, "/api/v1/follows", none, "", 401},
+		{"private: read token follow list", private, http.MethodGet, "/api/v1/follows", read, "", 200},
+		{"open: anonymous follow", open, http.MethodPost, "/api/v1/repos/acme/tiny/follow", none, `{}`, 401},
+		{"open: read token follow", open, http.MethodPost, "/api/v1/repos/acme/tiny/follow", read, `{}`, 403},
+		{"open: write token follow", open, http.MethodPost, "/api/v1/repos/acme/tiny/follow", write, `{}`, 409},
+		{"open: anonymous unfollow", open, http.MethodDelete, "/api/v1/repos/acme/tiny/follow", none, "", 401},
+		{"open: read token unfollow", open, http.MethodDelete, "/api/v1/repos/acme/tiny/follow", read, "", 403},
+		{"open: write token unfollow", open, http.MethodDelete, "/api/v1/repos/acme/tiny/follow", write, "", 404},
+		{"open: anonymous sync", open, http.MethodPost, "/api/v1/repos/acme/tiny/sync", none, "", 401},
+		{"open: read token sync", open, http.MethodPost, "/api/v1/repos/acme/tiny/sync", read, "", 403},
+		{"open: write token sync", open, http.MethodPost, "/api/v1/repos/acme/tiny/sync", write, "", 404},
+		{"open: anonymous sync all", open, http.MethodPost, "/api/v1/sync", none, "", 401},
+		{"open: read token sync all", open, http.MethodPost, "/api/v1/sync", read, "", 403},
+		{"open: write token sync all", open, http.MethodPost, "/api/v1/sync", write, "", 202},
+		{"open: anonymous dataset follow", open, http.MethodPost, "/api/v1/datasets/acme/tiny/follow", none, `{}`, 401},
+		{"open: read token dataset follow", open, http.MethodPost, "/api/v1/datasets/acme/tiny/follow", read, `{}`, 403},
+		{"open: write token dataset follow", open, http.MethodPost, "/api/v1/datasets/acme/tiny/follow", write, `{}`, 409},
+		{"open: read token dataset unfollow", open, http.MethodDelete, "/api/v1/datasets/acme/tiny/follow", read, "", 403},
+		{"open: write token dataset unfollow", open, http.MethodDelete, "/api/v1/datasets/acme/tiny/follow", write, "", 404},
+		{"open: anonymous dataset sync", open, http.MethodPost, "/api/v1/datasets/acme/tiny/sync", none, "", 401},
+		{"open: read token dataset sync", open, http.MethodPost, "/api/v1/datasets/acme/tiny/sync", read, "", 403},
+		{"open: write token dataset sync", open, http.MethodPost, "/api/v1/datasets/acme/tiny/sync", write, "", 404},
 		// Spaces are not supported: the fixed "not implemented".
 		{"private: spaces", private, http.MethodGet, "/api/spaces/acme/tiny", none, "", 404},
 	}

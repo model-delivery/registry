@@ -40,6 +40,10 @@ const (
 	defaultBackupKeep = 48
 	// minBackupInterval is the most often scheduled backups may run.
 	minBackupInterval = time.Minute
+	// minSyncInterval is the most often followed repositories may be
+	// checked against their upstream: each check asks the upstream for the
+	// repository's refs, and a hub limits how often it is asked.
+	minSyncInterval = 5 * time.Minute
 )
 
 // The kinds of storage for model files.
@@ -82,6 +86,9 @@ func cmdServe(e *env, args []string) error {
 	c.noteEnv(err)
 	backupEvery := c.Duration("backup-interval", envEvery, "take a metadata backup this often, such as 1h; at least a minute; 0 for no scheduled backups (env REGISTRY_BACKUP_INTERVAL)")
 	backupKeep := c.Int("backup-keep", envKeep, "how many stored backups to keep; 0 keeps every one (env REGISTRY_BACKUP_KEEP)")
+	envSync, err := syncSettings(e)
+	c.noteEnv(err)
+	syncEvery := c.Duration("sync-interval", envSync, "check each followed repository against the upstream this often and mirror what has moved, such as 1h; at least 5m; 0 for no scheduled syncs (env REGISTRY_SYNC_INTERVAL)")
 	restoreEmpty := c.Bool("restore-if-empty", c.envBool("REGISTRY_RESTORE_IF_EMPTY"), "when the data directory has no database, start from the newest stored backup (env REGISTRY_RESTORE_IF_EMPTY)")
 	storage := c.storageFlags("where model files are kept: filesystem or s3 (env REGISTRY_STORAGE); s3 is configured with the --s3-* flags")
 	s3Redirect := c.Bool("s3-redirect", c.envBool("REGISTRY_S3_REDIRECT"), "with s3 storage, answer downloads with a redirect to a signed URL on the object store instead of streaming them through the registry (env REGISTRY_S3_REDIRECT)")
@@ -92,6 +99,9 @@ func cmdServe(e *env, args []string) error {
 
 	if err := checkBackupSettings(*backupEvery, *backupKeep); err != nil {
 		return err
+	}
+	if *syncEvery != 0 && *syncEvery < minSyncInterval {
+		return usagef("--sync-interval must be a duration of at least five minutes, such as 1h or 15m; got %s", *syncEvery)
 	}
 	for name, limit := range map[string]int64{"--pull-through-max-file-bytes": *pullMaxFile, "--max-blob-bytes": *maxBlob} {
 		if limit < 0 {
@@ -145,6 +155,7 @@ func cmdServe(e *env, args []string) error {
 		PullThrough:       *pullThrough,
 		PullThroughAllow:  allow,
 		BackupKeep:        *backupKeep,
+		SyncInterval:      *syncEvery,
 		Version:           Version,
 		Logger:            log,
 
@@ -163,6 +174,9 @@ func cmdServe(e *env, args []string) error {
 	log.Info("registry listening", "addr", ln.Addr().String(), "data", *data, "upstream", *upstream,
 		"anonymous_read", !*requireAuth, "pull_through", *pullThrough, "pull_through_stream", *pullThrough && *pullStream, "version", Version)
 
+	if *syncEvery > 0 {
+		log.Info("scheduled syncs of followed repositories are on", "every", syncEvery.String())
+	}
 	var backups func(context.Context)
 	if *backupEvery > 0 {
 		log.Info("scheduled metadata backups are on", "every", backupEvery.String(), "keep", *backupKeep)
@@ -193,8 +207,9 @@ const (
 // or after grace if some of it has not. Three things are stopped:
 //
 //   - requests in flight, which the HTTP server waits for;
-//   - the server's own pull-through fetches, which no request owns: they
-//     are cancelled and waited for (server.Server.Shutdown);
+//   - the server's own work, which no request owns: pull-through fetches,
+//     syncs of followed repositories and their schedule, all cancelled and
+//     waited for (server.Server.Shutdown);
 //   - background, the scheduled-backup loop when there is one, which runs
 //     on a context that ends here.
 //
@@ -229,7 +244,7 @@ func serve(ctx context.Context, srv *http.Server, ln net.Listener, handler *serv
 	httpStopped := make(chan error, 1)
 	go func() { httpStopped <- srv.Shutdown(deadline) }()
 	if err := handler.Shutdown(deadline); err != nil {
-		log.Warn("stopped waiting for pull-through fetches", "error", err)
+		log.Warn("stopped waiting for pull-through fetches and syncs", "error", err)
 	}
 	if err := <-httpStopped; err != nil && !errors.Is(err, context.DeadlineExceeded) && failed == nil {
 		failed = err
@@ -317,6 +332,20 @@ func backupSettings(e *env) (every time.Duration, keep int, err error) {
 		}
 	}
 	return every, keep, nil
+}
+
+// syncSettings reads how often followed repositories are checked from the
+// environment; unset means never on a schedule.
+func syncSettings(e *env) (time.Duration, error) {
+	v := e.getenv("REGISTRY_SYNC_INTERVAL")
+	if v == "" {
+		return 0, nil
+	}
+	every, err := time.ParseDuration(v)
+	if err != nil || (every != 0 && every < minSyncInterval) {
+		return 0, usagef("REGISTRY_SYNC_INTERVAL must be a duration of at least five minutes, such as 1h or 15m, or 0 for none; got %q", v)
+	}
+	return every, nil
 }
 
 // checkBackupSettings holds the schedule given by flags to the rules

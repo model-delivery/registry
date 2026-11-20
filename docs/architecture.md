@@ -15,6 +15,7 @@ be kept in an S3-compatible bucket instead of on local disk.
         |    hf.go           Hugging Face downloads    /api/{models,datasets}/...      |
         |    hfupload.go     Hugging Face uploads      preupload, lfs batch, commit    |
         |    pullthrough.go  fetching from upstream what a client asks for             |
+        |    sync.go         keeping followed repositories up to date with upstream    |
         |    stream.go       sending a file to clients while it is fetched             |
         |    api.go          registry REST API         /api/v1/...                     |
         |    backup.go       metadata backups          /api/v1/backups...              |
@@ -442,6 +443,46 @@ A lookup that hits is never sent upstream, so pull-through cannot change
 what a recorded branch points at. `modelctl mirror` on a partly fetched
 revision fetches whatever is still pending and completes it.
 
+## Keeping mirrors up to date
+
+A repository created by mirroring or pull-through can be followed: the
+follow list (`follows`, `registry/follow.go`) says which, and whether each
+follows one branch or every branch and tag. A repository created here is
+refused, by the check `Registry.Follow` makes in its transaction, for the
+reason pull-through never adds to one.
+
+`internal/server/sync.go` checks a followed repository in three steps:
+ask the upstream for its refs (one request), mirror what has moved
+(`mirror.MirrorRefs`, described under [Mirroring](#mirroring)), and record
+how it went against the repository (`Registry.RecordSync`: when, whether
+anything changed, the failure). A check that fails records no revision
+and moves no ref; the failure is attributed as everywhere else, the
+upstream's reason recorded and shown, a failure of the registry's own
+logged in full and recorded as no more than that.
+
+Checks come from two places: the schedule, and a request to sync now.
+Both go through one coordinator, which keeps one job per repository (a
+request for a repository already being checked joins that check), runs
+one check at a time, and runs each on the server's lifetime, so a client
+that hangs up does not stop it and `Server.Shutdown` does. The schedule
+is a loop over a tick channel, a ticker in production and the test's own
+channel in tests, reading the clock `Config.Now`; on each tick it starts
+the repositories that are due. A repository is due one interval after its
+last check, twice that after each failure in a row (up to a day), and
+never before its own place in the first interval after the server
+started, a fixed offset derived from its key, which spreads repositories
+over the interval and keeps a restart from checking them all at once.
+
+A check fetches one file at a time and holds, for each file and each
+listing, one of the upstream slots the pull-through coordinator uses
+(`upstreamSlots`). Pull-through jobs and syncs together therefore never
+fetch more at once than those slots allow, and a sync holds at most one
+file slot of the four.
+
+A sync and pull-through do not otherwise meet. Pull-through still never
+refreshes a branch it holds; a followed branch moves only when a sync
+mirrors the revision the upstream now points it at.
+
 ## Serving downloads
 
 `GET /{repo}/resolve/{revision}/{path}` resolves the revision, looks up the
@@ -492,12 +533,13 @@ overwritten, and a failed restore puts it back.
 
 ## Background work and shutdown
 
-Two things in the server process are not requests: pull-through fetches,
-which outlive the request that started them, and the scheduled-backup
-loop. Each has an owner that stops it. `Server.Shutdown` cancels every
-fetch and returns when the last has ended, which also ends, by an abort,
-any response that was being sent from one; the backup loop runs on a
-context that `modelctl serve` cancels. On a signal, `serve` stops taking
+Three things in the server process are not requests: pull-through
+fetches, which outlive the request that started them, syncs of followed
+repositories with their schedule, and the scheduled-backup loop. Each has
+an owner that stops it. `Server.Shutdown` cancels every fetch and every
+sync, and the sync schedule, and returns when the last has ended, which
+also ends, by an abort, any response that was being sent from a fetch; the
+backup loop runs on a context that `modelctl serve` cancels. On a signal, `serve` stops taking
 requests, cancels both, and waits for requests in flight, the fetches and
 a backup in progress, up to thirty seconds, before it closes the
 registry. Nothing is started on a context that nobody cancels.

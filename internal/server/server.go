@@ -70,6 +70,15 @@ type Config struct {
 	// BackupKeep is how many stored metadata backups to keep when one is
 	// taken through the API; 0 keeps them all.
 	BackupKeep int
+	// SyncInterval is how often each followed repository is checked
+	// against its upstream (sync.go). 0 turns the schedule off; checks then
+	// run only when asked for.
+	SyncInterval time.Duration
+	// SyncTicks, when set, drives the schedule in place of a ticker the
+	// server makes: on each value the schedule looks for repositories that
+	// are due, by the clock Now. Tests send the ticks themselves. It has an
+	// effect only with SyncInterval set.
+	SyncTicks <-chan time.Time
 	// UpstreamClient overrides the HTTP client used to reach the upstream.
 	// The default one refuses redirects that lead to local and private
 	// addresses; see mirror.Upstream.Client before replacing it.
@@ -86,10 +95,13 @@ type Config struct {
 // its own account: pull-through fetches, which outlive the requests that
 // start them. Call Shutdown before closing the registry.
 type Server struct {
-	reg     *registry.Registry
-	cfg     Config
-	log     *slog.Logger
-	puller  *puller // nil unless pull-through caching is on
+	reg    *registry.Registry
+	cfg    Config
+	log    *slog.Logger
+	puller *puller // nil unless pull-through caching is on
+	// syncer checks followed repositories against their upstream, on the
+	// schedule and when asked (sync.go).
+	syncer  *syncer
 	handler http.Handler
 	// patterns is every route registered, as the mux was given it. The
 	// documents that list routes are checked against it
@@ -120,11 +132,24 @@ func New(reg *registry.Registry, cfg Config) *Server {
 	lifetime, stop := context.WithCancel(context.Background())
 	s := &Server{reg: reg, cfg: cfg, log: cfg.Logger, stop: stop, uploadKey: newUploadKey()}
 	s.m.declare(cfg.Version, s.now())
+	// Pull-through fetches and syncs take turns at the same upstream slots,
+	// so that together they never ask more of the upstream than the limits.
+	slots := newUpstreamSlots()
 	if cfg.PullThrough {
 		s.puller = newPuller(reg, s.upstream, cfg.PullThroughAllow, cfg.PullThroughMaxFileBytes, cfg.Logger)
 		s.puller.ctx, s.puller.now = lifetime, s.now
 		s.puller.stream = !cfg.PullThroughNoStream
 		s.puller.m = s.m.pull
+		s.puller.slots, s.puller.listings = slots.files, slots.listings
+	}
+	s.syncer = newSyncer(s, lifetime, cfg.SyncInterval, slots)
+	if cfg.SyncInterval > 0 {
+		ticks, stopTicker := cfg.SyncTicks, func() {}
+		if ticks == nil {
+			ticker := time.NewTicker(min(syncTickPeriod, cfg.SyncInterval))
+			ticks, stopTicker = ticker.C, ticker.Stop
+		}
+		s.syncer.schedule(ticks, stopTicker)
 	}
 
 	// Every route is registered with the access it needs: gate, with a role
@@ -155,7 +180,12 @@ func New(reg *registry.Registry, cfg Config) *Server {
 		handle("GET "+root+"/{ns}/{name}/revisions/{rev...}", api(registry.RoleRead, s.apiGetRevision(typ)))
 		handle("POST "+root+"/{ns}/{name}/commits", api(registry.RoleWrite, s.apiCommit(typ)))
 		handle("DELETE "+root+"/{ns}/{name}", api(registry.RoleAdmin, s.apiDeleteRepo(typ)))
+		handle("POST "+root+"/{ns}/{name}/follow", api(registry.RoleWrite, s.apiFollow(typ)))
+		handle("DELETE "+root+"/{ns}/{name}/follow", api(registry.RoleWrite, s.apiUnfollow(typ)))
+		handle("POST "+root+"/{ns}/{name}/sync", api(registry.RoleWrite, s.apiSyncNow(typ)))
 	}
+	handle("GET /api/v1/follows", api(registry.RoleRead, s.apiListFollows))
+	handle("POST /api/v1/sync", api(registry.RoleWrite, s.apiSyncAll))
 	handle("HEAD /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiStatBlob))
 	handle("PUT /api/v1/blobs/{sha256}", api(registry.RoleWrite, s.apiPutBlob))
 	handle("POST /api/v1/mirror", api(registry.RoleWrite, s.apiMirror))
@@ -230,18 +260,49 @@ func New(reg *registry.Registry, cfg Config) *Server {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
 
 // Shutdown ends the work the server does on its own account and waits for
-// it: pull-through fetches are cancelled, and Shutdown returns once every
-// one of them has stopped, or with ctx's error if they have not by then.
-// Requests are not its business; stop the http.Server for those.
+// it: pull-through fetches, syncs and the sync schedule are cancelled, and
+// Shutdown returns once every one of them has stopped, or with ctx's error
+// if they have not by then. Requests are not its business; stop the
+// http.Server for those.
 //
 // Call it before closing the registry. After it returns nil, nothing the
 // server started is still reading or writing.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.stop()
-	if s.puller == nil {
-		return nil
+	var errs []error
+	if s.puller != nil {
+		errs = append(errs, s.puller.wait(ctx))
 	}
-	return s.puller.wait(ctx)
+	errs = append(errs, s.syncer.wait(ctx))
+	return errors.Join(errs...)
+}
+
+// upstreamSlots are the turns at the upstream that the server's own work
+// takes: file fetches, and listings, which have slots of their own so that
+// they never wait behind a file. Pull-through jobs hold a slot for their
+// whole run; a sync holds one per file or listing (sync.go).
+type upstreamSlots struct {
+	files, listings chan struct{}
+	// file and listing take one of each, for internal/mirror.
+	file, listing mirror.Slot
+}
+
+func newUpstreamSlots() upstreamSlots {
+	s := upstreamSlots{files: make(chan struct{}, maxConcurrentPulls), listings: make(chan struct{}, maxConcurrentListings)}
+	s.file, s.listing = poolSlot(s.files), poolSlot(s.listings)
+	return s
+}
+
+// poolSlot takes a slot from pool, waiting as long as ctx lives.
+func poolSlot(pool chan struct{}) mirror.Slot {
+	return func(ctx context.Context) (func(), error) {
+		select {
+		case pool <- struct{}{}:
+			return func() { <-pool }, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // now is the server's clock. Deadlines set on a connection are the one use
@@ -562,8 +623,10 @@ func statusFor(err error) (int, string) {
 		return http.StatusNotFound, hfCodeRevisionNotFound
 	case errors.Is(err, registry.ErrEntryNotFound), errors.Is(err, blob.ErrNotFound):
 		return http.StatusNotFound, hfCodeEntryNotFound
-	case errors.Is(err, registry.ErrTokenNotFound):
+	case errors.Is(err, registry.ErrTokenNotFound), errors.Is(err, registry.ErrNotFollowed):
 		return http.StatusNotFound, ""
+	case errors.Is(err, registry.ErrLocalRepo):
+		return http.StatusConflict, ""
 	case errors.Is(err, registry.ErrInvalid), errors.Is(err, registry.ErrBlobMissing), errors.Is(err, blob.ErrMismatch):
 		return http.StatusBadRequest, ""
 	case errors.Is(err, registry.ErrConflict):

@@ -51,8 +51,8 @@ export T=md_your_token
 |---|---|
 | `400` | The request is malformed: invalid JSON, an unknown field, a name or path that is not allowed, a file that was never uploaded, or an upload that does not hash to its digest. |
 | `401`, `403` | No valid token, or a token whose role is too low. |
-| `404` | No such repository, revision, file, token or backup. Looking up a revision also sets the `X-Error-Code` header to `RepoNotFound` or `RevisionNotFound`. |
-| `409` | The request conflicts with what is recorded: a tag that already names another revision, a branch name that is a tag, a token name that is taken, or a commit onto a branch whose revision still has files that were never fetched (see `pending` below). Nothing is changed. |
+| `404` | No such repository, revision, file, token or backup, or a repository that is not followed. Looking up a revision also sets the `X-Error-Code` header to `RepoNotFound` or `RevisionNotFound`. |
+| `409` | The request conflicts with what is recorded: a tag that already names another revision, a branch name that is a tag, a token name that is taken, a commit onto a branch whose revision still has files that were never fetched (see `pending` below), or following a repository that was not created from an upstream. Nothing is changed. |
 | `413` | A file larger than `REGISTRY_MAX_BLOB_BYTES`. |
 | `500` | The registry itself failed, for example its disk or database. The body says only `internal error`; the server's log has the reason. |
 | `502` | The upstream hub is at fault: it cannot be reached, it answered with an error or with something that is not a hub's answer, it denies access, or it redirects somewhere the registry does not follow. Mirroring answers this, and so does looking up a revision with pull-through on. The body says which. |
@@ -232,6 +232,7 @@ curl -N -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json
 | `repo` | Required. The repository id on the upstream hub. |
 | `type` | `dataset` to mirror a dataset; `model` (the default) for a model. Anything else is refused with `400`. |
 | `revision` | Branch, tag or revision id. Default `main`. |
+| `all_refs` | `true` to mirror every branch and tag instead of one revision; see [below](#every-branch-and-tag). |
 | `upstream_token` | Token for the upstream hub, for private or gated repositories. Used for this request only and not stored. |
 
 If the upstream cannot provide the revision, the response is an ordinary
@@ -258,6 +259,94 @@ dropping). When the registry itself could not store the revision, it says
 so and no more; the reason is in the server's log.
 
 The upstream hub itself is fixed by the server's `--upstream` setting.
+
+### Every branch and tag
+
+With `"all_refs": true` (and no `revision`), the request mirrors every
+branch and every tag the upstream lists for the repository, model or
+dataset. A revision that several refs name is fetched once, and files
+already stored are not fetched again. Each upstream branch is recorded as
+a branch and each tag as a tag.
+
+The upstream's list of refs is asked for before the answer starts, so a
+repository it does not have is a `404` and a refusal a `502`, as above.
+The stream then has the `start` and `file` lines of each revision fetched,
+one `ref` line per ref, and a last `done` line that repeats every ref's
+result in `refs`:
+
+```json
+{"event":"ref","ref":"main","kind":"branch","outcome":"mirrored","sha":"f171d7ba..."}
+{"event":"ref","ref":"v1.0","kind":"tag","outcome":"tag_moved","sha":"9a0e33c1...","previous":"5b2c8e10...","detail":"tag \"v1.0\" of acme/tiny has moved upstream, from 5b2c8e10... to 9a0e33c1...; the registry's tag stays at 5b2c8e10..., because a tag never moves here"}
+{"event":"done","repo":"acme/tiny","bytes":28183891,"downloaded_bytes":27663679,"reused_bytes":520212,"refs":[...]}
+```
+
+| `outcome` | |
+|---|---|
+| `mirrored` | The ref is new, or a branch moved, or its revision had files that were not stored; the revision is now stored in full and the ref points at it. |
+| `unchanged` | The registry already had the ref at that revision, with every file stored. |
+| `tag_moved` | The upstream's tag names another revision than the registry's. Tags never move here, so the registry's tag stays; `previous` is where it is, `sha` where the upstream's is. |
+| `conflict` | The name is a branch on one side and a tag on the other, or the upstream has both a branch and a tag of that name (the branch is mirrored). The registry's ref is left as it is. |
+| `deleted_upstream` | The registry has the ref and the upstream no longer does. It stays. |
+| `failed` | The ref could not be mirrored, and nothing of it was recorded; `detail` says why, by the same rule as an `error` line. The other refs are not affected. |
+
+A `done` line means the run finished; look at each ref's `outcome` for
+how it went. An `error` line is sent only when the run could not go
+through the refs at all.
+
+A revision mirrored by name (without `all_refs`) is likewise recorded as
+the kind of ref it is upstream: mirroring a tag creates a tag. Up to
+v0.4.1 it became a branch.
+
+## Keeping mirrors up to date
+
+A repository created by mirroring or pull-through can be *followed*: the
+registry checks what its followed refs point at upstream, on the schedule
+set by `REGISTRY_SYNC_INTERVAL` or when asked, and mirrors whatever has
+moved. See [operations.md](operations.md#keeping-mirrors-up-to-date).
+Every route here has a dataset twin under `/api/v1/datasets`.
+
+| | |
+|---|---|
+| `POST /api/v1/repos/{namespace}/{name}/follow` (write) | Follow a repository, or change what it follows. Body `{"branch": "main"}` or `{"all_refs": true}`; `{}` follows the repository's only branch, or `main`. Answers `200` with the entry (below). A repository created by a push or an upload is refused with `409`, and so is a branch name that is a tag here. |
+| `DELETE /api/v1/repos/{namespace}/{name}/follow` (write) | Stop following. Nothing the repository holds changes. Answers `204`, or `404` if it was not followed. |
+| `GET /api/v1/follows` (read) | The follow list, models and datasets: `{"follows": [...], "interval_seconds": 3600}` (`0` when there is no schedule). |
+| `POST /api/v1/repos/{namespace}/{name}/sync` (write) | Check one followed repository now and answer when the check is over. `404` if it is not followed. |
+| `POST /api/v1/sync` (write) | Start a check of every followed repository and answer at once, `202` with `{"queued": ["acme/tiny", "datasets/acme/reviews"]}`. The checks take their turns, one at a time. |
+| `POST /api/v1/datasets/{namespace}/{name}/follow` (write) | Follow a dataset. |
+| `DELETE /api/v1/datasets/{namespace}/{name}/follow` (write) | Stop following a dataset. |
+| `POST /api/v1/datasets/{namespace}/{name}/sync` (write) | Check one followed dataset now. |
+
+An entry of the follow list:
+
+```json
+{"name": "acme/tiny", "branch": "main", "created_at": "...",
+ "last_check": "...", "last_success": "...", "last_change": "...",
+ "last_error": "upstream returned 503", "last_error_at": "...", "failures": 1, "next_check": "..."}
+```
+
+`branch` is absent and `all_refs` is `true` for a repository that follows
+every branch and tag; `type` is `dataset` for a dataset. `last_check` is
+when the upstream was last asked, whatever came of it; `last_success`
+when that last went well; `last_change` when a check last added or moved
+a ref. `last_error`, `last_error_at` and `failures` (checks in a row that
+failed) are cleared by a check that succeeds. `next_check` is when the
+schedule will next check it, and is absent with no schedule. A time is
+absent until it has happened.
+
+The answer to a sync of one repository:
+
+```json
+{"name": "acme/tiny", "checked_at": "...", "changed": true, "downloaded_bytes": 520212,
+ "refs": [{"name": "main", "kind": "branch", "outcome": "mirrored", "sha": "9a0e...", "previous": "f171..."}]}
+```
+
+`refs` is as for a mirror of every ref, for the refs followed. A check
+that failed answers `502` (the upstream's doing: unreachable, an error
+answer, content that did not match its digest, a followed branch the
+upstream no longer has) or `500` (the registry's own), with the same
+document and the reason in `error`; it is also recorded in the entry's
+`last_error`. A tag that moved upstream, or a ref deleted upstream, is not
+a failure: it is reported in `refs` and left as it is.
 
 ## Tokens
 

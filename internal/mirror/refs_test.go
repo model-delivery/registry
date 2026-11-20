@@ -150,6 +150,16 @@ func (h *refHub) set(f func(h *refHub)) {
 	f(h)
 }
 
+// listAndMirror lists the upstream's refs and mirrors those spec names, as
+// the server does.
+func listAndMirror(ctx context.Context, up *Upstream, reg *registry.Registry, key string, spec registry.FollowSpec, opt Options) (RefsResult, error) {
+	listed, err := ListRefs(ctx, up, key, opt.ListingSlot)
+	if err != nil {
+		return RefsResult{}, err
+	}
+	return MirrorRefs(ctx, up, reg, key, spec, listed, opt)
+}
+
 // outcomes is each ref's outcome, by name.
 func outcomes(res RefsResult) map[string]RefOutcome {
 	out := map[string]RefOutcome{}
@@ -187,7 +197,7 @@ func TestMirrorEveryRef(t *testing.T) {
 			up := &Upstream{Endpoint: h.URL}
 			var lines []Event
 			var mu sync.Mutex
-			res, err := MirrorRefs(ctx, up, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{Progress: func(e Event) {
+			res, err := listAndMirror(ctx, up, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{Progress: func(e Event) {
 				mu.Lock()
 				lines = append(lines, e)
 				mu.Unlock()
@@ -223,7 +233,7 @@ func TestMirrorEveryRef(t *testing.T) {
 				t.Fatalf("%d ref lines, want 4", refLines)
 			}
 
-			again, err := MirrorRefs(ctx, up, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{})
+			again, err := listAndMirror(ctx, up, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -253,7 +263,7 @@ func TestMirrorABranchThatMoved(t *testing.T) {
 	reg := openRegistry(t)
 	up := &Upstream{Endpoint: h.URL}
 	branch := registry.FollowSpec{Branch: "main"}
-	if _, err := MirrorRefs(ctx, up, reg, h.key, branch, Options{}); err != nil {
+	if _, err := listAndMirror(ctx, up, reg, h.key, branch, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	before := h.files.Load()
@@ -262,7 +272,7 @@ func TestMirrorABranchThatMoved(t *testing.T) {
 		h.revs[revB] = map[string]string{"config.json": "{}", "weights.bin": "weights two", "tokenizer.json": "tok"}
 		h.branches["main"] = revB
 	})
-	res, err := MirrorRefs(ctx, up, reg, h.key, branch, Options{})
+	res, err := listAndMirror(ctx, up, reg, h.key, branch, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +307,7 @@ func TestMirrorRefsNeverMovesATagOrDeletes(t *testing.T) {
 	reg := openRegistry(t)
 	up := &Upstream{Endpoint: h.URL}
 	all := registry.FollowSpec{AllRefs: true}
-	if _, err := MirrorRefs(ctx, up, reg, h.key, all, Options{}); err != nil {
+	if _, err := listAndMirror(ctx, up, reg, h.key, all, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -305,7 +315,7 @@ func TestMirrorRefsNeverMovesATagOrDeletes(t *testing.T) {
 		h.tags["v1"] = revB
 		delete(h.branches, "dev")
 	})
-	res, err := MirrorRefs(ctx, up, reg, h.key, all, Options{})
+	res, err := listAndMirror(ctx, up, reg, h.key, all, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +332,7 @@ func TestMirrorRefsNeverMovesATagOrDeletes(t *testing.T) {
 	checkRef(t, reg, h.key, "dev", registry.KindBranch, revA)
 
 	// Following the deleted branch alone says the same.
-	res, err = MirrorRefs(ctx, up, reg, h.key, registry.FollowSpec{Branch: "dev"}, Options{})
+	res, err = listAndMirror(ctx, up, reg, h.key, registry.FollowSpec{Branch: "dev"}, Options{})
 	if err != nil || len(res.Refs) != 1 || res.Refs[0].Outcome != RefDeletedUpstream || res.Refs[0].Previous != revA {
 		t.Fatalf("the deleted branch alone: %+v, %v", res.Refs, err)
 	}
@@ -358,7 +368,7 @@ func TestMirrorRefsOneFails(t *testing.T) {
 		h.corrupt["bad.csv"] = true
 	})
 	reg := openRegistry(t)
-	res, err := MirrorRefs(ctx, &Upstream{Endpoint: h.URL}, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{})
+	res, err := listAndMirror(ctx, &Upstream{Endpoint: h.URL}, reg, h.key, registry.FollowSpec{AllRefs: true}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +457,7 @@ func TestMirrorHoldsAFileSlotPerFile(t *testing.T) {
 	}
 	listings := 0
 	listing := func(context.Context) (func(), error) { listings++; return func() {}, nil }
-	res, err := MirrorRefs(ctx, &Upstream{Endpoint: h.URL}, openRegistry(t), h.key, registry.FollowSpec{Branch: "main"},
+	res, err := listAndMirror(ctx, &Upstream{Endpoint: h.URL}, openRegistry(t), h.key, registry.FollowSpec{Branch: "main"},
 		Options{Concurrency: 4, FileSlot: slot, ListingSlot: listing})
 	if err != nil || res.Refs[0].Outcome != RefMirrored {
 		t.Fatalf("%+v, %v", res, err)

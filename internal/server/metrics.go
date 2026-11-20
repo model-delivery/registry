@@ -110,6 +110,12 @@ type serverMetrics struct {
 
 	pull pullMetrics
 
+	// Checks of followed repositories (sync.go).
+	syncChecks, syncChanges *metrics.Counter
+	syncBytes               *metrics.Counter
+	syncFailures            *metrics.CounterVec
+	followed, syncOldest    *metrics.Gauge
+
 	// Set when the metrics are written, from what the registry and the
 	// pull-through coordinator hold.
 	pullInFlight, pullWaiting, distrusted *metrics.Gauge
@@ -132,6 +138,10 @@ type serverMetrics struct {
 	// one. storedKnown is set once storage has been asked.
 	stored      registry.Backup
 	storedKnown bool
+	// oldestSync is the oldest last successful check among the followed
+	// repositories (when it was followed, for one never checked well),
+	// counted with the catalogue; zero when none is followed.
+	oldestSync time.Time
 }
 
 // pullMetrics is what the pull-through coordinator counts. The zero value
@@ -229,6 +239,19 @@ func (m *serverMetrics) declare(version string, started time.Time) {
 	m.mirrors = set.Counter("modelregistry_mirrors_total", "Mirrors finished, by outcome.", outcome(outcomeSucceeded, outcomeFailed))
 	m.mirrorBytes = set.Counter("modelregistry_mirror_fetched_bytes_total", "Bytes downloaded from the upstream by mirrors that succeeded.").With()
 
+	// Keeping mirrors up to date.
+	m.syncChecks = set.Counter("modelregistry_sync_checks_total",
+		"Checks of a followed repository against its upstream that finished, scheduled and asked for, whatever came of them.").With()
+	m.syncChanges = set.Counter("modelregistry_sync_changes_total",
+		"Checks that added or moved a ref: a new revision mirrored, or a ref recorded at one already stored.").With()
+	m.syncFailures = set.Counter("modelregistry_sync_failures_total",
+		"Checks that failed, by outcome: upstream (unreachable, or it answered with an error), verification (content did not match its digest), not_found (the upstream does not have the repository or the followed branch), local (the registry failed).",
+		outcome(outcomeUpstream, outcomeVerification, outcomeNotFound, outcomeLocal))
+	m.syncBytes = set.Counter("modelregistry_sync_fetched_bytes_total", "Bytes downloaded from the upstream by checks of followed repositories.").With()
+	m.followed = set.Gauge("modelregistry_followed_repositories", "Repositories on the follow list.").With()
+	m.syncOldest = set.Gauge("modelregistry_sync_oldest_success_age_seconds",
+		"Seconds since the followed repository that has gone longest without a successful check last had one (or was followed, if it never has); 0 when none is followed.").With()
+
 	// Storage and catalogue.
 	backend := metrics.L("backend", blob.KindFilesystem, blob.KindS3, blob.KindOther)
 	m.repos = set.Gauge("modelregistry_repositories", "Repositories the registry holds.").With()
@@ -277,6 +300,10 @@ func routeClass(r *http.Request) string {
 	case strings.HasPrefix(path, "/api/v1/"):
 		switch strings.TrimPrefix(path, "/api/v1/") {
 		case "mirror", "verify", "backups/snapshot", "backup/snapshot":
+			return routeTask
+		}
+		// Syncing one repository now lasts as long as the sync.
+		if r.Method == http.MethodPost && strings.HasSuffix(path, "/sync") && path != "/api/v1/sync" {
 			return routeTask
 		}
 		return routeAPI
@@ -511,6 +538,21 @@ func (s *Server) readGauges(ctx context.Context) {
 			m.pendingFiles.Set(float64(t.PendingFiles))
 			m.pendingBytes.Set(float64(t.PendingBytes))
 		}
+		if follows, err := s.reg.Follows(ctx); err != nil {
+			s.log.Warn("metrics: could not read the follow list", "error", err)
+		} else {
+			m.followed.Set(float64(len(follows)))
+			m.oldestSync = time.Time{}
+			for _, f := range follows {
+				last := f.LastSuccess
+				if last.IsZero() {
+					last = f.CreatedAt
+				}
+				if m.oldestSync.IsZero() || last.Before(m.oldestSync) {
+					m.oldestSync = last
+				}
+			}
+		}
 		if !m.storedKnown {
 			if list, err := s.reg.Backups(ctx); err != nil {
 				s.log.Warn("metrics: could not list the stored backups", "error", err)
@@ -521,6 +563,12 @@ func (s *Server) readGauges(ctx context.Context) {
 				}
 			}
 		}
+	}
+
+	if m.oldestSync.IsZero() {
+		m.syncOldest.Set(0)
+	} else {
+		m.syncOldest.Set(max(0, now.Sub(m.oldestSync).Seconds()))
 	}
 
 	a := s.reg.Activity()

@@ -282,6 +282,9 @@ type mirrorRequest struct {
 	// Type is "dataset" for a dataset; empty or "model" for a model.
 	Type     registry.RepoType `json:"type"`
 	Revision string            `json:"revision"`
+	// AllRefs mirrors every branch and tag the upstream has, in place of
+	// one revision.
+	AllRefs bool `json:"all_refs"`
 	// UpstreamToken authenticates to the upstream hub for private or gated
 	// repositories. It is used for this request only and never stored.
 	UpstreamToken string `json:"upstream_token"`
@@ -310,6 +313,10 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	if req.UpstreamToken != "" {
 		up.Token = req.UpstreamToken
 	}
+	if req.AllRefs {
+		s.mirrorAllRefs(w, r, up, registry.RepoKey(typ, req.Repo), req.Revision)
+		return
+	}
 	// Resolve upstream before answering, so a wrong name or a missing
 	// token comes back as a proper HTTP error.
 	plan, err := mirror.Prepare(r.Context(), up, registry.RepoKey(typ, req.Repo), req.Revision)
@@ -318,27 +325,8 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// From here the response is a stream of JSON lines; failures are
-	// reported as a final {"event":"error"} line.
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
-	enc := json.NewEncoder(w)
-	emit := func(e mirror.Event) {
-		_ = enc.Encode(e)
-		_ = rc.Flush()
-	}
+	emit, events, done := s.mirrorStream(w)
 	started := s.now()
-	// Progress callbacks arrive from several goroutines; serialise writes.
-	events := make(chan mirror.Event, mirrorEventBuffer)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for e := range events {
-			emit(e)
-		}
-	}()
 	// The last event Execute sends on success is the "done" line.
 	s.m.mirrorsStarted.Inc()
 	res, err := plan.Execute(r.Context(), s.reg, mirror.DefaultConcurrency, func(e mirror.Event) { events <- e })
@@ -346,7 +334,7 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	<-done
 	if err != nil {
 		s.m.mirrors.With(outcomeFailed).Inc()
-		emit(mirror.Event{Event: mirror.EventError, Error: s.mirrorFailure(plan, err)})
+		emit(mirror.Event{Event: mirror.EventError, Error: s.mirrorFailure(plan.Repo, plan.Info.SHA, err)})
 		return
 	}
 	s.m.mirrors.With(outcomeSucceeded).Inc()
@@ -354,6 +342,79 @@ func (s *Server) apiMirror(w http.ResponseWriter, r *http.Request) {
 	s.m.commits.With(sourceMirror).Inc()
 	s.log.Info("mirror complete", "repo", res.Repo, "sha", res.SHA, "files", res.Files,
 		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", s.now().Sub(started).Round(time.Millisecond))
+}
+
+// mirrorStream starts the answer to a mirror request that has begun: a
+// stream of JSON lines. emit writes one line; events takes progress lines
+// from any goroutine and writes them in turn, until it is closed, after
+// which done is closed.
+func (s *Server) mirrorStream(w http.ResponseWriter) (emit func(any), events chan<- mirror.Event, done <-chan struct{}) {
+	// From here the response is a stream of JSON lines; failures are
+	// reported as a final {"event":"error"} line.
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	enc := json.NewEncoder(w)
+	emit = func(e any) {
+		_ = enc.Encode(e)
+		_ = rc.Flush()
+	}
+	// Progress callbacks arrive from several goroutines; serialise writes.
+	queue := make(chan mirror.Event, mirrorEventBuffer)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for e := range queue {
+			emit(e)
+		}
+	}()
+	return emit, queue, finished
+}
+
+// mirrorAllRefs answers a mirror request for every branch and tag of the
+// repository with key key. The upstream's refs are listed before the
+// answer starts, so that a wrong name or a missing token is an ordinary
+// error; after that every ref is reported on a line of its own, and the
+// done line carries them all. A ref that failed is reported there and does
+// not undo the others.
+func (s *Server) mirrorAllRefs(w http.ResponseWriter, r *http.Request, up *mirror.Upstream, key, revision string) {
+	if revision != "" {
+		writeError(w, http.StatusBadRequest, "all_refs mirrors every branch and tag; leave revision out")
+		return
+	}
+	listed, err := mirror.ListRefs(r.Context(), up, key, nil)
+	if err != nil {
+		s.fail(w, r, upstreamFailure(err))
+		return
+	}
+	emit, events, done := s.mirrorStream(w)
+	started := s.now()
+	s.m.mirrorsStarted.Inc()
+	res, err := mirror.MirrorRefs(r.Context(), up, s.reg, key, registry.FollowSpec{AllRefs: true}, listed, mirror.Options{
+		Concurrency: mirror.DefaultConcurrency,
+		Progress:    func(e mirror.Event) { events <- e },
+		Describe:    func(err error) string { return s.mirrorFailure(key, "", err) },
+	})
+	close(events)
+	<-done
+	if err != nil {
+		s.m.mirrors.With(outcomeFailed).Inc()
+		emit(mirror.Event{Event: mirror.EventError, Error: s.mirrorFailure(key, "", err)})
+		return
+	}
+	outcome := outcomeSucceeded
+	if len(res.Failed()) > 0 {
+		outcome = outcomeFailed
+	}
+	s.m.mirrors.With(outcome).Inc()
+	s.m.mirrorBytes.Add(res.DownloadedBytes)
+	if res.Changed() {
+		s.m.commits.With(sourceMirror).Inc()
+	}
+	s.log.Info("mirror of every ref complete", "repo", key, "refs", len(res.Refs), "failed", len(res.Failed()),
+		"downloaded_bytes", res.DownloadedBytes, "reused_bytes", res.ReusedBytes, "took", s.now().Sub(started).Round(time.Millisecond))
+	emit(res.DoneEvent())
 }
 
 // upstreamFailure marks a failure to reach or read the upstream, of a kind
@@ -375,19 +436,19 @@ func upstreamFailure(err error) error {
 // registry's own (its disk, its database) is logged in full and described
 // no further, and anything else (the upstream's doing, or the request's)
 // is passed on with its reason.
-func (s *Server) mirrorFailure(plan *mirror.Plan, err error) string {
+func (s *Server) mirrorFailure(repo, sha string, err error) string {
 	status, _ := statusFor(err)
 	switch {
 	case mirror.FromUpstream(err) && status == http.StatusInternalServerError:
 		// The upstream's doing, of a kind with no status of its own: a
 		// dropped connection, an error answer.
-		s.log.Warn("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
+		s.log.Warn("mirror failed", "repo", repo, "sha", sha, "error", err)
 		return "mirror failed: " + err.Error()
 	case status == http.StatusInternalServerError:
-		s.log.Error("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
+		s.log.Error("mirror failed", "repo", repo, "sha", sha, "error", err)
 		return mirrorFailedLocally
 	}
-	s.log.Warn("mirror failed", "repo", plan.Repo, "sha", plan.Info.SHA, "error", err)
+	s.log.Warn("mirror failed", "repo", repo, "sha", sha, "error", err)
 	return err.Error()
 }
 

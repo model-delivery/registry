@@ -196,9 +196,8 @@ func TestHubClientDatasetAgainstMirror(t *testing.T) {
 				strings.Join(got.TreeFolders, ",") != "data" || strings.Join(got.TopLevel, ",") != "README.md,data,shared.txt" {
 				t.Errorf("list_repo_tree: files %v folders %v top %v", got.TreeFiles, got.TreeFolders, got.TopLevel)
 			}
-			// Mirroring the upstream's tag v1 records it as a local branch of
-			// that name, as it does for a model.
-			if got.Branches["main"] != data.SHA || got.Branches["v1"] != data.SHA {
+			// The upstream's tag v1 is a tag here too, as it is for a model.
+			if got.Branches["main"] != data.SHA || got.Tags["v1"] != data.SHA {
 				t.Errorf("list_repo_refs: branches %v tags %v", got.Branches, got.Tags)
 			}
 			if len(got.PathsInfo) != 2 || got.PathsInfo[0][0] != "data/train.csv" || got.PathsInfo[1][1] != "folder" {

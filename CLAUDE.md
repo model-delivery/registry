@@ -32,8 +32,10 @@ Read `docs/architecture.md` before changing anything structural, and
   repositories kept up to date with their upstream), `backup.go` (metadata
   backup and restore), `verify.go` (re-checking every stored file).
 - `internal/mirror` — imports a revision from an upstream hub: `mirror.go`
-  (the plan and its execution), `upstream.go` (the hub's API, resumed
-  downloads), `guard.go` (where the upstream may send the registry).
+  (the plan and its execution), `refs.go` (every branch and tag, or one
+  branch, as the upstream has them now: what `--all-refs` and a sync run),
+  `upstream.go` (the hub's API, resumed downloads), `guard.go` (where the
+  upstream may send the registry).
 - `internal/server` — HTTP. `server.go` has the route table, the access
   gate and the error writers. Then one file per surface: `hf.go` (Hugging
   Face download routes), `hfupload.go` (Hugging Face upload routes),

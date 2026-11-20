@@ -299,6 +299,58 @@ func (u *Upstream) info(ctx context.Context, repo, revision string) (Info, error
 	return Info{ID: doc.ID, SHA: doc.SHA, Raw: raw}, nil
 }
 
+// UpstreamRef is a branch or tag as the upstream lists it.
+type UpstreamRef struct {
+	Name string
+	Kind registry.RefKind
+	// SHA is the revision id it points at.
+	SHA string
+}
+
+// maxRefs is how many branches and tags of one repository are read from
+// the upstream; a listing longer than that is refused, not cut short.
+const maxRefs = 10000
+
+// refs lists the branches and tags of the repository whose key is repo,
+// upstream: branches first, then tags, each in the order the upstream gave
+// them. The hub's other kinds of ref (conversions, pull requests) are not
+// asked for. A ref whose target is not a revision id makes the whole
+// listing an error: it is not what a hub sends.
+func (u *Upstream) refs(ctx context.Context, repo string) ([]UpstreamRef, error) {
+	resp, err := u.get(ctx, u.apiRepo(repo)+"/refs", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	type listed struct {
+		Name         string `json:"name"`
+		TargetCommit string `json:"targetCommit"`
+	}
+	var doc struct {
+		Branches []listed `json:"branches"`
+		Tags     []listed `json:"tags"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxInfoBytes)).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("parse upstream refs: %w", err)
+	}
+	if len(doc.Branches)+len(doc.Tags) > maxRefs {
+		return nil, fmt.Errorf("upstream lists more than %d branches and tags", maxRefs)
+	}
+	var out []UpstreamRef
+	for _, group := range []struct {
+		kind registry.RefKind
+		refs []listed
+	}{{registry.KindBranch, doc.Branches}, {registry.KindTag, doc.Tags}} {
+		for _, r := range group.refs {
+			if !registry.IsSHA(r.TargetCommit) {
+				return nil, fmt.Errorf("upstream %s %q points at %q, which is not a 40-character revision id", group.kind, r.Name, r.TargetCommit)
+			}
+			out = append(out, UpstreamRef{Name: r.Name, Kind: group.kind, SHA: r.TargetCommit})
+		}
+	}
+	return out, nil
+}
+
 var nextLinkRe = regexp.MustCompile(`<([^>]+)>\s*;\s*rel="next"`)
 
 // tree lists every file in a revision of the repository whose key is repo,

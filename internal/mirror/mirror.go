@@ -17,10 +17,13 @@ import (
 type EventKind string
 
 // The lines of a mirror's progress, in the order they are sent: one start,
-// a file for each file, then done or error.
+// a file for each file, then done or error. A mirror of every ref sends a
+// start and the files of each revision it fetches, a ref line for each ref,
+// and one done line at the end.
 const (
 	EventStart EventKind = "start"
 	EventFile  EventKind = "file"
+	EventRef   EventKind = "ref"
 	EventDone  EventKind = "done"
 	EventError EventKind = "error"
 )
@@ -54,6 +57,12 @@ type Event struct {
 	DownloadedBytes int64      `json:"downloaded_bytes,omitempty"`
 	ReusedBytes     int64      `json:"reused_bytes,omitempty"`
 	Error           string     `json:"error,omitempty"`
+	// Kind, Outcome, Previous and Detail describe one ref on a ref line of
+	// a mirror of refs (see RefResult).
+	Kind     registry.RefKind `json:"kind,omitempty"`
+	Outcome  RefOutcome       `json:"outcome,omitempty"`
+	Previous string           `json:"previous,omitempty"`
+	Detail   string           `json:"detail,omitempty"`
 }
 
 // Result is what a finished mirror did.
@@ -63,7 +72,7 @@ type Result struct {
 	// dataset.
 	Repo string
 	SHA  string
-	// Ref is the branch that now points at the revision; empty when the
+	// Ref is the branch or tag that now points at the revision; empty when the
 	// revision was asked for by id.
 	Ref   string
 	Files int
@@ -105,10 +114,56 @@ const defaultRevision = "main"
 // the upstream sends.
 const maxStoredInfo = 1 << 20
 
+// target is the ref a mirrored revision is recorded under: the branch it
+// moves, or the tag it creates. The zero value is neither, for a revision
+// asked for by its id.
+type target struct {
+	name string
+	kind registry.RefKind
+}
+
+// branch is the branch the revision moves, if any.
+func (t target) branch() string {
+	if t.kind == registry.KindBranch {
+		return t.name
+	}
+	return ""
+}
+
+// tags is the tags the revision is given, if any.
+func (t target) tags() []string {
+	if t.kind == registry.KindTag {
+		return []string{t.name}
+	}
+	return nil
+}
+
+// TagMovedError reports that an upstream tag names another revision than
+// the registry's tag of the same name. Tags never move here, so the
+// registry's tag stays where it is. errors.Is finds registry.ErrConflict in
+// it.
+type TagMovedError struct {
+	Repo, Tag string
+	// Local is the revision the registry's tag names; Upstream the one the
+	// upstream's tag names now.
+	Local, Upstream string
+}
+
+func (e *TagMovedError) Error() string {
+	return fmt.Sprintf("tag %q of %s has moved upstream, from %s to %s; the registry's tag stays at %s, because a tag never moves here",
+		e.Tag, e.Repo, e.Local, e.Upstream, e.Local)
+}
+
+// Is makes errors.Is(err, registry.ErrConflict) hold.
+func (e *TagMovedError) Is(target error) bool { return target == registry.ErrConflict }
+
 // Plan is a resolved upstream revision, ready to be copied.
 type Plan struct {
 	up       *Upstream
 	revision string
+	// target is where the revision is recorded: under the branch or tag it
+	// was asked for by, as the upstream classes that name.
+	target target
 	// Repo is the key (registry.RepoKey) the revision is recorded under:
 	// the upstream's canonical name, of the type that was asked for.
 	Repo string
@@ -157,7 +212,41 @@ func Prepare(ctx context.Context, up *Upstream, repo, revision string) (*Plan, e
 			return nil, blame(err)
 		}
 	}
-	return &Plan{up: up, revision: revision, Repo: key, Type: typ, Info: info, Entries: entries}, nil
+	plan := &Plan{up: up, revision: revision, Repo: key, Type: typ, Info: info, Entries: entries}
+	if !registry.IsSHA(revision) {
+		kind, err := refKind(ctx, up, key, revision)
+		if err != nil {
+			return nil, blame(err)
+		}
+		plan.target = target{name: revision, kind: kind}
+	}
+	return plan, nil
+}
+
+// refKind asks the upstream whether name is a branch or a tag of the
+// repository whose key is key. A hub that lists no refs at all (it answers
+// "not found" for the listing) is taken to mean a branch, which is what a
+// name was recorded as before tags were told apart.
+func refKind(ctx context.Context, up *Upstream, key, name string) (registry.RefKind, error) {
+	refs, err := up.refs(ctx, key)
+	if errors.Is(err, ErrUpstreamNotFound) {
+		return registry.KindBranch, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	// A branch wins over a tag of the same name, as it does when the hub
+	// resolves the name.
+	kind := registry.KindBranch
+	for _, r := range refs {
+		if r.Name == name {
+			if r.Kind == registry.KindBranch {
+				return registry.KindBranch, nil
+			}
+			kind = registry.KindTag
+		}
+	}
+	return kind, nil
 }
 
 // storedInfo is the upstream's model description as it is kept with the
@@ -188,6 +277,48 @@ func (p *Plan) Bytes() int64 {
 // the revision is recorded. A failure is the returned error, never an
 // event: reporting it is the caller's business.
 func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency int, progress func(Event)) (Result, error) {
+	return p.ExecuteWith(ctx, reg, Options{Concurrency: concurrency, Progress: progress})
+}
+
+// Slot waits for permission to make one request of the upstream and
+// returns the function that gives it back. It fails only when ctx ends.
+type Slot func(ctx context.Context) (release func(), err error)
+
+// Options are how a mirror shares the upstream with other work.
+type Options struct {
+	// Concurrency is how many files are fetched at once; below 1 means
+	// DefaultConcurrency.
+	Concurrency int
+	// Progress, when not nil, receives the progress lines, from several
+	// goroutines.
+	Progress func(Event)
+	// FileSlot, when not nil, is held for each file while it is fetched or
+	// looked up, so that the mirror never has more files in flight than it
+	// is given slots, however high Concurrency is.
+	FileSlot Slot
+	// ListingSlot, when not nil, is held for each request of the upstream's
+	// API: a revision's description, its file listing, the refs.
+	ListingSlot Slot
+	// Describe, when not nil, is what MirrorRefs reports a failed ref's
+	// error as (RefResult.Detail); nil uses the error's text.
+	Describe func(error) string
+}
+
+// hold runs work with a slot from slot, or without one when slot is nil.
+func hold(ctx context.Context, slot Slot, work func() error) error {
+	if slot != nil {
+		release, err := slot(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	return work()
+}
+
+// ExecuteWith is Execute with the options given in full.
+func (p *Plan) ExecuteWith(ctx context.Context, reg *registry.Registry, opt Options) (Result, error) {
+	progress, concurrency := opt.Progress, opt.Concurrency
 	if progress == nil {
 		progress = func(Event) {}
 	}
@@ -195,6 +326,18 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 		concurrency = DefaultConcurrency
 	}
 	repo, sha := p.Repo, p.Info.SHA
+	// A tag never moves here. An upstream tag that now names another
+	// revision is refused before anything is fetched.
+	if tag := p.target.tags(); len(tag) == 1 {
+		held, err := reg.Ref(ctx, repo, tag[0])
+		switch {
+		case errors.Is(err, registry.ErrRevisionNotFound), errors.Is(err, registry.ErrRepoNotFound):
+		case err != nil:
+			return Result{}, err
+		case held.Kind == registry.KindTag && held.SHA != sha:
+			return Result{}, &TagMovedError{Repo: repo, Tag: tag[0], Local: held.SHA, Upstream: sha}
+		}
+	}
 	name, typ := eventRepo(repo)
 	progress(Event{Event: EventStart, Repo: name, RepoType: typ, SHA: sha, Files: len(p.Entries), Bytes: p.Bytes()})
 
@@ -216,7 +359,12 @@ func (p *Plan) Execute(ctx context.Context, reg *registry.Registry, concurrency 
 			defer wg.Done()
 			for i := range jobs {
 				e := p.Entries[i]
-				f, fetched, err := ensureBlob(ctx, p.up, reg, repo, sha, e, nil)
+				var f registry.File
+				var fetched bool
+				err := hold(ctx, opt.FileSlot, func() (err error) {
+					f, fetched, err = ensureBlob(ctx, p.up, reg, repo, sha, e, nil)
+					return err
+				})
 				mu.Lock()
 				if err != nil {
 					if firstErr == nil {
@@ -264,11 +412,11 @@ feed:
 		UpstreamInfo: p.storedInfo(),
 		Message:      "Mirrored from " + p.up.endpoint(),
 		Files:        files,
-	}
-	// A named revision becomes a local branch pointing at the same id, so
-	// "main" keeps working offline. A raw revision id is recorded as is.
-	if !registry.IsSHA(p.revision) {
-		in.Branch = p.revision
+		// A named revision becomes a local ref pointing at the same id, so
+		// "main" keeps working offline: a branch for an upstream branch and
+		// a tag for an upstream tag. A raw revision id is recorded as is.
+		Branch: p.target.branch(),
+		Tags:   p.target.tags(),
 	}
 	// The revision may already be recorded, perhaps by pull-through with
 	// some files still to fetch. Every file is stored now, so the registry
@@ -276,7 +424,7 @@ feed:
 	// holds no such revision is this a new one to record whole; any other
 	// failure is the mirror's failure.
 	_, err := reg.CompleteRevision(ctx, registry.CompleteInput{
-		Repo: repo, SHA: sha, Branch: in.Branch, Upstream: in.Upstream, Files: files,
+		Repo: repo, SHA: sha, Branch: in.Branch, Tags: in.Tags, Upstream: in.Upstream, Files: files,
 	})
 	if errors.Is(err, registry.ErrRevisionNotFound) {
 		_, err = reg.Commit(ctx, in)
@@ -284,7 +432,7 @@ feed:
 	if err != nil {
 		return Result{}, err
 	}
-	res := Result{Repo: repo, SHA: sha, Ref: in.Branch, Files: len(files),
+	res := Result{Repo: repo, SHA: sha, Ref: p.target.name, Files: len(files),
 		Bytes: downloaded + reused, DownloadedBytes: downloaded, ReusedBytes: reused}
 	progress(res.doneEvent())
 	return res, nil
@@ -309,11 +457,8 @@ func (p *Plan) lazyInput(branch string) registry.LazyInput {
 // records into a repository that is new or that came from an upstream; for
 // one created in this registry it fails with registry.ErrLocalRepo.
 func (p *Plan) RecordLazy(ctx context.Context, reg *registry.Registry) (registry.Commit, error) {
-	branch := ""
-	if !registry.IsSHA(p.revision) {
-		branch = p.revision
-	}
-	in := p.lazyInput(branch)
+	in := p.lazyInput(p.target.branch())
+	in.Tags = p.target.tags()
 	in.OnlyFromUpstream = true
 	return reg.CommitLazy(ctx, in)
 }

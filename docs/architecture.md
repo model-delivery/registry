@@ -247,7 +247,21 @@ what that means for users.
    to five times per file.
 3. Once every file is stored and verified, record the revision under its
    upstream id, with the upstream's model description kept as provenance
-   (unless it is over 1 MiB, in which case none is kept).
+   (unless it is over 1 MiB, in which case none is kept). A revision asked
+   for by name is recorded under that name as the kind of ref it is
+   upstream, which the upstream's refs listing says: a branch as a branch
+   and a tag as a tag. (Up to v0.4.1 every name became a branch.) An
+   upstream tag that now names another revision than the registry's tag of
+   that name is refused before anything is fetched, since tags never move.
+
+A mirror of every ref (`internal/mirror/refs.go`) lists the upstream's
+branches and tags and takes each in turn: one the registry already has at
+the same revision, with every file stored, is left alone; a new one, or a
+branch that has moved, has its revision mirrored as above (or, if that
+revision is already stored in full, only the ref recorded); a tag that has
+moved upstream and a name that is a branch on one side and a tag on the
+other are reported and left; a ref only the registry has stays. Each ref
+succeeds or fails on its own.
 
 If any file fails, nothing is recorded. The repository does not appear, or
 keeps pointing at its previous revision. Blobs downloaded before the

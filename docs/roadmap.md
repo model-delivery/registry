@@ -8,18 +8,12 @@ move an item forward are welcome.
 
 ## Next
 
-The first two are about keeping independent copies of models, and the
-data they were trained on, that do not depend on one host. (Dataset
-repositories, the item that used to head this list, are in the registry
-now: see the [README](../README.md#what-it-does).)
+The first is about keeping independent copies of models, and the data
+they were trained on, that do not depend on one host. (Dataset
+repositories and keeping mirrors up to date, the items that used to head
+this list, are in the registry now: see the [README](../README.md#what-it-does)
+and [keeping mirrors up to date](operations.md#keeping-mirrors-up-to-date).)
 
-- **Keeping mirrors up to date.** A mirror is a snapshot of one revision,
-  and picking up a newer one means running `modelctl mirror` again. Two
-  additions:
-  - **Scheduled sync** for chosen repositories. A newer upstream revision
-    is recorded and the branch moves to it; earlier revisions stay, so
-    anything pinned to a revision id keeps getting the same files.
-  - **Mirror every branch and tag** of a repository in one command.
 - **Several upstreams.** A registry can already mirror from another
   registry in place of Hugging Face. Let it have a list, tried in order,
   so a chain of independent mirrors keeps working when one of them, or

@@ -52,6 +52,7 @@ registry you run.
 | `hf upload` | The command: a folder, one file, and a folder to a new branch |
 | `HfApi.get_paths_info` | For a model and for a dataset: files and directories by path. `expand` is ignored |
 | All of the above with `repo_type="dataset"`, and `HfApi.dataset_info` | See [Datasets](#datasets) for exactly which |
+| `snapshot_download` after a sync | A followed model whose upstream `main` moved and was synced: `main` gives the new revision's files and the earlier revision id still gives the earlier files, with the upstream gone (`TestHubClientAfterSync`) |
 
 All of these run with the `hf_xet` package installed, as a default
 installation has it. Downloads are unaffected by it; uploads are covered
